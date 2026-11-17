@@ -8,6 +8,7 @@
 > ⚠️ 本次是**静态审查**。当前开发环境里没有 JDK 与 Android SDK，`./gradlew` 没能跑起来，
 > 所以下面每一条都是读代码得出的结论，不是编译器或测试给的。CI 上的第一次构建
 > （`.github/workflows/android.yml`，含新增的 `SyncMergePlanTest`）才是这批改动的验收。
+> 注：目前已跑CI，能构建，无语法问题
 
 ## 结论
 
