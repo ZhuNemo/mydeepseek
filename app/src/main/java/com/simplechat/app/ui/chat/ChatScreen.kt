@@ -44,6 +44,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -52,6 +53,7 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -72,7 +74,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
-import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
 import androidx.core.content.ContextCompat
@@ -127,6 +129,14 @@ private const val HugeMessageChars = 20_000
 
 /** 换会话时，慢过这么久才显示转圈 —— 短会话不该闪一下圈圈。 */
 private const val SpinnerDelayMs = 120L
+
+/**
+ * 预热 Markdown 解析时，尾部消息超过这么多字符就不预热。
+ *
+ * 预热的意义是"打开就能看到的那一条不用现场解析"；一条几万字的消息本身就要
+ * 几百毫秒解析，替它预热只会把后台线程占满、让真正的首屏更晚。
+ */
+private const val WarmTailMaxChars = 24_000
 
 /** 等新会话内容就位的兜底上限。超过就当它已经好了，不能让界面停在透明态。 */
 private const val SwitchLoadTimeoutMs = 2_000L
@@ -203,7 +213,16 @@ fun ChatScreen(
     var speechError by remember { mutableStateOf<String?>(null) }
     val voice = rememberVoiceInput(onText = { text -> input = voiceBase + text })
     // 音色来自设置：设置里换一个，回到对话页立即生效（见 SpeechOutput 的 applyVoice）
-    val speaker = rememberSpeechOutput(vm.ttsVoiceName)
+    val speaker = rememberSpeechOutput(vm.ttsVoiceName, vm.officialTts)
+    val lifecycleOwner = LocalLifecycleOwner.current
+    /*
+     * 朗读入口是否显示：官方音色只在拿到官方配置时可用（官方 /v1/tools/tts 只在
+     * 官方域提供）。不可用时**整颗按钮不出现** —— 用户要求：不支持的 API 直接隐藏。
+     */
+    val readAloudAvailable =
+        !com.simplechat.app.net.DeepSeekTts.isOfficialVoice(vm.ttsVoiceName) || vm.officialTts != null
+
+    AutoReadAloudEffect(vm, ReadAloudEnabled && readAloudAvailable, speaker::read, speaker::stop)
 
     /*
      * 麦克风权限的当前状态。
@@ -351,7 +370,6 @@ fun ChatScreen(
      * 这一下是真正兜底的那次。
      */
     val draftScope = rememberCoroutineScope()
-    val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         fun flush() {
             draftScope.launch { composerOwner?.let { vm.saveDraft(it, draftToPersist()) } }
@@ -398,23 +416,31 @@ fun ChatScreen(
 
     /** 两个导出口共用：拿到目标位置后写文件。 */
     suspend fun exportTo(uri: Uri, markdown: Boolean) {
-        val text = if (markdown) {
-            vm.exportCurrentConversationMarkdown()
-        } else {
-            vm.exportCurrentConversation()
+        val id = vm.currentConversationId
+        var saved = false
+        var staged: java.io.File? = null
+        try {
+            if (id == null) { exportHint = Res.get(R.string.chat_export_empty); return }
+            val file = java.io.File.createTempFile("chat-export-", ".tmp", context.cacheDir)
+            staged = file
+            withContext(Dispatchers.IO) {
+                vm.exportConversationFile(file, id, markdown)
+                com.simplechat.app.data.copyExportFile(file, {
+                    context.contentResolver.openOutputStream(uri, "wt") ?: error(Res.get(R.string.error_write_failed))
+                })
+            }
+            saved = true
+            exportHint = Res.get(R.string.export_done)
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            exportHint = Res.get(R.string.export_failed, error.userMessage())
+        } finally {
+            withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                staged?.delete()
+                if (!saved) runCatching { android.provider.DocumentsContract.deleteDocument(context.contentResolver, uri) }
+            }
         }
-        if (text == null) {
-            exportHint = Res.get(R.string.chat_export_empty)
-            return
-        }
-        val ok = withContext(Dispatchers.IO) {
-            runCatching {
-                context.contentResolver.openOutputStream(uri)?.use {
-                    it.write(text.toByteArray())
-                } ?: error(Res.get(R.string.error_write_failed))
-            }.isSuccess
-        }
-        exportHint = if (ok) Res.get(R.string.export_done) else Res.get(R.string.export_failed_short)
     }
 
     /** 导出文件名：会话标题去掉文件系统不认的字符。 */
@@ -568,9 +594,16 @@ fun ChatScreen(
      * 消息索引的内容（§34.3）—— **快照**：只在会话或条数变化时重建，不在流式期间
      * 反复重算（§34.5）。预览文本在这里算完，别在组合里现算（每次重组跑一遍
      * `take(N)` 是白烧）。
+     *
+     * 放到**后台线程**算：它要遍历整条路径（长会话几千条），而这件事与"首帧能看到
+     * 消息"无关 —— 放在主线程上，正好和列表首次布局抢那一帧。
      */
-    val messageIndexEntries = remember(vm.currentConversationId, vm.messages.size) {
-        buildMessageIndexEntries(vm.messages)
+    val messageIndexEntries by produceState(
+        initialValue = emptyList<MessageIndexEntry>(),
+        vm.currentConversationId,
+        vm.messages.size,
+    ) {
+        value = buildMessageIndexSnapshot(vm.messages)
     }
 
     val density = LocalDensity.current
@@ -641,6 +674,13 @@ fun ChatScreen(
      * 绝不订阅内容变化 —— 那才是之前那个每 80ms 转一圈的死循环。
      */
     var detached by remember { mutableStateOf(false) }
+    var searchPlacementReset by remember(vm.currentConversationId) { androidx.compose.runtime.mutableLongStateOf(0L) }
+    fun resumeFollowing() {
+        vm.dismissSearch()
+        searchPlacementReset++
+        detached = false
+    }
+    SideEffect { if (vm.searchTarget != null) detached = true }
 
     /*
      * 「别跟底」的状态。
@@ -675,7 +715,7 @@ fun ChatScreen(
                 is DragInteraction.Stop, is DragInteraction.Cancel -> {
                     // 等这一次手势（含惯性滑动）彻底停下，再看落点是不是底部
                     snapshotFlow { listState.isScrollInProgress }.first { !it }
-                    if (listState.isAtBottom()) detached = false
+                    if (listState.isAtBottom()) resumeFollowing()
                 }
                 else -> Unit
             }
@@ -714,7 +754,7 @@ fun ChatScreen(
              * `pathRebuilding` / `switchingConversation` 期间让位 ——
              * 那两种是**故意**要把视口挪到别处去的，别和它们抢。
              */
-            if (!detached && !pathRebuilding && !switchingConversation &&
+            if (!detached && vm.searchTarget == null && !vm.switching && !pathRebuilding && !switchingConversation &&
                 !listState.isScrollInProgress && listState.canScrollForward
             ) {
                 // 向底部**逼近**一帧，不是一把跳过去 —— 见 ScrollToBottom.followBottom
@@ -727,21 +767,26 @@ fun ChatScreen(
     /*
      * 预热 Markdown 解析缓存（**后台线程**）。
      *
-     * 解析改成同步之后（见 `MarkdownText` 的 MarkdownStateCache），一条长消息
-     * 第一次组合时会在**主线程**逐块解析 —— 这就是"加载时卡一点点"的来源。
-     * 这里在列表一变就把各条的块提前解析好，条目真正组合时只命中缓存。
+     * ⚠️ **只预热末尾这一条**，不是整个会话。
      *
-     * **从最新一条往前**：贴底打开时先看到的正是尾部那几条。
+     * 早先这里是 `vm.messages.asReversed().map { it.content }.forEach { warm(it) }` ——
+     * 而 effect 的 key 是 `messages.size`：**每来一条新消息，就把全部历史重新解析一遍**。
+     * 一千条的会话里，每轮回复都要在后台把上百万字重新解析一次，解析结果还因为缓存
+     * 容量被反复冲刷（见 `MarkdownStateCache`）。这正是"长会话越聊越卡"的直接原因之一。
+     *
+     * 真正需要的只有"贴底打开时立刻能看到的那一条"，其余交给惰性渲染：
+     * 滚进视口才解析，解析结果进 LRU 缓存。
      */
-    LaunchedEffect(vm.messages.size) {
-        val contents = vm.messages.asReversed().map { it.content }
-        withContext(Dispatchers.Default) {
-            contents.forEach { warmMarkdownCache(it) }
-        }
+    LaunchedEffect(vm.currentConversationId, vm.messages.size) {
+        val tail = vm.messages.lastOrNull() ?: return@LaunchedEffect
+        // 超长消息不预热：解析它本身就要几百毫秒，预热反而把后台线程占满
+        if (tail.content.length > WarmTailMaxChars) return@LaunchedEffect
+        withContext(Dispatchers.Default) { warmMarkdownCache(tail.content) }
     }
 
     /** 追加新消息后跟到底部（用户没离开时）。 */
     LaunchedEffect(vm.messages.size) {
+        if (vm.searchTarget != null) return@LaunchedEffect
         if (switchingConversation) return@LaunchedEffect
         if (detached) return@LaunchedEffect
         /*
@@ -780,7 +825,7 @@ fun ChatScreen(
     SideEffect {
         lastPadPx = padPx
         // 首次测量只记基线（0 → 实测值那一跳不是键盘引起的）
-        if (padDelta == 0) return@SideEffect
+        if (padDelta == 0 || detached || vm.searchTarget != null || vm.switching || switchingConversation) return@SideEffect
         /*
          * ★ 顶部为原点：底部留白变化**不推**内容。
          *
@@ -791,7 +836,12 @@ fun ChatScreen(
          * `isAtBottom()` 在这里读到的是**上一次布局**的结果 = 变化前的状态，正是要的。
          */
         if (listState.isAtBottom()) {
-            scope.launch { listState.scrollToBottom() }
+            val owner = vm.currentConversationId
+            scope.launch {
+                if (owner == vm.currentConversationId && !detached && vm.searchTarget == null && !vm.switching) {
+                    listState.scrollToBottom()
+                }
+            }
         }
     }
 
@@ -895,6 +945,7 @@ fun ChatScreen(
 
     LaunchedEffect(vm.currentConversationId) {
         val id = vm.currentConversationId
+        val enteredFromSearch = vm.searchTarget != null
         val fromAnotherConversation = previousConversationId != null
         previousConversationId = id
 
@@ -929,6 +980,10 @@ fun ChatScreen(
              */
             dissolve.snapTo(0f)
             awaitLoaded()
+            if (enteredFromSearch || vm.searchTarget != null) {
+                dissolve.snapTo(1f)
+                return@LaunchedEffect
+            }
 
 
             /*
@@ -944,6 +999,7 @@ fun ChatScreen(
                 // 长消息的文字布局还会再长几帧（实测差了一整截）。
                 var stable = 0
                 while (stable < 3) {
+                    if (vm.searchTarget != null) break
                     listState.scrollToBottom()
                     withFrameNanos { }
                     stable = if (listState.isAtBottom()) stable + 1 else 0
@@ -953,6 +1009,21 @@ fun ChatScreen(
         } finally {
             switchingConversation = false
             loadingConversation = false
+        }
+    }
+
+    /** 收起键盘与焦点。 */
+    LaunchedEffect(vm.searchTarget?.request, vm.switching) {
+        val target = vm.searchTarget ?: return@LaunchedEffect
+        if (vm.switching || target.ready) return@LaunchedEffect
+        detached = true
+        focusManager.clearFocus()
+        keyboard?.hide()
+        val index = vm.messages.indexOfFirst { it.id == target.messageId }
+        if (index >= 0) {
+            listState.scrollToItem(index)
+            withFrameNanos { }
+            vm.markSearchReady(target.request)
         }
     }
 
@@ -1018,10 +1089,10 @@ fun ChatScreen(
      * **不需要二次确认**：树模型下旧的那条（连同它整棵子树）原样留在旧分支里，
      * 一条都不会丢。想回到旧分支，切一下版本就行。
      */
-    fun requestResend(target: UiMessage, text: String, attachments: List<Attachment>) {
+    fun requestResend(target: UiMessage, text: String, attachments: List<Attachment>, onPersisted: () -> Unit = {}) {
         // 编辑并重发 = 从这条起重建路径，下游换成一条空的流式回复 → 同「重新生成」，不锚
-        detached = false
-        vm.editMessage(target, text, resend = true, attachments = attachments)
+        resumeFollowing()
+        vm.editMessage(target, text, resend = true, attachments = attachments, onPersisted = onPersisted)
     }
 
     /** 展开面板时收起键盘 —— 键盘与面板同时占屏会让输入区几乎没有空间。 */
@@ -1037,6 +1108,12 @@ fun ChatScreen(
     ) {
         ChatTopBar(
             title = vm.conversationTitle(),
+            autoReadAloud = vm.autoReadAloud,
+            readAloudAvailable = ReadAloudEnabled && readAloudAvailable,
+            onToggleAutoReadAloud = {
+                if (vm.autoReadAloud) speaker.stop()
+                vm.toggleAutoReadAloud()
+            },
             onMenu = {
                 dismissInput()
                 onOpenDrawer()
@@ -1046,7 +1123,7 @@ fun ChatScreen(
                 onNewConversation()
                 panel = InputPanelState.NONE
                 // 新对话 = "我要看新的"，恢复跟随
-                detached = false
+                resumeFollowing()
             },
             // 点顶栏任意处也收键盘
             modifier = Modifier.dismissKeyboardOnTouch(),
@@ -1083,6 +1160,10 @@ fun ChatScreen(
                 } else {
                     MessageList(
                         messages = vm.messages,
+                        searchTarget = vm.searchTarget,
+                        searchBottomObstructionPx = inputAreaHeight,
+                        searchPlacementReset = searchPlacementReset,
+                        onDismissSearch = vm::dismissSearch,
                         listState = listState,
                         /*
                          * 展开 / 收起**任何**折叠块（思考面板、超长用户气泡）时，
@@ -1121,7 +1202,7 @@ fun ChatScreen(
                              * 而用户按「重新生成」就是想**看新回复**，跟到底部才对。
                              * （对照：「切版本」是看已完成的兄弟版本，那里才锚。）
                              */
-                            detached = false
+                            resumeFollowing()
                             vm.regenerate(message)
                         },
                         onContinue = { message ->
@@ -1129,12 +1210,13 @@ fun ChatScreen(
                              * 续写**跟底**：新内容接在这条末尾，用户按它就是想看接下来写什么。
                              * 与「重新生成」同一个判断（那条把内容清空，锚不住）。
                              */
-                            detached = false
+                            resumeFollowing()
                             vm.continueMessage(message)
                         },
                         // 朗读暂时下线（见 ReadAloudEnabled）：开关关着时按钮不出现、
                         // TTS 引擎也不会被初始化
-                        speakingId = if (ReadAloudEnabled) speaker.speakingId else null,
+                        speakingId = if (ReadAloudEnabled && readAloudAvailable) speaker.speakingId else null,
+                        readAloudAvailable = ReadAloudEnabled && readAloudAvailable,
                         autoCollapseThinking = vm.autoCollapseThinking,
                         onSpeak = { message ->
                             // 朗读正文（不是时间线里的过程文字）：用户要听的是回答本身
@@ -1165,7 +1247,7 @@ fun ChatScreen(
                         },
                         onRetry = { message ->
                             // 同「重新生成」：换成一条空的流式回复 → 不锚，跟到底部看它写
-                            detached = false
+                            resumeFollowing()
                             vm.retryMessage(message)
                         },
                     )
@@ -1225,8 +1307,12 @@ fun ChatScreen(
                 generating = vm.isStreaming,
                 onClick = {
                     // 用户显式要"看最新的" —— 这是少数几个该主动滚动的地方之一
-                    detached = false
-                    scope.launch { listState.scrollToBottom() }
+                    resumeFollowing()
+                    scope.launch {
+                        // Remove the search-only padding before computing the normal content bottom.
+                        withFrameNanos { }
+                        listState.scrollToBottom()
+                    }
                 },
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
@@ -1294,6 +1380,10 @@ fun ChatScreen(
                     .navigationBarsPadding()
                     .imePadding(),
             ) {
+                vm.imageSkipNotice?.let { message ->
+                    BannerBar(message = message, onDismiss = vm::dismissImageSkipNotice,
+                        onNeverRemind = vm::neverRemindImageSkip)
+                }
                 vm.banner?.let { message ->
                     BannerBar(message = message, onDismiss = { vm.dismissBanner() })
                 }
@@ -1362,6 +1452,18 @@ fun ChatScreen(
                     onSend = {
                         val target = editingMessage
                         val attached = pending
+                        val submitted = input
+                        val draftKey = composerOwner
+                        val clearPersistedInput = {
+                            // Clear only the submitted draft, after the message transaction committed.
+                            if (input == submitted && pending == attached) {
+                                input = ""
+                                pending = emptyList()
+                                editingMessage = null
+                                draftScope.launch { draftKey?.let { vm.clearDraft(it) } }
+                                dismissInput()
+                            }
+                        }
 
                         /*
                          * 模型不支持识图时**在这里拦住**，而不是让请求打到服务端换回 400。
@@ -1380,21 +1482,13 @@ fun ChatScreen(
                              * 回复的结尾（实测就是这个 bug）。
                              * 交给上面那个"条数变化才滚"的 effect —— 等它真的进列表再滚。
                              */
-                            detached = false
+                            resumeFollowing()
                             if (target != null) {
                                 // 输入栏的发送键就是「保存并发送」，不再让用户做二次选择
-                                editingMessage = null
-                                requestResend(target, input, attached)
+                                requestResend(target, submitted, attached, clearPersistedInput)
                             } else {
-                                vm.send(input, attached)
+                                vm.send(submitted, attached, clearPersistedInput)
                             }
-                            input = ""
-                            pending = emptyList()
-                            // 发出去的就不再是草稿 —— 立刻删行，不等防抖
-                            draftScope.launch { composerOwner?.let { vm.clearDraft(it) } }
-                            // 发完就收键盘：接下来是看回复，不是继续打字。
-                            // 键盘占着屏幕会把刚发出的那条和开头几行回复一起顶掉。
-                            dismissInput()
                         }
                     },
                     onStop = { vm.stop() },
@@ -1459,6 +1553,7 @@ fun ChatScreen(
                 ) {
                     ContextPanelContent(
                         stats = vm.contextStats,
+                        usage = vm.lastUsage,
                         compaction = vm.compaction,
                         compacting = vm.compacting,
                         compactPreview = vm.compactPreview,
@@ -1727,7 +1822,7 @@ private fun copyToClipboard(context: android.content.Context, text: String) {
 
 /** 顶部错误条。可手动关闭，避免一直占据视线。 */
 @Composable
-private fun BannerBar(message: String, onDismiss: () -> Unit) {
+internal fun BannerBar(message: String, onDismiss: () -> Unit, onNeverRemind: (() -> Unit)? = null) {
     val colors = LocalChatColors.current
     Row(
         modifier = Modifier
@@ -1744,6 +1839,9 @@ private fun BannerBar(message: String, onDismiss: () -> Unit) {
             color = MaterialTheme.colorScheme.onSurface,
             modifier = Modifier.weight(1f),
         )
+        if (onNeverRemind != null) TextButton(onClick = onNeverRemind) {
+            Text(stringResource(R.string.images_never_remind), maxLines = 1)
+        }
         Spacer(Modifier.size(6.dp))
         IconCircleButton(
             icon = AppIcons.Close,
@@ -1755,3 +1853,6 @@ private fun BannerBar(message: String, onDismiss: () -> Unit) {
         )
     }
 }
+
+
+

@@ -22,31 +22,29 @@ interface ConversationDao {
     )
     fun observeAll(): Flow<List<ConversationEntity>>
 
-    /**
-     * 搜索：**标题 或 消息正文**命中。
-     *
-     * 命中正文时顺带带回**最早那条**命中的消息，供结果行显示片段。
-     * `snippet` 是整条正文、不在 SQL 里截断 —— 中文按字节截会切出乱码，
-     * 取窗口的事交给 UI 层（[snippetAround]）。
-     *
-     * 刻意不上 FTS：这个量级（几百个会话）`LIKE` 完全够用，
-     * 而 FTS 要额外的虚表与分词器，中文还会被切坏。
-     */
+    /** One bounded preview per matching message, including inactive variants; title-only hits remain visible. */
     @Query(
         """
         SELECT c.*,
-            (SELECT m.content FROM messages m
-             WHERE m.conversationId = c.id AND m.content LIKE '%' || :query || '%'
-             ORDER BY m.createdAt ASC LIMIT 1) AS snippet
+            CASE WHEN m.id IS NULL THEN NULL ELSE
+                substr(m.content, max(1, instr(lower(m.content), lower(:query)) - 60), max(180, length(:query) + 120))
+            END AS snippet,
+            m.id AS messageId, m.role AS messageRole, m.createdAt AS messageCreatedAt,
+            m.variantIndex AS variantIndex,
+            CASE WHEN m.id IS NULL THEN 0 ELSE
+                (SELECT count(*) FROM messages sibling WHERE sibling.conversationId = m.conversationId
+                 AND sibling.parentId = m.parentId)
+            END AS variantCount
         FROM conversations c
-        WHERE c.title LIKE '%' || :query || '%'
-           OR EXISTS (SELECT 1 FROM messages m
-                      WHERE m.conversationId = c.id AND m.content LIKE '%' || :query || '%')
+        LEFT JOIN messages m ON m.conversationId = c.id AND instr(lower(m.content), lower(:query)) > 0
+        WHERE length(:query) > 0 AND (m.id IS NOT NULL OR instr(lower(c.title), lower(:query)) > 0)
         ORDER BY c.pinned DESC,
-                 CASE WHEN c.pinned THEN c.pinnedAt ELSE c.updatedAt END DESC
+                 CASE WHEN c.pinned THEN c.pinnedAt ELSE c.updatedAt END DESC,
+                 c.id ASC, m.createdAt DESC, m.id ASC
+        LIMIT :limit
         """,
     )
-    fun search(query: String): Flow<List<ConversationSearchHit>>
+    fun search(query: String, limit: Int = Int.MAX_VALUE): Flow<List<ConversationSearchHit>>
 
     @Query("SELECT * FROM conversations WHERE id = :id")
     suspend fun findById(id: String): ConversationEntity?
@@ -114,6 +112,21 @@ interface ConversationDao {
 }
 
 /**
+ * 一条消息的**骨架**（见 `MessageDao.getLightFor`）。
+ *
+ * 刻意只有这几列：判断"当前分支是哪条"不需要正文与附件。
+ */
+data class MessageLight(
+    val id: String,
+    val parentId: String,
+    val variantIndex: Int,
+    val active: Boolean,
+    val role: String,
+    val status: String,
+    val createdAt: Long,
+)
+
+/**
  * 搜索命中：会话 + 命中的那条消息正文。
  *
  * [snippet] 为 null 表示只有**标题**命中，没有正文片段可显示。
@@ -127,6 +140,24 @@ data class ConversationStamp(
 data class ConversationSearchHit(
     @Embedded val conversation: ConversationEntity,
     val snippet: String?,
+    val messageId: String? = null,
+    val messageRole: String? = null,
+    val messageCreatedAt: Long? = null,
+    val variantIndex: Int? = null,
+    val variantCount: Int = 0,
+)
+
+/** Bounded fields for lossless export of messages larger than CursorWindow. */
+data class MessageTextChunk(
+    val content: ByteArray?,
+    val attachments: ByteArray?,
+    val reasoning: ByteArray?,
+    val timeline: ByteArray?,
+    val errorMessage: ByteArray?,
+    val attachmentsPresent: Boolean = false,
+    val reasoningPresent: Boolean = false,
+    val timelinePresent: Boolean = false,
+    val errorPresent: Boolean = false,
 )
 
 @Dao
@@ -172,6 +203,79 @@ interface MessageDao {
     @Query("SELECT * FROM messages WHERE id = :id")
     suspend fun findById(id: String): MessageEntity?
 
+    @Query(
+        """
+        SELECT id, conversationId, parentId, variantIndex, active, role,
+               '' AS content, NULL AS attachments, NULL AS reasoning,
+               status, NULL AS errorMessage,
+               model, excluded, thinkingMs, ttftMs, tps, tokens_in, tokens_out,
+               NULL AS timeline, stopReason, createdAt
+        FROM messages WHERE id = :id
+        """,
+    )
+    suspend fun exportHeader(id: String): MessageEntity?
+
+    @Query(
+        """
+        SELECT substr(CAST(content AS BLOB), :start, :chunkBytes) AS content,
+               substr(CAST(attachments AS BLOB), :start, :chunkBytes) AS attachments,
+               substr(CAST(reasoning AS BLOB), :start, :chunkBytes) AS reasoning,
+               substr(CAST(timeline AS BLOB), :start, :chunkBytes) AS timeline,
+               substr(CAST(errorMessage AS BLOB), :start, :chunkBytes) AS errorMessage,
+               attachments IS NOT NULL AS attachmentsPresent,
+               reasoning IS NOT NULL AS reasoningPresent,
+               timeline IS NOT NULL AS timelinePresent,
+               errorMessage IS NOT NULL AS errorPresent
+        FROM messages WHERE id = :id
+        """,
+    )
+    suspend fun exportTextChunk(id: String, start: Int, chunkBytes: Int): MessageTextChunk?
+
+    /**
+     * 一个会话里所有消息的**骨架**：只读判活路径需要的几列。
+     *
+     * ### 为什么打开会话要先读一遍它
+     *
+     * 打开长会话最贵的不是"走树"，而是**把不需要的消息正文读出来**：
+     * 一条分支被重新生成过 5 次，树上就有 5 条回复，而界面上只显示其中一条；
+     * 每次 `SELECT *` 都把这 5 条的正文（还带 `attachments` / `timeline` 两段 JSON）
+     * 全读进内存。几十条消息看不出差别，几千条的会话就是几十兆 —— 真机上
+     * 表现是"点进去转半天，甚至闪退"。
+     *
+     * 先读骨架（每行只有几十字节）→ 在内存里走出活跃路径 → 只按 id 取那几条的正文。
+     * 被放弃的分支因此**一次都不会被读出来**。
+     */
+    @Query(
+        """
+        SELECT id, parentId, variantIndex, active, role, status, createdAt
+        FROM messages WHERE conversationId = :conversationId
+        """,
+    )
+    suspend fun getLightFor(conversationId: String): List<MessageLight>
+
+    /** 按 id 批量取整条消息（活跃路径上的那些）。 */
+    @Query("SELECT * FROM messages WHERE id IN (:ids)")
+    suspend fun getByIds(ids: List<String>): List<MessageEntity>
+
+    /**
+     * 同 [getByIds]，但把 `attachments` 截断到 [cap] 字符。
+     *
+     * **兜底用**：老数据里的图片是内联 base64，单行可能超过 `CursorWindow` 的 2MB，
+     * 那样整条会话都读不出来。截断之后那一行的附件解析会失败，按约定当"没有附件"，
+     * 至少正文、思考、时间线都还在，会话能打开。
+     */
+    @Query(
+        """
+        SELECT id, conversationId, parentId, variantIndex, active, role, content,
+               substr(attachments, 1, :cap) AS attachments,
+               reasoning, status, errorMessage, model, excluded,
+               thinkingMs, ttftMs, tps, tokens_in, tokens_out,
+               timeline, stopReason, createdAt
+        FROM messages WHERE id IN (:ids)
+        """,
+    )
+    suspend fun getByIdsCapped(ids: List<String>, cap: Int): List<MessageEntity>
+
     /** 同父兄弟里的下一个版本号。 */
     @Query(
         """
@@ -186,6 +290,10 @@ interface MessageDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertAll(messages: List<MessageEntity>)
+
+    /** An import must never replace a message owned by another conversation. */
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertImported(messages: List<MessageEntity>)
 
     /** 流式期间的 checkpoint 写入（§4.4）。 */
     @Query(
@@ -222,6 +330,27 @@ interface MessageDao {
         timeline: String?,
         stopReason: String?,
     )
+
+    /**
+     * 「保存」编辑后的消息：**原地**换掉正文（可连同附件与内容块）。
+     *
+     * 用户对「保存」的理解就是"改这条"，而不是"再长出一条" —— 早先走的是
+     * "新增版本"（`addActiveVariant`），于是只改个错别字也会冒出一组 `‹ 1/2 ›`，
+     * 并且新版本没有子树：会话下半段当场消失，看起来就像"保存把我后面的聊天删了"。
+     *
+     * `timeline` 必须一起写：扩展通道的界面与请求都读它（见 `rewriteTimelineText`），
+     * 只改 `content` 会得到"保存了却没变"。
+     *
+     * 状态 / 用时统计 / 思考内容都不动：保存改的是文字，不是这次请求的结果。
+     */
+    @Query(
+        """
+        UPDATE messages
+        SET content = :content, attachments = :attachments, timeline = :timeline
+        WHERE id = :id
+        """,
+    )
+    suspend fun editContent(id: String, content: String, attachments: String?, timeline: String?)
 
     /**
      * 把卡在 `STREAMING` 的消息判为中断。
@@ -295,6 +424,20 @@ interface MessageDao {
 
     @Query("SELECT id FROM messages WHERE id = :id")
     suspend fun findExistingId(id: String): String?
+
+    /**
+     * 一条会话的全部消息 id（只读一列，**不碰正文与附件**）。
+     *
+     * 导入时用来判重：逐条 `findExistingId` 是 N 次查询，几万条消息就是几万次
+     * Binder/游标开销；先取一份 id 集合再在内存里比对，代价与消息条数线性相关，
+     * 单次查询就能完成。
+     */
+    @Query("SELECT id FROM messages WHERE conversationId = :conversationId")
+    suspend fun idsFor(conversationId: String): List<String>
+
+    /** Also protects older forks whose shared-file references were never registered. */
+    @Query("SELECT EXISTS(SELECT 1 FROM messages WHERE instr(attachments, '\"' || :path || '\"') > 0)")
+    suspend fun referencesAttachment(path: String): Boolean
 }
 
 @Dao
@@ -392,8 +535,11 @@ interface AttachmentRefDao {
     @Query("SELECT path FROM attachment_refs WHERE conversationId = :conversationId")
     suspend fun pathsOf(conversationId: String): List<String>
 
-    @Query("SELECT path FROM attachment_refs")
+    @Query("SELECT DISTINCT path FROM attachment_refs")
     suspend fun allPaths(): List<String>
+
+    @Query("SELECT EXISTS(SELECT 1 FROM attachment_refs WHERE path = :path)")
+    suspend fun containsPath(path: String): Boolean
 
     @Query("DELETE FROM attachment_refs WHERE conversationId = :conversationId")
     suspend fun clear(conversationId: String)
@@ -401,7 +547,11 @@ interface AttachmentRefDao {
     @Query("DELETE FROM attachment_refs WHERE conversationId IN (:ids)")
     suspend fun clearAll(ids: List<String>)
 
-    /** 删掉单条消息时按**路径**清登记 —— 会话还在，不能按会话清。 */
+    /**
+     * 删掉单条消息时按**路径**清登记 —— 会话还在，不能按会话清。
+     *
+     * 不清的话，`containsPath` 会永远返回 true，那些图片文件就再也回收不掉。
+     */
     @Query("DELETE FROM attachment_refs WHERE path IN (:paths)")
     suspend fun clearPaths(paths: List<String>)
 

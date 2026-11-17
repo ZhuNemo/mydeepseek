@@ -17,9 +17,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -36,6 +39,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -56,21 +60,26 @@ import com.simplechat.app.ui.theme.LocalChatColors
 @Composable
 fun ConversationSearchPage(
     hits: List<ConversationSearchHit>,
-    currentConversationId: String?,
     query: String,
     onQueryChange: (String) -> Unit,
     onBack: () -> Unit,
-    onClick: (ConversationEntity) -> Unit,
+    onClick: (ConversationSearchHit) -> Unit,
     onRename: (ConversationEntity) -> Unit,
     onTogglePin: (ConversationEntity) -> Unit,
     onDelete: (ConversationEntity) -> Unit,
+    hasMore: Boolean = false,
+    onLoadMore: () -> Unit = {},
+    listState: LazyListState = rememberLazyListState(),
+    autoFocus: Boolean = true,
+    selectedResultKey: String? = null,
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalChatColors.current
     val focusRequester = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
+    val focus = LocalFocusManager.current
 
-    LaunchedEffect(Unit) { focusRequester.requestFocus() }
+    LaunchedEffect(autoFocus) { if (autoFocus) focusRequester.requestFocus() }
 
     Column(
         modifier = modifier
@@ -180,21 +189,23 @@ fun ConversationSearchPage(
             }
         } else {
             LazyColumn(
+                state = listState,
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f),
                 contentPadding = PaddingValues(top = 4.dp, bottom = 12.dp),
             ) {
-                items(items = hits, key = { it.conversation.id }) { hit ->
+                items(items = hits, key = { it.searchResultKey }) { hit ->
                     val conversation = hit.conversation
                     ConversationRow(
                         conversation = conversation,
-                        current = conversation.id == currentConversationId,
+                        current = hit.searchResultKey == selectedResultKey,
                         selectionMode = false,
                         selected = false,
                         onClick = {
+                            focus.clearFocus()
                             keyboard?.hide()
-                            onClick(conversation)
+                            onClick(hit)
                         },
                         onEnterSelection = {},
                         onRename = { onRename(conversation) },
@@ -204,7 +215,15 @@ fun ConversationSearchPage(
                         // 命中正文时补一行片段，能一眼看出"是在哪句话里命中的"
                         snippet = snippetForDisplay(hit.snippet, query),
                         showMultiSelect = false,
+                        searchRole = hit.messageRole,
+                        searchDate = hit.messageCreatedAt ?: conversation.updatedAt,
+                        searchVariant = if (hit.variantCount > 1) "${(hit.variantIndex ?: 0) + 1}/${hit.variantCount}" else null,
                     )
+                }
+                if (hasMore) item {
+                    TextButton(onClick = onLoadMore, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.search_load_more))
+                    }
                 }
             }
         }

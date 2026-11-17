@@ -3,6 +3,7 @@ package com.simplechat.app.ui.settings
 import android.content.Intent
 import java.io.File
 import android.net.Uri
+import android.provider.DocumentsContract
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -25,6 +26,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -38,6 +40,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -71,6 +74,8 @@ import com.simplechat.app.ui.common.ContainerShape
 import com.simplechat.app.ui.common.BubbleShapeOut
 import com.simplechat.app.App
 import com.simplechat.app.R
+import com.simplechat.app.data.ApiKey
+import com.simplechat.app.net.UpdateChecker
 import com.simplechat.app.data.AppLanguage
 import com.simplechat.app.data.ImportMode
 import com.simplechat.app.data.Res
@@ -78,8 +83,12 @@ import com.simplechat.app.data.DEFAULT_DAV_PATH
 import com.simplechat.app.data.StoredSettings
 import com.simplechat.app.data.sync.SyncStage
 import com.simplechat.app.data.sync.SyncState
+import com.simplechat.app.data.ApiProfile
 import com.simplechat.app.data.userMessage
+import com.simplechat.app.data.copyExportFile
+import com.simplechat.app.data.stageArchive
 import com.simplechat.app.net.ModelCatalog
+import com.simplechat.app.net.DeepSeekTts
 import com.simplechat.app.net.ProviderKind
 import com.simplechat.app.ui.common.AppIcons
 import com.simplechat.app.ui.common.AppConfirmDialog
@@ -106,7 +115,10 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -119,6 +131,7 @@ private enum class SettingsPage(val depth: Int) {
     ROOT(0),
     DATA(1),
     API(1),
+    API_PROFILES(2),
     /** 云端同步（WebDAV）。 */
     SYNC(1),
     PRESETS(1),
@@ -126,20 +139,26 @@ private enum class SettingsPage(val depth: Int) {
     /** 朗读音色（系统 TTS）。 */
     VOICE(1),
     ABOUT(1),
+    /** 开源许可与版权清单（关于 → 二级）。 */
+    LICENSES(2),
 }
 
 private sealed interface SettingsDialog {
     data object Provider : SettingsDialog
     data object BaseUrl : SettingsDialog
     data object Model : SettingsDialog
+    /** 手动填写模型 id：端点没实现 `/models`、或列表里没有目标模型时的出口。 */
+    data object ModelManual : SettingsDialog
     data object ApiKey : SettingsDialog
+    data class ApiProfileName(val profile: ApiProfile? = null, val copyCurrent: Boolean = false) : SettingsDialog
+    data class DeleteApiProfile(val profile: ApiProfile) : SettingsDialog
     data object DeleteAll : SettingsDialog
     data object ImportMode : SettingsDialog
     /** 协议通道（自动 / OpenAI 兼容 / Anthropic 兼容）。 */
     data object ApiStyle : SettingsDialog
     /** 地区（时间地点提醒里的地点那一项）。 */
     data object Location : SettingsDialog
-    /** 云端同步：服务器地址 / 账号 / 应用密码 / 远程文件。 */
+    /** 云端同步：服务器地址 / 账号 / 应用密码 / 远程目录。 */
     data object SyncServer : SettingsDialog
     data object SyncUser : SettingsDialog
     data object SyncPassword : SettingsDialog
@@ -204,6 +223,14 @@ fun SettingsScreen(
     var dialog by remember { mutableStateOf<SettingsDialog?>(null) }
     var testing by remember { mutableStateOf(false) }
     var testResult by remember { mutableStateOf<String?>(null) }
+    var profileError by remember { mutableStateOf<String?>(null) }
+    fun updateProfile(action: suspend () -> Unit) {
+        scope.launch {
+            try { action(); profileError = null }
+            catch (error: CancellationException) { throw error }
+            catch (error: Exception) { profileError = error.userMessage() }
+        }
+    }
     var dataMessage by remember { mutableStateOf<String?>(null) }
     var pendingImport by remember { mutableStateOf<File?>(null) }
     // 导入进度：null = 没在导入；0..1 = 解析进度（拷贝阶段是 indeterminate）
@@ -211,6 +238,13 @@ fun SettingsScreen(
     val importPercent by importProgress.collectAsState()
     // 读文件 / 开包阶段：没有可用进度，界面给循环进度条 + 「读取中」
     var importReading by remember { mutableStateOf(false) }
+    val archiveProgress = remember { MutableStateFlow<Float?>(null) }
+    val archivePercent by archiveProgress.collectAsState()
+    var archiveSaving by remember { mutableStateOf(false) }
+    var pendingArchive by remember { mutableStateOf<File?>(null) }
+    DisposableEffect(Unit) {
+        onDispose { pendingArchive?.delete(); pendingImport?.delete() }
+    }
     var presets by remember { mutableStateOf<List<Preset>>(emptyList()) }
 
     /*
@@ -229,7 +263,37 @@ fun SettingsScreen(
      * - [speaker] 只用于「试听」与选完顺手念一句，不参与对话页的朗读。
      */
     var speechVoices by remember { mutableStateOf<List<SpeechVoice>?>(null) }
-    val speaker = rememberSpeechOutput(stored.ttsVoiceName)
+
+    /*
+     * DeepSeek 官方 TTS（/v1/tools/tts，音色 stella / tide）。
+     *
+     * 只在「服务商 = DeepSeek 官方 + Base URL 指向官方域 + Key 已填」时可用 ——
+     * 那个端点是官方域专有的。可用时列在音色页最前面；不可用时整块不出现，
+     * 只留一句说明（不支持的 API 不做入口，也不在点了之后才报错）。
+     */
+    val officialTtsConfig = remember(stored.providerId, stored.apiKey) {
+        if (DeepSeekTts.isOfficialTtsVoiceAvailable(stored.providerId, stored.apiKey)) {
+            DeepSeekTts.Config(stored.apiKey)
+        } else {
+            null
+        }
+    }
+    val officialVoices = remember(officialTtsConfig) {
+        if (officialTtsConfig == null) {
+            emptyList()
+        } else {
+            DeepSeekTts.Voice.entries.map { voice ->
+                SpeechVoice(
+                    name = DeepSeekTts.storageNameOf(voice.id),
+                    label = Res.get(voice.labelRes),
+                    // 官方合成走网络（不是设备引擎），标"需联网"符合用户预期
+                    needsNetwork = true,
+                )
+            }
+        }
+    }
+
+    val speaker = rememberSpeechOutput(stored.ttsVoiceName, officialTtsConfig)
     /** 朗读相关的报错（引擎缺失 / 合成失败），显示在音色页的说明位置。 */
     var speechError by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(speaker.error) {
@@ -256,7 +320,9 @@ fun SettingsScreen(
     LaunchedEffect(Unit) { repository.observePresets().collect { presets = it } }
 
     // 二级页面按返回键先回一级，而不是直接退出设置
-    BackHandler(enabled = page != SettingsPage.ROOT) { page = SettingsPage.ROOT }
+    fun previousPage() { page = if (page == SettingsPage.API_PROFILES) SettingsPage.API else SettingsPage.ROOT }
+    BackHandler(enabled = page != SettingsPage.ROOT) { previousPage() }
+    LaunchedEffect(stored.activeApiProfileId, stored.baseUrl) { testResult = null }
 
     val provider = runCatching { ProviderKind.valueOf(stored.providerId) }
         .getOrDefault(ProviderKind.DEEPSEEK)
@@ -269,26 +335,76 @@ fun SettingsScreen(
 
     // ── 文件读写：导出 / 导入 ─────────────────────────────
 
-    val exportLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.CreateDocument("application/json"),
-    ) { uri: Uri? ->
-        if (uri == null) return@rememberLauncherForActivityResult
+    fun savePreparedExport(uri: Uri?) {
+        val staged = pendingArchive
+        pendingArchive = null
+        if (uri == null) {
+            staged?.delete()
+            archiveProgress.value = null
+            dataMessage = null
+            return
+        }
         scope.launch {
-            val outcome = withContext(Dispatchers.IO) {
-                runCatching {
-                    val text = repository.exportBackup()
-                    context.contentResolver.openOutputStream(uri)?.use {
-                        it.write(text.toByteArray())
-                    } ?: error(Res.get(R.string.error_write_failed))
+            archiveSaving = true
+            archiveProgress.value = 0f
+            var saved = false
+            try {
+                checkNotNull(staged) { Res.get(R.string.export_failed_short) }
+                withContext(Dispatchers.IO) {
+                    copyExportFile(staged, openDestination = {
+                        context.contentResolver.openOutputStream(uri, "wt")
+                            ?: error(Res.get(R.string.error_write_failed))
+                    }, onProgress = { archiveProgress.value = it })
                 }
+                saved = true
+                dataMessage = Res.get(R.string.export_done)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                dataMessage = Res.get(R.string.export_failed, error.userMessage())
+            } finally {
+                withContext(NonCancellable + Dispatchers.IO) {
+                    staged?.delete()
+                    if (!saved) runCatching { DocumentsContract.deleteDocument(context.contentResolver, uri) }
+                }
+                archiveSaving = false
+                archiveProgress.value = null
             }
-            dataMessage = outcome.fold(
-                onSuccess = { Res.get(R.string.export_done) },
-                onFailure = { Res.get(R.string.export_failed, it.userMessage()) },
-            )
         }
     }
 
+    fun prepareExport(extension: String, launch: (String) -> Unit, generate: suspend (File) -> Unit) {
+        if (archiveProgress.value != null || importProgress.value != null || importReading) return
+        archiveSaving = false
+        archiveProgress.value = 0f
+        dataMessage = null
+        scope.launch {
+            var staged: File? = null
+            try {
+                val target = File.createTempFile("prepared-export-", ".$extension", context.cacheDir)
+                staged = target
+                withContext(Dispatchers.IO) {
+                    generate(target)
+                    check(target.length() > 0) { Res.get(R.string.export_failed_short) }
+                }
+                pendingArchive = target
+                val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
+                launch("simplechat-$stamp.$extension")
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                pendingArchive = null
+                archiveProgress.value = null
+                dataMessage = Res.get(R.string.export_failed, error.userMessage())
+            } finally {
+                if (pendingArchive !== staged) withContext(NonCancellable + Dispatchers.IO) { staged?.delete() }
+            }
+        }
+    }
+
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json"),
+    ) { uri: Uri? -> savePreparedExport(uri) }
     val importLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument(),
     ) { uri: Uri? ->
@@ -303,66 +419,66 @@ fun SettingsScreen(
              */
             importReading = true
             dataMessage = null
-            val file = withContext(Dispatchers.IO) {
-                runCatching {
-                    val target = File(context.cacheDir, "import-${System.currentTimeMillis()}.bak")
+            var staged: File? = null
+            try {
+                val file = withContext(Dispatchers.IO) {
+                    val target = File.createTempFile("import-", ".bak", context.cacheDir)
+                    staged = target
                     context.contentResolver.openInputStream(uri)?.use { input ->
-                        target.outputStream().use { output -> input.copyTo(output, DEFAULT_BUFFER_SIZE * 8) }
+                        target.outputStream().use { output ->
+                            val buffer = ByteArray(64 * 1024)
+                            while (true) {
+                                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                                val count = input.read(buffer)
+                                if (count < 0) break
+                                output.write(buffer, 0, count)
+                            }
+                        }
                     } ?: error(Res.get(R.string.import_read_failed))
+                    check(target.length() > 0L) { Res.get(R.string.import_read_failed) }
                     target
-                }.getOrNull()
-            }
-            if (file == null || file.length() == 0L) {
-                file?.delete()
-                importReading = false
-                dataMessage = Res.get(R.string.import_read_failed)
-            } else {
-                dataMessage = null
-                importProgress.value = null
-                importReading = false
+                }
                 pendingImport = file
                 dialog = SettingsDialog.ImportMode
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                dataMessage = Res.get(R.string.error_import_failed, error.userMessage())
+            } finally {
+                if (pendingImport !== staged) withContext(NonCancellable + Dispatchers.IO) { staged?.delete() }
+                importReading = false
             }
         }
     }
 
-    fun startExport() {
-        val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
-        dataMessage = null
-        exportLauncher.launch("simplechat-$stamp.json")
+    fun startExport() = prepareExport("json", { exportLauncher.launch(it) }) { file ->
+        repository.exportBackup(file, onProgress = { archiveProgress.value = it })
     }
 
-    /*
-     * ZIP 归档：同一份备份 + 每个会话一份 Markdown 文稿。
-     *
-     * 与 JSON 导出并列而不是替换：JSON 好读好 diff，ZIP 好传好归档
-     * （一个大文件里既有可导入的数据，也有能直接看的文稿）。
-     */
+    fun startReportExport() = prepareExport("json", { exportLauncher.launch(it) }) { file ->
+        val report = repository.lastImportReportFile()
+            ?: error(Res.get(R.string.import_report_missing))
+        report.inputStream().use { input -> file.outputStream().use { input.copyTo(it) } }
+        archiveProgress.value = 1f
+    }
+
+    val crashLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) {
+        uri: Uri? -> savePreparedExport(uri)
+    }
+    fun startCrashExport() = prepareExport("txt", { crashLauncher.launch(it) }) { file ->
+        val report = com.simplechat.app.data.CrashDiagnostics.file(context)
+            ?: error(Res.get(R.string.crash_report_missing))
+        report.inputStream().use { input -> file.outputStream().use { input.copyTo(it) } }
+        archiveProgress.value = 1f
+    }
+
     val archiveLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/zip"),
-    ) { uri: Uri? ->
-        if (uri == null) return@rememberLauncherForActivityResult
-        scope.launch {
-            val outcome = withContext(Dispatchers.IO) {
-                runCatching {
-                    val bytes = repository.exportArchive()
-                    context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
-                        ?: error(Res.get(R.string.error_write_failed))
-                }
-            }
-            dataMessage = outcome.fold(
-                onSuccess = { Res.get(R.string.export_done) },
-                onFailure = { Res.get(R.string.export_failed, it.userMessage()) },
-            )
-        }
-    }
+    ) { uri: Uri? -> savePreparedExport(uri) }
 
-    fun startArchiveExport() {
-        val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
-        dataMessage = null
-        archiveLauncher.launch("simplechat-$stamp.zip")
+    fun startArchiveExport() = prepareExport("zip", { archiveLauncher.launch(it) }) { file ->
+        stageArchive(file) { repository.exportArchive(it) { p -> archiveProgress.value = p } }
     }
-
     // ── 页面 ──────────────────────────────────────────────
 
     Column(
@@ -376,13 +492,20 @@ fun SettingsScreen(
                 SettingsPage.DATA -> stringResource(R.string.settings_data)
                 SettingsPage.API -> stringResource(R.string.settings_api)
                 SettingsPage.SYNC -> stringResource(R.string.settings_sync)
+                SettingsPage.API_PROFILES -> stringResource(R.string.api_profiles_title)
                 SettingsPage.PRESETS -> stringResource(R.string.settings_presets)
                 SettingsPage.FONT -> stringResource(R.string.settings_font_size)
                 SettingsPage.VOICE -> stringResource(R.string.tts_voice)
                 SettingsPage.ABOUT -> stringResource(R.string.settings_about)
+                SettingsPage.LICENSES -> stringResource(R.string.about_licenses)
             },
-            onBack = { if (page == SettingsPage.ROOT) onBack() else page = SettingsPage.ROOT },
+            onBack = {
+                if (archiveProgress.value == null && importProgress.value == null && !importReading) {
+                    if (page == SettingsPage.ROOT) onBack() else previousPage()
+                }
+            },
         )
+        BackHandler(enabled = archivePercent != null || importPercent != null || importReading) { }
 
         /*
          * 二级页面从右侧滑入、返回原路退回（见 ui/common/Motion.kt）。
@@ -432,41 +555,18 @@ fun SettingsScreen(
                             message = dataMessage,
                             progress = importPercent,
                             reading = importReading,
+                            exportProgress = archivePercent,
+                            exportSaving = archiveSaving,
                             onExport = { startExport() },
                             onExportArchive = { startArchiveExport() },
+                            onExportReport = { startReportExport() },
+                            onExportCrash = { startCrashExport() },
                             onImport = {
                                 // 全放行：Chatbox 的备份是 .zip，有的设备报的 MIME 还很不标准。
                                 // 真正的判定放在解析那一步，认不出来会给出明确原因。
                                 importLauncher.launch(arrayOf("*/*"))
                             },
                             onDeleteAll = { dialog = SettingsDialog.DeleteAll },
-                        )
-
-                        SettingsPage.API -> ApiPage(
-                            stored = stored,
-                            provider = provider,
-                            testing = testing,
-                            testResult = testResult,
-                            onPick = { dialog = it },
-                            onWebSearch = { enabled ->
-                                scope.launch { store.setWebSearch(enabled) }
-                            },
-                            onTest = {
-                                if (testing) return@ApiPage
-                                testing = true
-                                testResult = null
-                                scope.launch {
-                                    val result = container.chatApi.fetchModels(
-                                        baseUrl = stored.baseUrl.ifBlank { provider.defaultBaseUrl },
-                                        apiKey = stored.apiKey,
-                                    )
-                                    testResult = result.fold(
-                                        onSuccess = { Res.get(R.string.api_test_ok, it.size) },
-                                        onFailure = { Res.get(R.string.api_test_failed, it.userMessage()) },
-                                    )
-                                    testing = false
-                                }
-                            },
                         )
 
                         SettingsPage.SYNC -> SyncPage(
@@ -493,6 +593,52 @@ fun SettingsScreen(
                             },
                         )
 
+                        SettingsPage.API -> ApiPage(
+                            stored = stored,
+                            provider = provider,
+                            testing = testing,
+                            testResult = testResult,
+                            onPick = { dialog = it },
+                            onProfiles = { page = SettingsPage.API_PROFILES },
+                            profileError = profileError,
+                            onWebSearch = { enabled ->
+                                scope.launch { store.setWebSearch(enabled) }
+                            },
+                            onTest = {
+                                if (testing) return@ApiPage
+                                testing = true
+                                testResult = null
+                                val source = stored
+                                scope.launch {
+                                    try {
+                                    val result = container.chatApi.fetchModels(
+                                        baseUrl = source.baseUrl.ifBlank { provider.defaultBaseUrl },
+                                        apiKey = source.apiKey,
+                                    )
+                                    // 拉到的列表**必须落库**：它就是「模型」选择器的数据源，
+                                    // 早先只报了个条数、列表丢掉，于是自定义端点明明"连接成功"，
+                                    // 点开「模型」却是一个只有标题的白框。
+                                    result.onSuccess { ids -> store.setModelIds(ids, source.activeApiProfileId, source.baseUrl) }
+                                    if (stored.activeApiProfileId == source.activeApiProfileId && stored.baseUrl == source.baseUrl) testResult = result.fold(
+                                        onSuccess = { Res.get(R.string.api_test_ok, it.size) },
+                                        onFailure = { Res.get(R.string.api_test_failed, it.userMessage()) },
+                                    )
+                                    } catch (error: CancellationException) { throw error }
+                                    catch (error: Exception) { profileError = error.userMessage() }
+                                    finally { testing = false }
+                                }
+                            },
+                        )
+
+                        SettingsPage.API_PROFILES -> ApiProfilesPage(
+                            stored = stored, error = profileError,
+                            onSelect = { profile -> updateProfile { store.selectApiProfile(profile.id); page = SettingsPage.API } },
+                            onNew = { dialog = SettingsDialog.ApiProfileName() },
+                            onCopy = { dialog = SettingsDialog.ApiProfileName(copyCurrent = true) },
+                            onRename = { dialog = SettingsDialog.ApiProfileName(profile = it) },
+                            onDelete = { dialog = SettingsDialog.DeleteApiProfile(it) },
+                        )
+
                         SettingsPage.PRESETS -> PresetsPage(
                             presets = presets,
                             onEdit = { dialog = SettingsDialog.PresetEditor(it) },
@@ -505,11 +651,17 @@ fun SettingsScreen(
                             onScaleCommit = { scope.launch { store.setFontScale(it) } },
                         )
 
-                        SettingsPage.ABOUT -> AboutPage()
+                        SettingsPage.ABOUT -> AboutPage(
+                            onOpenLicenses = { page = SettingsPage.LICENSES },
+                        )
+
+                        SettingsPage.LICENSES -> LicensesPage()
 
                         SettingsPage.VOICE -> VoicePage(
                             selectedName = stored.ttsVoiceName,
                             voices = speechVoices,
+                            officialVoices = officialVoices,
+                            officialAvailable = officialTtsConfig != null,
                             previewing = speaker.previewing,
                             error = speechError,
                             onSelect = { voice ->
@@ -542,14 +694,36 @@ fun SettingsScreen(
             onDismiss = { dialog = null },
             onSelect = { picked ->
                 dialog = null
-                scope.launch {
-                    store.setProvider(
-                        providerId = picked.name,
-                        baseUrl = picked.defaultBaseUrl,
-                        modelId = picked.defaultModel.ifBlank { stored.modelId },
-                    )
+                updateProfile { store.selectProvider(picked) }
+            },
+        )
+
+        is SettingsDialog.ApiProfileName -> TextInputDialog(
+            title = stringResource(if (activeDialog.profile != null) R.string.api_profile_rename
+                else if (activeDialog.copyCurrent) R.string.api_profile_copy else R.string.api_profile_new),
+            initial = activeDialog.profile?.name ?: if (activeDialog.copyCurrent)
+                stored.apiProfiles.firstOrNull { it.id == stored.activeApiProfileId }?.name.orEmpty() +
+                    stringResource(R.string.conversation_fork_suffix) else "",
+            placeholder = stringResource(R.string.api_profile_name_hint),
+            onDismiss = { dialog = null },
+            onConfirm = { value ->
+                if (value.isNotBlank()) {
+                    dialog = null
+                    updateProfile {
+                        if (activeDialog.profile != null) store.renameApiProfile(activeDialog.profile.id, value)
+                        else { store.createApiProfile(value, activeDialog.copyCurrent); page = SettingsPage.API }
+                    }
                 }
             },
+        )
+
+        is SettingsDialog.DeleteApiProfile -> AppConfirmDialog(
+            title = stringResource(R.string.api_profile_delete),
+            message = stringResource(R.string.api_profile_delete_body, activeDialog.profile.name),
+            confirmText = stringResource(R.string.action_delete),
+            destructive = true,
+            onDismiss = { dialog = null },
+            onConfirm = { dialog = null; updateProfile { store.deleteApiProfile(activeDialog.profile.id) } },
         )
 
         SettingsDialog.BaseUrl -> TextInputDialog(
@@ -559,18 +733,46 @@ fun SettingsScreen(
             onDismiss = { dialog = null },
             onConfirm = { value ->
                 dialog = null
-                scope.launch { store.setBaseUrl(value) }
+                updateProfile { store.setBaseUrl(value) }
             },
         )
 
-        SettingsDialog.Model -> ChoiceDialog(
-            title = stringResource(R.string.label_model),
-            options = ModelCatalog.knownModels(provider).map { it to it.displayName },
-            selected = ModelCatalog.knownModels(provider).firstOrNull { it.id == stored.modelId },
+        SettingsDialog.Model -> {
+            /*
+             * 选项 = **这个端点拉到的模型**（落库的那份）在前，内置能力表补在后。
+             *
+             * 早先只读 `knownModels(provider)`：自定义服务商的内置目录是空的，
+             * 于是「测试连接」显示"可用模型 45 个"、点开「模型」却什么都没有 ——
+             * 拉取结果根本没进界面。
+             */
+            val models = ModelCatalog.pickerModels(provider, stored.modelIds)
+            ChoiceDialog(
+                title = stringResource(R.string.label_model),
+                options = models.map { it to it.displayName },
+                selected = models.firstOrNull { it.id == stored.modelId },
+                emptyHint = stringResource(R.string.api_model_empty_hint),
+                extraAction = stringResource(R.string.api_model_manual) to {
+                    dialog = SettingsDialog.ModelManual
+                },
+                onDismiss = { dialog = null },
+                onSelect = { picked ->
+                    dialog = null
+                    scope.launch { store.setModel(picked.id) }
+                },
+            )
+        }
+
+        SettingsDialog.ModelManual -> TextInputDialog(
+            title = stringResource(R.string.api_model_manual),
+            initial = stored.modelId,
+            // 例子用**当前服务商的默认模型**：用户照抄一个多半就是能用的
+            placeholder = provider.defaultModel.ifBlank { ProviderKind.DEEPSEEK.defaultModel },
             onDismiss = { dialog = null },
-            onSelect = { picked ->
+            onConfirm = { value ->
                 dialog = null
-                scope.launch { store.setModel(picked.id) }
+                val id = value.trim()
+                // 空值等于"没选"，不要拿它覆盖已选模型
+                if (id.isNotEmpty()) scope.launch { store.setModel(id) }
             },
         )
 
@@ -579,10 +781,27 @@ fun SettingsScreen(
             initial = stored.apiKey,
             placeholder = "sk-…",
             secret = true,
+            /*
+             * 粘进来的东西经常带换行、空格，甚至整段中文占位符。HTTP 头只接受可见 ASCII，
+             * 不拦的话错误会以 `Unexpected char 0x4f55 at 8 in Authorization value`
+             * 的形式出现在对话里 —— 用户完全看不懂（见 `ApiKey`）。
+             */
+            validate = { raw ->
+                val clean = ApiKey.normalize(raw)
+                val illegal = ApiKey.firstIllegalChar(clean)
+                if (illegal == null) {
+                    null
+                } else {
+                    Res.get(
+                        R.string.api_key_illegal_chars,
+                        "0x%04x".format(illegal.code),
+                    )
+                }
+            },
             onDismiss = { dialog = null },
             onConfirm = { value ->
                 dialog = null
-                scope.launch { store.setApiKey(value) }
+                updateProfile { store.setApiKey(value) }
             },
         )
 
@@ -683,6 +902,7 @@ fun SettingsScreen(
             selected = null,
             onDismiss = {
                 dialog = null
+                pendingImport?.delete()
                 pendingImport = null
             },
             onSelect = { mode ->
@@ -692,26 +912,23 @@ fun SettingsScreen(
                 if (file == null) return@ChoiceDialog
                 scope.launch {
                     dataMessage = Res.get(R.string.import_working)
-                    importPercent
+                    importProgress.value = 0f
                     // 认得三种备份：本应用的 JSON / ZIP、Chatbox 的 ZIP / JSON、DeepSeek 导出
-                    val outcome = runCatching {
+                    try {
                         withContext(Dispatchers.IO) {
-                            repository.importExternal(file, context.cacheDir, mode) { p ->
+                            val (_, summary) = repository.importExternal(file, context.cacheDir, mode) { p ->
                                 // 回调来自 IO 线程：StateFlow 是线程安全的，界面侧 collectAsState 收。
                                 // 0 就先不给 —— 停在 0% 看着像卡死，等真有进展再显示百分比
-                                if (p > 0f) importProgress.value = p.coerceIn(0f, 1f)
+                                importProgress.value = p.coerceIn(0f, 1f)
                             }
+                            dataMessage = summary
                         }
+                    } catch (error: CancellationException) { throw error }
+                    catch (error: Exception) { dataMessage = Res.get(R.string.error_import_failed, error.userMessage()) }
+                    finally {
+                        importProgress.value = null
+                        withContext(NonCancellable + Dispatchers.IO) { file.delete() }
                     }
-                    importProgress.value = null
-                    // 大文件的临时副本用过就删，别占着缓存
-                    withContext(Dispatchers.IO) { file.delete() }
-                    dataMessage = outcome.fold(
-                        // 结果文案由仓库层统一按"对账"口径生成（会话 4 个 · 归档共 5 个 · …），
-                        // 界面只负责显示，不再自己拼数字
-                        onSuccess = { (_, summary) -> summary },
-                        onFailure = { Res.get(R.string.error_import_failed, it.userMessage()) },
-                    )
                 }
             },
         )
@@ -796,7 +1013,7 @@ private fun RootPage(
         SettingsNavRow(
             icon = AppIcons.Cloud,
             label = stringResource(R.string.settings_sync),
-            // 值只给"配没配"，不显示地址 —— 那一行是给人扫一眼的，不是配置面板
+            // 只给"配没配"，不显示地址 —— 那一行是给人扫一眼的，不是配置面板
             value = if (stored.syncConfigured) {
                 stringResource(R.string.settings_sync_summary)
             } else {
@@ -982,6 +1199,9 @@ private fun RootPage(
 private fun VoicePage(
     selectedName: String,
     voices: List<SpeechVoice>?,
+    /** DeepSeek 官方音色；空 = 当前服务商不支持官方朗读（整块不显示）。 */
+    officialVoices: List<SpeechVoice>,
+    officialAvailable: Boolean,
     previewing: Boolean,
     error: String?,
     onSelect: (SpeechVoice?) -> Unit,
@@ -1006,12 +1226,33 @@ private fun VoicePage(
         }
     }
 
+    /*
+     * 官方音色单独一组、排在系统音色**后面**：系统音色是"一定可用"的兜底，
+     * 官方的音质更好但依赖服务商与网络。不支持时不显示这一组 —— 连入口都没有，
+     * 用户就不会点了才发现不行。
+     */
+    if (officialVoices.isNotEmpty()) {
+        Spacer(Modifier.size(24.dp))
+        SettingsSectionLabel(stringResource(R.string.tts_voice_official_section))
+        SettingsCard {
+            officialVoices.forEachIndexed { index, voice ->
+                if (index > 0) RowDivider()
+                VoiceRow(
+                    label = voice.label,
+                    selected = voice.name == selectedName,
+                    onClick = { onSelect(voice) },
+                    onPreview = { onPreview(voice) },
+                )
+            }
+        }
+    }
+
     val colors = LocalChatColors.current
     val hint = when {
         // 报错优先：引擎缺失 / 合成失败时，"正在试听"之类的说明就是误导
         error != null -> error
         voices == null -> stringResource(R.string.tts_voice_loading)
-        voices.isEmpty() -> stringResource(R.string.tts_voice_empty)
+        voices.isEmpty() && officialVoices.isEmpty() -> stringResource(R.string.tts_voice_empty)
         previewing -> stringResource(R.string.tts_voice_preview_running)
         else -> stringResource(R.string.tts_voice_hint)
     }
@@ -1021,6 +1262,15 @@ private fun VoicePage(
         color = colors.placeholder,
         modifier = Modifier.padding(start = 4.dp, top = 12.dp),
     )
+    // 官方音色没出现时说明原因与条件，而不是让用户以为"这个 App 只有系统音色"
+    if (!officialAvailable) {
+        Text(
+            text = stringResource(R.string.tts_voice_official_hint),
+            style = MaterialTheme.typography.bodySmall,
+            color = colors.placeholder,
+            modifier = Modifier.padding(start = 4.dp, top = 8.dp),
+        )
+    }
 }
 
 /** 一行音色：名字 +（可选）试听 + 选中标记。 */
@@ -1084,8 +1334,12 @@ private fun DataPage(
     progress: Float? = null,
     /** 无进度阶段（读文件、开包）—— 给循环进度条，别让界面看着像卡死。 */
     reading: Boolean = false,
+    exportProgress: Float? = null,
+    exportSaving: Boolean = false,
     onExport: () -> Unit,
     onExportArchive: () -> Unit,
+    onExportReport: () -> Unit,
+    onExportCrash: () -> Unit,
     onImport: () -> Unit,
     onDeleteAll: () -> Unit,
 ) {
@@ -1096,12 +1350,14 @@ private fun DataPage(
             label = stringResource(R.string.settings_export_all),
             hint = stringResource(R.string.settings_export_all_summary),
             onClick = onExport,
+            enabled = !reading && progress == null && exportProgress == null,
         )
         RowDivider()
         SettingsActionRow(
             label = stringResource(R.string.settings_export_archive),
             hint = stringResource(R.string.settings_export_archive_summary),
             onClick = onExportArchive,
+            enabled = !reading && progress == null && exportProgress == null,
         )
         RowDivider()
         SettingsActionRow(
@@ -1109,7 +1365,7 @@ private fun DataPage(
             hint = stringResource(R.string.settings_import_all_summary),
             onClick = onImport,
             // 导入期间不能重复点：同一份包并发解析会把内存和数据库都顶爆
-            enabled = !reading && progress == null,
+            enabled = !reading && progress == null && exportProgress == null,
         )
     }
 
@@ -1119,6 +1375,21 @@ private fun DataPage(
      *
      * 解析阶段按"已处理多少条会话"给确定进度；拷贝与收尾阶段只有 indeterminate。
      */
+    if (exportProgress != null) {
+        Spacer(Modifier.size(12.dp))
+        Column(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) {
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), progress = { exportProgress })
+            Spacer(Modifier.size(6.dp))
+            Text(
+                text = stringResource(
+                    if (exportSaving) R.string.export_saving_progress else R.string.export_preparing_progress,
+                    (exportProgress * 100).toInt(),
+                ),
+                style = MaterialTheme.typography.labelMedium,
+                color = LocalChatColors.current.placeholder,
+            )
+        }
+    }
     if (reading || progress != null) {
         Spacer(Modifier.size(12.dp))
         Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp)) {
@@ -1152,6 +1423,28 @@ private fun DataPage(
         }
     }
 
+    /*
+     * 诊断：导入对账报告与崩溃诊断都是"出了问题才用"的东西，和日常的备份 / 导入
+     * 不是同一类操作。混在备份卡片里，看起来会像"又一个常规导出"。
+     */
+    SettingsSectionLabel(stringResource(R.string.settings_group_diagnostics))
+
+    SettingsCard {
+        SettingsActionRow(
+            label = stringResource(R.string.import_report_export),
+            hint = stringResource(R.string.import_report_hint),
+            onClick = onExportReport,
+            enabled = !reading && progress == null && exportProgress == null,
+        )
+        RowDivider()
+        SettingsActionRow(
+            label = stringResource(R.string.crash_report_export),
+            hint = stringResource(R.string.crash_report_hint),
+            onClick = onExportCrash,
+            enabled = !reading && progress == null && exportProgress == null,
+        )
+    }
+
     SettingsSectionLabel(stringResource(R.string.settings_group_reset))
 
     SettingsCard {
@@ -1160,6 +1453,7 @@ private fun DataPage(
             hint = stringResource(R.string.settings_destructive_hint),
             destructive = true,
             onClick = onDeleteAll,
+            enabled = !reading && progress == null && exportProgress == null,
         )
     }
 
@@ -1352,10 +1646,21 @@ private fun ApiPage(
     testing: Boolean,
     testResult: String?,
     onPick: (SettingsDialog) -> Unit,
+    onProfiles: () -> Unit,
+    profileError: String?,
     onTest: () -> Unit,
     onWebSearch: (Boolean) -> Unit,
 ) {
     val colors = LocalChatColors.current
+
+    SettingsSectionLabel(stringResource(R.string.api_profiles_title))
+    SettingsCard {
+        SettingsNavRow(null, stringResource(R.string.api_profile_current),
+            stored.apiProfiles.firstOrNull { it.id == stored.activeApiProfileId }?.name, onProfiles)
+    }
+    Text(stringResource(R.string.api_profiles_hint), style = MaterialTheme.typography.labelSmall,
+        color = colors.placeholder, modifier = Modifier.padding(horizontal = 4.dp, vertical = 10.dp))
+    profileError?.let { Text(it, color = colors.danger, style = MaterialTheme.typography.labelMedium) }
 
     SettingsSectionLabel(stringResource(R.string.settings_group_service))
 
@@ -1377,7 +1682,8 @@ private fun ApiPage(
         SettingsNavRow(
             icon = null,
             label = stringResource(R.string.label_model),
-            value = stored.modelId,
+            // 自定义服务商初始没有模型，空串不该显示成一行空白
+            value = stored.modelId.ifBlank { stringResource(R.string.api_model_unset) },
             onClick = { onPick(SettingsDialog.Model) },
         )
     }
@@ -1448,6 +1754,48 @@ private fun ApiPage(
             },
             onClick = { onPick(SettingsDialog.Location) },
         )
+    }
+}
+
+@Composable
+internal fun ApiProfilesPage(
+    stored: StoredSettings, error: String?, onSelect: (ApiProfile) -> Unit,
+    onNew: () -> Unit, onCopy: () -> Unit, onRename: (ApiProfile) -> Unit, onDelete: (ApiProfile) -> Unit,
+) {
+    val colors = LocalChatColors.current
+    SettingsSectionLabel(stringResource(R.string.api_profiles_title))
+    Text(stringResource(R.string.api_profiles_hint), style = MaterialTheme.typography.bodySmall,
+        color = colors.placeholder, modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp))
+    error?.let { Text(it, color = colors.danger) }
+    SettingsCard {
+        stored.apiProfiles.forEachIndexed { index, profile ->
+            if (index > 0) RowDivider(inset = 16.dp)
+            Row(Modifier.fillMaxWidth().padding(end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f).clickable { onSelect(profile) }.padding(16.dp)) {
+                    Text(profile.name, style = MaterialTheme.typography.titleSmall,
+                        color = if (profile.id == stored.activeApiProfileId) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
+                    val provider = ProviderKind.entries.firstOrNull { it.name == profile.providerId }
+                    Text(listOfNotNull(provider?.displayName, profile.modelId.takeIf { it.isNotBlank() }).joinToString(" · "),
+                        style = MaterialTheme.typography.labelSmall, color = colors.placeholder,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    if (profile.baseUrl.isNotBlank()) Text(profile.baseUrl,
+                        style = MaterialTheme.typography.labelSmall, color = colors.placeholder,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(stringResource(if (profile.id == stored.activeApiProfileId) R.string.api_profile_selected
+                        else if (profile.apiKeyEncrypted.isNotBlank()) R.string.api_profile_key_saved else R.string.api_key_unset),
+                        style = MaterialTheme.typography.labelSmall, color = colors.placeholder)
+                }
+                IconCircleButton(AppIcons.Edit, stringResource(R.string.api_profile_rename), { onRename(profile) }, size = 36.dp, iconSize = 18.dp)
+                if (stored.apiProfiles.size > 1) IconCircleButton(AppIcons.Trash,
+                    stringResource(R.string.api_profile_delete), { onDelete(profile) }, size = 36.dp, iconSize = 18.dp)
+            }
+        }
+    }
+    Spacer(Modifier.size(16.dp))
+    SettingsCard {
+        SettingsActionRow(stringResource(R.string.api_profile_new), stringResource(R.string.api_profile_new_hint), onNew)
+        RowDivider(inset = 16.dp)
+        SettingsActionRow(stringResource(R.string.api_profile_copy), stringResource(R.string.api_profile_copy_hint), onCopy)
     }
 }
 
@@ -1791,13 +2139,45 @@ private fun FontPage(
 // ══════════════════════════════════════════════════════════
 
 @Composable
-private fun AboutPage() {
+private fun AboutPage(onOpenLicenses: () -> Unit) {
+    val colors = LocalChatColors.current
+    val scope = rememberCoroutineScope()
+    var checking by remember { mutableStateOf(false) }
+    var checkResult by remember { mutableStateOf<UpdateChecker.Result?>(null) }
+
     SettingsSectionLabel(stringResource(R.string.about_version))
 
     SettingsCard {
         InfoRow(label = stringResource(R.string.about_version), value = "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
         RowDivider(inset = 16.dp)
         InfoRow(label = stringResource(R.string.about_package), value = BuildConfig.APPLICATION_ID)
+        RowDivider(inset = 16.dp)
+        InfoRow(label = stringResource(R.string.license_type), value = APP_LICENSE)
+        RowDivider(inset = 16.dp)
+        InfoRow(label = stringResource(R.string.license_copyright), value = APP_COPYRIGHT)
+    }
+
+    /*
+     * 「检查更新」单独一张卡：上面几行是只读信息，这一行是**可点**的 ——
+     * 混排会出现"有的能点有的不能点"。
+     */
+    SettingsSectionLabel(stringResource(R.string.about_update))
+
+    SettingsCard {
+        SettingsActionRow(
+            label = stringResource(R.string.about_check_update),
+            hint = stringResource(R.string.about_current_version, BuildConfig.VERSION_NAME),
+            onClick = {
+                if (checking) return@SettingsActionRow
+                checking = true
+                checkResult = null
+                scope.launch {
+                    checkResult = UpdateChecker.check(BuildConfig.VERSION_NAME)
+                    checking = false
+                }
+            },
+            enabled = !checking,
+        )
     }
 
     /*
@@ -1817,26 +2197,19 @@ private fun AboutPage() {
 
     SettingsSectionLabel(stringResource(R.string.about_licenses))
 
+    /*
+     * 只放一行入口，不把十几个组件铺在「关于」页里。
+     *
+     * 合规要看的是**每个组件的五项信息**（名称与版本 / 许可证 / 版权 / 官方链接 /
+     * 许可证全文），那必须是一页能逐条读的清单，而不是几张 `名字 (MIT)` 的便签。
+     */
     SettingsCard {
-        InfoRow(label = stringResource(R.string.about_icon), value = "Lucide (ISC)")
-        RowDivider(inset = 16.dp)
-        InfoRow(label = stringResource(R.string.about_libs_net), value = "OkHttp · kotlinx.serialization")
-        RowDivider(inset = 16.dp)
-        InfoRow(label = stringResource(R.string.about_libs_storage), value = "Room · DataStore · Jetpack Compose")
-        RowDivider(inset = 16.dp)
-        InfoRow(label = "Markdown", value = "multiplatform-markdown-renderer (Apache-2.0)")
-        RowDivider(inset = 16.dp)
-        InfoRow(label = stringResource(R.string.about_libs_parsing), value = "JetBrains markdown · Highlights")
-        RowDivider(inset = 16.dp)
-        InfoRow(label = stringResource(R.string.about_libs_crypto), value = "Android Keystore (AES-256-GCM)")
-        RowDivider(inset = 16.dp)
-        InfoRow(label = stringResource(R.string.about_libs_math), value = "latex-renderer (MIT)")
-        RowDivider(inset = 16.dp)
-        InfoRow(label = stringResource(R.string.about_libs_diagram), value = "Mermaid (MIT)")
-        RowDivider(inset = 16.dp)
-        InfoRow(label = "DeepSeek Chat Demo", value = "MIT")
-        RowDivider(inset = 16.dp)
-        InfoRow(label = "Simple-Agent", value = "MIT")
+        SettingsNavRow(
+            icon = AppIcons.FileText,
+            label = stringResource(R.string.about_licenses),
+            value = stringResource(R.string.licenses_count, thirdPartyLicenses.size),
+            onClick = onOpenLicenses,
+        )
     }
 
     Spacer(Modifier.size(16.dp))
@@ -1847,6 +2220,214 @@ private fun AboutPage() {
         color = LocalChatColors.current.placeholder,
         modifier = Modifier.padding(horizontal = 4.dp),
     )
+
+    checkResult?.let { result ->
+        val context = LocalContext.current
+        UpdateResultDialog(
+            result = result,
+            onDismiss = { checkResult = null },
+            onOpen = { url ->
+                checkResult = null
+                openInBrowser(context, url)
+            },
+        )
+    }
+}
+
+/**
+ * 检查更新的结果。
+ *
+ * 三种结果一句话说清：有新版本 → 给一个「前往下载」；没有 → 「已是最新版」；
+ * 查不出来 → 「检查失败」（不猜原因，也不催用户重试 —— 网络的事他比我们清楚）。
+ */
+@Composable
+private fun UpdateResultDialog(
+    result: UpdateChecker.Result,
+    onDismiss: () -> Unit,
+    onOpen: (String) -> Unit,
+) {
+    val colors = LocalChatColors.current
+    Dialog(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(ContainerShape)
+                .background(colors.card)
+                .padding(20.dp),
+        ) {
+            Text(
+                text = when (result) {
+                    is UpdateChecker.Result.Newer -> stringResource(R.string.update_new_title, result.release.tag)
+                    UpdateChecker.Result.UpToDate -> stringResource(R.string.update_up_to_date)
+                    is UpdateChecker.Result.Failed -> stringResource(R.string.update_failed)
+                },
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            if (result is UpdateChecker.Result.Newer) {
+                Spacer(Modifier.size(8.dp))
+                Text(
+                    text = stringResource(R.string.about_current_version, BuildConfig.VERSION_NAME),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = colors.placeholder,
+                )
+            }
+            Spacer(Modifier.size(18.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+            ) {
+                TextAction(stringResource(R.string.action_close), onClick = onDismiss)
+                if (result is UpdateChecker.Result.Newer) {
+                    Spacer(Modifier.size(8.dp))
+                    TextAction(
+                        stringResource(R.string.update_open),
+                        primary = true,
+                        onClick = { onOpen(result.release.url) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** 用浏览器打开链接；没有浏览器时静默失败（不值得为一步跳转崩掉整个设置页）。 */
+private fun openInBrowser(context: android.content.Context, url: String) {
+    runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+}
+
+// ══════════════════════════════════════════════════════════
+//  三级：开源许可与版权
+// ══════════════════════════════════════════════════════════
+
+/**
+ * 第三方组件清单。
+ *
+ * 合规要的是**每个组件的五项**：名称与版本、许可证、版权所有、官方链接、许可证全文。
+ * 这必须是一页能逐条读的清单 —— 挤在「关于」页里的 `名字 (MIT)` 便签既查不到版本，
+ * 也拿不到版权方。
+ */
+@Composable
+private fun LicensesPage() {
+    val colors = LocalChatColors.current
+    var selected by remember { mutableStateOf<LicenseEntry?>(null) }
+
+    SettingsSectionLabel(stringResource(R.string.licenses_third_party))
+
+    SettingsCard {
+        thirdPartyLicenses.forEachIndexed { index, entry ->
+            if (index > 0) RowDivider(inset = 16.dp)
+            LicenseRow(entry = entry, onClick = { selected = entry })
+        }
+    }
+
+    SettingsSectionLabel(stringResource(R.string.licenses_reference_title))
+
+    SettingsCard {
+        referenceCredits.forEachIndexed { index, textRes ->
+            if (index > 0) RowDivider(inset = 16.dp)
+            Text(
+                text = stringResource(textRes),
+                style = MaterialTheme.typography.bodyMedium,
+                color = colors.processText,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+            )
+        }
+    }
+
+    selected?.let { entry ->
+        LicenseDetailDialog(entry = entry, onDismiss = { selected = null })
+    }
+}
+
+/** 清单里的一行：名称 + 版本 · 许可证 + 版权方。 */
+@Composable
+private fun LicenseRow(entry: LicenseEntry, onClick: () -> Unit) {
+    val colors = LocalChatColors.current
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = entry.name,
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(Modifier.size(3.dp))
+            Text(
+                text = "${entry.version} · ${entry.license}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            Spacer(Modifier.size(2.dp))
+            Text(
+                text = entry.copyright,
+                style = MaterialTheme.typography.labelSmall,
+                color = colors.placeholder,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Spacer(Modifier.size(8.dp))
+        Icon(
+            imageVector = AppIcons.ChevronRight,
+            contentDescription = null,
+            tint = colors.placeholder,
+            modifier = Modifier.size(16.dp),
+        )
+    }
+}
+
+/** 单个组件的详情：五项信息齐全，链接可直接打开。 */
+@Composable
+private fun LicenseDetailDialog(entry: LicenseEntry, onDismiss: () -> Unit) {
+    val colors = LocalChatColors.current
+    Dialog(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(ContainerShape)
+                .background(colors.card)
+                .verticalScroll(rememberScrollState())
+                .padding(vertical = 16.dp),
+        ) {
+            Text(
+                text = entry.name,
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.padding(horizontal = 16.dp),
+            )
+            Spacer(Modifier.size(12.dp))
+            InfoRow(label = stringResource(R.string.license_version), value = entry.version)
+            RowDivider(inset = 16.dp)
+            InfoRow(label = stringResource(R.string.license_type), value = entry.license)
+            RowDivider(inset = 16.dp)
+            InfoRow(label = stringResource(R.string.license_copyright), value = entry.copyright)
+            RowDivider(inset = 16.dp)
+            LinkRow(
+                label = stringResource(R.string.license_project),
+                value = entry.projectUrl,
+                url = entry.projectUrl,
+            )
+            RowDivider(inset = 16.dp)
+            LinkRow(
+                label = stringResource(R.string.license_full_text),
+                value = entry.licenseUrl,
+                url = entry.licenseUrl,
+            )
+            Spacer(Modifier.size(12.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                horizontalArrangement = Arrangement.End,
+            ) {
+                TextAction(stringResource(R.string.action_close), onClick = onDismiss)
+            }
+        }
+    }
 }
 
 // ══════════════════════════════════════════════════════════
@@ -2199,6 +2780,10 @@ private fun <T> ChoiceDialog(
     selected: T?,
     onDismiss: () -> Unit,
     onSelect: (T) -> Unit,
+    /** 一个选项都没有时显示的话。给 null 就是只留标题（其余调用方没有空列表）。 */
+    emptyHint: String? = null,
+    /** 列表下面多出来的那一条动作（例如「手动填写模型」），与选中状态无关。 */
+    extraAction: Pair<String, () -> Unit>? = null,
 ) {
     val colors = LocalChatColors.current
     Dialog(onDismissRequest = onDismiss) {
@@ -2215,25 +2800,62 @@ private fun <T> ChoiceDialog(
                 color = MaterialTheme.colorScheme.onSurface,
                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 14.dp),
             )
-            options.forEach { (item, label) ->
+
+            if (options.isEmpty()) {
+                emptyHint?.let {
+                    Text(
+                        text = it,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = colors.placeholder,
+                        modifier = Modifier.padding(start = 20.dp, end = 20.dp, bottom = 12.dp),
+                    )
+                }
+            } else {
+                /*
+                 * 用 LazyColumn 而不是 Column：自定义端点的 `/models` 动辄四五十个
+                 * （用户那台中转站是 45 个），一次性铺开会把弹窗顶穿屏幕、底部
+                 * 超出窗口的部分**点不到也看不见** —— 看起来又像"列表没显示"。
+                 */
+                LazyColumn(modifier = Modifier.heightIn(max = 420.dp)) {
+                    items(options.size) { index ->
+                        val (item, label) = options[index]
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onSelect(item) }
+                                .padding(horizontal = 20.dp, vertical = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = label,
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = if (item == selected) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurface
+                                },
+                                modifier = Modifier.weight(1f),
+                            )
+                            AppMenuCheck(selected = item == selected)
+                        }
+                    }
+                }
+            }
+
+            extraAction?.let { (label, onClick) ->
+                if (options.isNotEmpty()) RowDivider(inset = 16.dp)
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clickable { onSelect(item) }
+                        .clickable(onClick = onClick)
                         .padding(horizontal = 20.dp, vertical = 14.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
                         text = label,
                         style = MaterialTheme.typography.bodyLarge,
-                        color = if (item == selected) {
-                            MaterialTheme.colorScheme.primary
-                        } else {
-                            MaterialTheme.colorScheme.onSurface
-                        },
-                        modifier = Modifier.weight(1f),
+                        color = MaterialTheme.colorScheme.primary,
                     )
-                    AppMenuCheck(selected = item == selected)
                 }
             }
         }
@@ -2248,9 +2870,12 @@ private fun TextInputDialog(
     onDismiss: () -> Unit,
     onConfirm: (String) -> Unit,
     secret: Boolean = false,
+    /** 返回非空字符串 = 校验失败的原因；此时不关窗、不提交。 */
+    validate: ((String) -> String?)? = null,
 ) {
     val colors = LocalChatColors.current
     var value by remember { mutableStateOf(initial) }
+    var error by remember { mutableStateOf<String?>(null) }
 
     Dialog(onDismissRequest = onDismiss) {
         Column(
@@ -2276,7 +2901,11 @@ private fun TextInputDialog(
             ) {
                 BasicTextField(
                     value = value,
-                    onValueChange = { value = it },
+                    onValueChange = {
+                        value = it
+                        // 用户开始改了就把旧的红字收掉，别让它跟着新内容一起错着
+                        error = null
+                    },
                     modifier = Modifier.fillMaxWidth(),
                     textStyle = MaterialTheme.typography.bodyMedium.copy(
                         color = MaterialTheme.colorScheme.onSurface,
@@ -2305,13 +2934,33 @@ private fun TextInputDialog(
 
             Spacer(Modifier.size(18.dp))
 
+            /*
+             * 校验失败时**不关窗**：把原因就地写在按钮上方，用户改一个字就能再点。
+             * 关掉窗再弹一句提示，等于让他重新打开一遍再粘一次。
+             */
+            error?.let { text ->
+                Text(
+                    text = text,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = LocalChatColors.current.danger,
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp),
+                )
+            }
+
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.End,
             ) {
                 TextAction(stringResource(R.string.action_cancel), onClick = onDismiss)
                 Spacer(Modifier.size(8.dp))
-                TextAction(stringResource(R.string.action_save), primary = true, onClick = { onConfirm(value) })
+                TextAction(
+                    stringResource(R.string.action_save),
+                    primary = true,
+                    onClick = {
+                        val problem = validate?.invoke(value)
+                        if (problem != null) error = problem else onConfirm(value)
+                    },
+                )
             }
         }
     }
@@ -2350,3 +2999,6 @@ private fun maskKey(key: String): String {
     if (key.length <= 8) return "••••"
     return key.take(4) + "••••" + key.takeLast(4)
 }
+
+
+

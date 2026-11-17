@@ -9,6 +9,22 @@ package com.simplechat.app.db
  */
 object MessageTree {
 
+    /** Root-to-target ancestry, including inactive branches. Invalid chains cannot be activated. */
+    fun ancestry(all: List<MessageLight>, targetId: String): List<MessageLight> {
+        val byId = all.associateBy { it.id }
+        val path = ArrayList<MessageLight>()
+        val seen = HashSet<String>()
+        var id = targetId
+        while (id != MessageEntity.ROOT_PARENT) {
+            val node = byId[id] ?: return emptyList()
+            if (!seen.add(id)) return emptyList()
+            path += node
+            id = node.parentId
+        }
+        path.reverse()
+        return path
+    }
+
     /**
      * 当前对话 = 从根沿 `active` 一路走到底的那条路径。
      *
@@ -33,6 +49,27 @@ object MessageTree {
     /** `parentId` → 兄弟数量。用于渲染 `‹ n/m ›`。 */
     fun siblingCounts(all: List<MessageEntity>): Map<String, Int> =
         siblingCountsOf(all.map { it.parentId })
+
+    /**
+     * 同 [activePath]，但只吃**骨架**（[MessageLight]）并只返回 id。
+     *
+     * 打开长会话时先读骨架（每行几十字节）走出路径，再按 id 只取这条路径的正文 ——
+     * 被放弃的分支因此一次都不会被读出来（见 `ChatRepository.loadActivePath`）。
+     */
+    fun activePathIds(all: List<MessageLight>): List<String> {
+        val byParent = all.groupBy { it.parentId }
+        val path = ArrayList<String>()
+        val visited = HashSet<String>()
+
+        var parentId: String = MessageEntity.ROOT_PARENT
+        while (true) {
+            val next = byParent[parentId]?.firstOrNull { it.active } ?: break
+            if (!visited.add(next.id)) break
+            path += next.id
+            parentId = next.id
+        }
+        return path
+    }
 
     /**
      * 同上，但只吃 `parentId` 列表。

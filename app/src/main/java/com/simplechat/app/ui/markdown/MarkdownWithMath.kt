@@ -4,14 +4,27 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.*
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontFamily
+import com.simplechat.app.R
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.hrm.latex.renderer.Latex
 import com.hrm.latex.renderer.model.LatexConfig
 import com.hrm.latex.renderer.model.LatexTheme
+import com.simplechat.app.ui.theme.LocalIsDarkTheme
 
 /**
  * 带公式渲染的正文：按 [splitMath] 把内容切成文本段与公式段，交替渲染。
@@ -49,6 +62,21 @@ fun MarkdownWithMath(
     }
 
     val fontSize = LatexFontSize
+    /*
+     * 公式主题：**透明底 + 正文色**。
+     *
+     * ⚠️ 不能用库的 `LatexTheme.material3()` —— 那个会把 `colorScheme.surface`
+     * 当作公式画布底色（浅色下是纯白、深色下是卡片灰），于是每段公式后面
+     * 拖着一整条色块（真机反馈的灰底就是这么来的）。官方 KaTeX 是透明底。
+     *
+     * 也不能用 `LatexTheme.auto()`：它按**系统**深浅色选色板，而本项目允许
+     * 强制浅色 / 深色，两者可能不一致 —— 会出现"深色页面上一段黑公式"。
+     */
+    val dark = LocalIsDarkTheme.current
+    val textColor = MaterialTheme.colorScheme.onBackground
+    val latexTheme = remember(dark, textColor) {
+        if (dark) LatexTheme.dark(color = textColor) else LatexTheme.light(color = textColor)
+    }
 
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
         segments.forEach { segment ->
@@ -58,22 +86,34 @@ fun MarkdownWithMath(
                     streaming = streaming,
                 )
 
-                is ContentSegment.Formula -> Latex(
-                    latex = segment.tex,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        // 行间公式上下多给一点空：它是一整块内容，不是一句话里的符号
-                        .padding(vertical = if (segment.display) 4.dp else 0.dp),
-                    config = LatexConfig(
-                        fontSize = fontSize,
-                        // 跟主题走：深色模式下公式也要是浅色，固定色板会在夜间变成一团黑
-                        theme = LatexTheme.material3(),
-                    ),
-                    /*
-                     * 居中交给排版下方（`fillMaxWidth` + 组件自身居中），
-                     * 这里只把行内公式按左对齐处理 —— 行内公式独占一行时左对齐更自然。
-                     */
-                )
+                is ContentSegment.Formula -> CompatibleFormula(segment, LatexConfig(fontSize = fontSize, theme = latexTheme))
+            }
+        }
+    }
+}
+
+@Composable
+private fun CompatibleFormula(segment: ContentSegment.Formula, config: LatexConfig) {
+    val prepared by produceState<LatexPresentation?>(null, segment.tex) {
+        value = withContext(Dispatchers.Default) { prepareLatexPresentation(segment.tex) }
+    }
+    var sourceVisible by remember(segment.tex) { mutableStateOf(false) }
+    val presentation = prepared
+    Column(Modifier.fillMaxWidth().padding(vertical = if (segment.display) 4.dp else 0.dp)) {
+        if (presentation?.simplified == true) TextButton(onClick = { sourceVisible = !sourceVisible }) {
+            Text(stringResource(if (sourceVisible) R.string.latex_show_rendered else R.string.latex_compatible_source))
+        }
+        if (presentation?.nativeTex != null && !sourceVisible) {
+            // Horizontal scrolling keeps wide formulas accessible instead of clipping content.
+            Latex(latex = presentation.nativeTex, config = config,
+                modifier = Modifier.horizontalScroll(rememberScrollState()))
+        } else {
+            if (presentation != null && presentation.nativeTex == null) {
+                Text(stringResource(R.string.latex_source_fallback), style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            SelectionContainer {
+                Text(segment.tex, style = MaterialTheme.typography.bodyLarge.copy(fontFamily = FontFamily.Monospace))
             }
         }
     }

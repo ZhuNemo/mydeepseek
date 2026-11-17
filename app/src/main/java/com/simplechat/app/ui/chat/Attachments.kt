@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -84,6 +85,11 @@ private val MessageThumbSize = 104.dp
 /** 预览之间的间隙。 */
 private val MessageThumbGap = 6.dp
 
+/** AI 消息里图片的最大宽度 / 高度范围（按原比例，不裁成方块）。 */
+private val MessageImageWidth = 240.dp
+private val MessageImageMinHeight = 120.dp
+private val MessageImageMaxHeight = 320.dp
+
 // ══════════════════════════════════════════════════════════
 //  解码
 // ══════════════════════════════════════════════════════════
@@ -109,7 +115,8 @@ fun rememberAttachmentImage(attachment: Attachment, targetPx: Int): ImageBitmap?
         value = withContext(Dispatchers.IO) {
             // 落盘的从文件读，内联的走 base64 —— 渲染层只认字节，不关心存哪
             val stored = if (attachment.isStored) AttachmentFiles.read(context, attachment.path) else null
-            decodeSampled(stored ?: Base64.decode(attachment.data, Base64.NO_WRAP), targetPx)
+            val bytes = stored ?: runCatching { Base64.decode(attachment.data, Base64.NO_WRAP) }.getOrNull()
+            bytes?.let { decodeSampled(it, targetPx.coerceAtLeast(1)) }
         }
     }
     return state
@@ -378,6 +385,74 @@ private fun MessageThumb(
  * 图片已经搬到气泡上方（见 [UserImagePreviews]），这里只剩纯文本 / 文档，
  * 它们本来就是"一张小卡片"，留在气泡里与文字同排最自然。
  */
+/**
+ * 一条消息携带的附件（**AI 消息**用）。
+ *
+ * 与用户气泡那条路刻意不同：用户发的图统一成气泡上方的正方形预览
+ * （见 [UserImagePreviews]）；AI 回复里的图（生图、截图解读后的回显）
+ * 不该被裁成方块，按原始宽高比显示。
+ */
+@Composable
+fun MessageAttachments(
+    attachments: List<Attachment>,
+    onOpenImage: (Attachment) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    if (attachments.isEmpty()) return
+    val images = attachments.filter { it.isImage }
+    val files = attachments.filter { !it.isImage }
+
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        images.forEach { spec ->
+            AttachmentSurface(inUserBubble = false) {
+                ScaledImage(spec, onClick = { onOpenImage(spec) })
+            }
+        }
+        MessageFiles(files)
+    }
+}
+
+/**
+ * 按原始宽高比显示。
+ *
+ * 宽高取不到（老数据）时按 4:3 占位 —— 与其等解码完再跳一次高度，
+ * 不如先用存下来的比例把位置撑住。
+ */
+@Composable
+private fun ScaledImage(spec: Attachment, onClick: () -> Unit) {
+    val ratio = if (spec.width > 0 && spec.height > 0) {
+        spec.width.toFloat() / spec.height
+    } else {
+        4f / 3f
+    }
+    val width = MessageImageWidth
+    val height = (width / ratio).coerceIn(MessageImageMinHeight, MessageImageMaxHeight)
+    val bitmap = rememberAttachmentImage(
+        attachment = spec,
+        targetPx = with(LocalDensity.current) { width.roundToPx() },
+    )
+
+    Box(
+        modifier = Modifier
+            .size(width, height)
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap,
+                contentDescription = spec.name,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+    }
+}
+
 @Composable
 fun MessageFiles(
     files: List<Attachment>,

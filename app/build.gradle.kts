@@ -33,8 +33,10 @@ android {
         applicationId = "com.simplechat.app"
         minSdk = 26
         targetSdk = 37
+        // 版本号取本仓库（我们的功能线），上游的 testInstrumentationRunner 保留
         versionCode = 16
         versionName = "1.2.3"
+        testInstrumentationRunner = "com.simplechat.app.DeviceRegression"
         vectorDrawables { useSupportLibrary = true }
     }
 

@@ -1,15 +1,19 @@
 package com.simplechat.app.ui.chat
 
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.simplechat.app.R
+import com.simplechat.app.data.ApiKey
+import com.simplechat.app.data.BackgroundGeneration
 import com.simplechat.app.data.Attachment
 import com.simplechat.app.data.ChatRepository
 import com.simplechat.app.ui.markdown.warmMarkdownCache
@@ -29,6 +33,7 @@ import com.simplechat.app.data.userMessage
 import com.simplechat.app.db.CompactionEntity
 import com.simplechat.app.db.DraftEntity
 import com.simplechat.app.net.ChatApi
+import com.simplechat.app.net.DeepSeekTts
 import com.simplechat.app.net.ApiStyle
 import com.simplechat.app.net.MessageContent
 import com.simplechat.app.net.ModelCatalog
@@ -39,16 +44,21 @@ import com.simplechat.app.net.ReplyBlock
 import com.simplechat.app.net.StreamEvent
 import com.simplechat.app.net.anthropic.AnthropicRequest
 import com.simplechat.app.net.headersFor
-import androidx.compose.runtime.derivedStateOf
+import com.simplechat.app.net.isOfficialDeepSeekEndpoint
+import com.simplechat.app.net.serverErrorText
 import java.util.UUID
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
 
 /**
  * 对话状态与流式调度。
@@ -66,6 +76,14 @@ import kotlinx.coroutines.withContext
  */
 /** 换会话时后台预热的尾部消息条数：贴底打开先看到的就是这几条。 */
 private const val WarmTailMessages = 10
+
+/**
+ * 预热时单条消息的长度上限。
+ *
+ * 一条几万字的消息解析要几百毫秒；替它预热不会让首屏更快（列表本身也要等它排版），
+ * 只会把后台线程占满、拖慢真正该快的那几条。
+ */
+private const val WarmTailMaxChars = 24_000
 
 class ChatViewModel(
     private val chatApi: ChatApi,
@@ -158,6 +176,26 @@ class ChatViewModel(
     var isStreaming by mutableStateOf(false)
         private set
 
+    var imageSkipNotice by mutableStateOf<String?>(null)
+        private set
+    private var showImageSkipNotice = true
+    private var skippedNoVision = 0
+    private var skippedUnreadable = 0
+
+    fun dismissImageSkipNotice() { imageSkipNotice = null }
+    fun neverRemindImageSkip() {
+        showImageSkipNotice = false
+        imageSkipNotice = null
+        viewModelScope.launch {
+            try { settingsStore.setShowImageSkipNotice(false) }
+            catch (error: kotlinx.coroutines.CancellationException) { throw error }
+            catch (error: Exception) {
+                showImageSkipNotice = true
+                banner = error.userMessage()
+            }
+        }
+    }
+
     var banner by mutableStateOf<String?>(null)
         private set
 
@@ -171,6 +209,35 @@ class ChatViewModel(
      * 而 `stored` 里带着 API Key 等敏感字段。设置里换音色 → 流回来 → 朗读立即生效。
      */
     var ttsVoiceName by mutableStateOf("")
+        private set
+
+    var autoReadAloud by mutableStateOf(false)
+        private set
+    private val replyCompletions = MutableSharedFlow<CompletedReply>(extraBufferCapacity = 1)
+    val completedReplies = replyCompletions.asSharedFlow()
+
+    fun toggleAutoReadAloud() {
+        val next = !autoReadAloud
+        autoReadAloud = next
+        viewModelScope.launch {
+            try { settingsStore.setAutoReadAloud(next) }
+            catch (error: kotlinx.coroutines.CancellationException) { throw error }
+            catch (error: Exception) {
+                autoReadAloud = !next
+                banner = error.userMessage()
+            }
+        }
+    }
+
+    /**
+     * DeepSeek **官方** TTS 的接入参数；null = 当前服务商不支持官方朗读。
+     *
+     * 只有「服务商 = DeepSeek 官方 + Base URL 指向官方域 + Key 已填」才非空 ——
+     * 官方 `/v1/tools/tts` 只在官方域提供。界面据此：
+     * - 设置页列不列 `Stella` / `Tide` 两个官方音色；
+     * - 对话页显不显示朗读按钮（用户要求：不支持的 API 直接隐藏入口）。
+     */
+    var officialTts by mutableStateOf<DeepSeekTts.Config?>(null)
         private set
 
     /**
@@ -229,9 +296,11 @@ class ChatViewModel(
         private set
 
     private var streamJob: Job? = null
+    private var streamGeneration = 0L
 
     /** 会话切换任务；`send()` 会等它完成，避免把消息插进半成品列表。 */
     private var switchJob: Job? = null
+    private val sendMutex = Mutex()
 
     /** 会话级设置（补充提示词 / 预设勾选）的防抖落库任务。 */
     private var settingsPersistJob: Job? = null
@@ -256,6 +325,12 @@ class ChatViewModel(
     private var stored: StoredSettings = StoredSettings()
     private var previousProviderKind: ProviderKind? = null
 
+    /** 上一次见到的端点，用来判断"模型列表该不该作废 / 换一份"。 */
+    private var previousBaseUrl: String? = null
+
+    /** 上一次见到的远端模型列表（落库的那份），同理只用来比较。 */
+    private var previousModelIds: List<String> = emptyList()
+
     /** 流式 checkpoint 的节流计时。 */
     private var lastCheckpointAt = 0L
 
@@ -275,6 +350,26 @@ class ChatViewModel(
         }
 
         /*
+         * 上下文统计：消息 / 设置 / 预设 / 压缩任何一个变了就重算，
+         * 但**防抖 + 后台线程**（原因见 contextStats 的说明）。
+         *
+         * 用 `collectLatest` + `delay` 而不是 `debounce`：后者是 FlowPreview API，
+         * 而这里要的语义就是"新输入来了就取消上一次等待"，两行代码说清楚。
+         *
+         * ⚠️ 这个 init 块**必须声明在 `settings` 等状态之后**：Kotlin 按声明顺序
+         * 初始化属性，而 `Main.immediate` 的 `launch` 会当场执行到第一个挂起点 ——
+         * 放在前面会读到还没赋值的委托（真机表现为启动即 NPE）。
+         */
+        viewModelScope.launch {
+            snapshotFlow { StatsInput(messages.toList(), settings, presets, compaction) }
+                .collectLatest { input ->
+                    delay(ContextStatsDebounceMs)
+                    val stats = withContext(Dispatchers.Default) { computeContextStats(input) }
+                    contextStats = stats
+                }
+        }
+
+        /*
          * 启动时**不恢复上次打开的会话**，一律停在「新对话」。
          *
          * 早先是恢复的，代价是：每次打开 App 都直接落进上一次那段对话里，
@@ -289,15 +384,35 @@ class ChatViewModel(
     private fun applyStored(value: StoredSettings) {
         val kind = runCatching { ProviderKind.valueOf(value.providerId) }
             .getOrDefault(ProviderKind.DEEPSEEK)
-        if (kind != previousProviderKind) {
+        /*
+         * 模型列表有两个来源，都要跟：**端点换了**（服务商 / Base URL）要换一份，
+         * **拉取结果变了**（设置页测试连接、或本页刷新）要跟着更新。
+         *
+         * 用 [ModelCatalog.pickerModels] 而不是 `knownModels`：自定义端点的内置
+         * 目录是空的，早先它会把拉到的模型列表整个抹掉 —— 于是"拉取成功"之后
+         * 一进设置、或重启一次，列表就空了。
+         */
+        val endpointChanged = kind != previousProviderKind || value.baseUrl != previousBaseUrl
+        if (endpointChanged || value.modelIds != previousModelIds) {
             previousProviderKind = kind
-            models = ModelCatalog.knownModels(kind)
-            modelHint = null
+            previousBaseUrl = value.baseUrl
+            previousModelIds = value.modelIds
+            models = ModelCatalog.pickerModels(kind, value.modelIds)
+            // 端点换了，上一轮的"已拉取 N 个"不再成立；只是列表更新则保留提示
+            if (endpointChanged) modelHint = null
         }
         apiStyle = ApiStyle.resolve(kind, value.apiStyleId, value.baseUrl)
         webSearch = value.webSearch
         autoCollapseThinking = value.autoCollapseThinking
         ttsVoiceName = value.ttsVoiceName
+        autoReadAloud = value.autoReadAloud
+        showImageSkipNotice = value.showImageSkipNotice
+        if (!showImageSkipNotice) imageSkipNotice = null
+        officialTts = if (DeepSeekTts.isOfficialTtsVoiceAvailable(value.providerId, value.apiKey)) {
+            DeepSeekTts.Config(value.apiKey)
+        } else {
+            null
+        }
         settings = settings.copy(
             model = ModelCatalog.find(kind, value.modelId),
             reasoningLevel = runCatching { ReasoningLevel.valueOf(value.reasoningLevelId) }
@@ -365,6 +480,16 @@ class ChatViewModel(
      * 另外用 [switchGeneration] 丢弃过期结果：快速连点两个会话时，
      * 先发的那次加载不能覆盖后发的。
      */
+    var searchTarget by mutableStateOf<SearchTarget?>(null)
+        private set
+    private var searchRequest = 0L
+
+    fun markSearchReady(request: Long) {
+        searchTarget?.takeIf { it.request == request }?.let { searchTarget = it.copy(ready = true) }
+    }
+
+    fun dismissSearch() { searchTarget = null }
+
     /**
      * 从库里重新载入**当前**会话。
      *
@@ -389,13 +514,18 @@ class ChatViewModel(
         }
     }
 
-    fun openConversation(id: String) {
-        if (id == currentConversationId) return
+    fun openConversation(id: String, targetMessageId: String? = null, query: String = "") {
+        if (id == currentConversationId && targetMessageId == null) return
+        searchTarget = targetMessageId?.let { SearchTarget(it, query, ++searchRequest) }
+        imageSkipNotice = null
         stop()
+        cancelCompaction()
         switchJob?.cancel()
 
         val generation = ++switchGeneration
         currentConversationId = id
+        // 换会话 = 换一轮上下文：上一轮的用量与缓存命中率不再适用
+        lastUsage = null
         // 标题立刻开始观察；下面那句清空只是防止旧标题残留一帧
         observeTitle(id)
         switching = true
@@ -403,12 +533,16 @@ class ChatViewModel(
         currentConversationTitle = null
 
         switchJob = viewModelScope.launch {
+            try {
             // 先清扫上次被中断的流式消息，否则它会以 STREAMING 状态卡在界面上
             repository.resolveDanglingStreams(id)
+            if (targetMessageId != null) repository.revealSearchMessage(id, targetMessageId)
 
             val loaded = repository.loadActivePath(id)
+
             val loadedCompaction = repository.getCompactions(id).lastOrNull()
             val conversation = repository.findConversation(id)
+            val loadedPresetIds = repository.getEnabledPresetIds(id)
 
             if (generation != switchGeneration) return@launch
 
@@ -425,10 +559,13 @@ class ChatViewModel(
              * 转圈因此是顺的。
              */
             withContext(Dispatchers.Default) {
-                loaded.asReversed().take(WarmTailMessages).forEach { message ->
-                    warmMarkdownCache(message.content)
-                }
+                loaded.asReversed()
+                    .take(WarmTailMessages)
+                    // 超长消息不预热：解析它本身就要几百毫秒，预热只会把后台线程占满
+                    .filter { it.content.length <= WarmTailMaxChars }
+                    .forEach { message -> warmMarkdownCache(message.content) }
             }
+
 
             if (generation != switchGeneration) return@launch
 
@@ -445,6 +582,7 @@ class ChatViewModel(
              */
             messages.clear()
             messages.addAll(loaded)
+
             compaction = loadedCompaction
             if (conversation != null) {
                 // 顺手填一次，避免标题晚一帧才出来；**真相仍是 observeTitle 那条流**
@@ -459,17 +597,28 @@ class ChatViewModel(
                      * `enabledPresetIds` 就空了 —— 「最终提示词」里预设那一段
                      * 凭空消失，请求也就少发了。
                      */
-                    enabledPresetIds = repository.getEnabledPresetIds(id),
+                    enabledPresetIds = loadedPresetIds,
                 )
             }
-            switching = false
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                if (generation == switchGeneration) {
+                    messages.clear()
+                    banner = Res.get(R.string.conversation_load_failed, error.userMessage())
+                }
+            } finally {
+                if (generation == switchGeneration) switching = false
+            }
         }
     }
 
     fun newConversation() {
+        searchTarget = null
         stop()
         cancelCompaction()
         switchJob?.cancel()
+        ++switchGeneration
         titleObserverJob?.cancel()
         currentConversationId = null
         // 「新对话」的待用标题还在（与草稿一样，不因为点了新建就被吞掉）
@@ -477,6 +626,7 @@ class ChatViewModel(
         compaction = null
         messages.clear()
         banner = null
+        imageSkipNotice = null
         switching = false
         settings = settings.copy(systemPrompt = "")
     }
@@ -485,15 +635,16 @@ class ChatViewModel(
 
     fun updateSettings(next: ConversationSettings) {
         val previous = settings
+        val profileId = stored.activeApiProfileId
         settings = next
         viewModelScope.launch {
-            if (next.model.id != previous.model.id) settingsStore.setModel(next.model.id)
+            if (next.model.id != previous.model.id) settingsStore.setModel(next.model.id, profileId)
             if (next.reasoningLevel != previous.reasoningLevel) {
-                settingsStore.setReasoningLevel(next.reasoningLevel.name)
+                settingsStore.setReasoningLevel(next.reasoningLevel.name, profileId)
             }
-            if (next.temperature != previous.temperature) settingsStore.setTemperature(next.temperature)
-            if (next.topP != previous.topP) settingsStore.setTopP(next.topP)
-            if (next.maxTokens != previous.maxTokens) settingsStore.setMaxTokens(next.maxTokens ?: 0)
+            if (next.temperature != previous.temperature) settingsStore.setTemperature(next.temperature, profileId)
+            if (next.topP != previous.topP) settingsStore.setTopP(next.topP, profileId)
+            if (next.maxTokens != previous.maxTokens) settingsStore.setMaxTokens(next.maxTokens ?: 0, profileId)
         }
 
         /*
@@ -528,73 +679,108 @@ class ChatViewModel(
         if (refreshingModels) return
         refreshingModels = true
         modelHint = null
+        val source = stored
         viewModelScope.launch {
-            chatApi.fetchModels(
-                baseUrl = stored.baseUrl.ifBlank { providerKind.defaultBaseUrl },
-                apiKey = stored.apiKey,
+            val result = chatApi.fetchModels(
+                baseUrl = source.baseUrl.ifBlank { providerKind.defaultBaseUrl },
+                apiKey = source.apiKey,
             )
-                .onSuccess { ids ->
-                    models = ModelCatalog.merge(providerKind, ids)
-                    modelHint = Res.get(R.string.models_fetched, ids.size)
-                }
-                .onFailure { error ->
-                    modelHint = Res.get(R.string.models_fetch_failed, error.userMessage()) +
-                        if (!stored.hasKey) Res.get(R.string.models_fetch_needs_key) else ""
-                }
+            if (stored.activeApiProfileId != source.activeApiProfileId || stored.baseUrl != source.baseUrl) {
+                refreshingModels = false
+                return@launch
+            }
+            result.onSuccess { ids ->
+                models = ModelCatalog.pickerModels(providerKind, ids)
+                modelHint = Res.get(R.string.models_fetched, ids.size)
+            }
+            result.onFailure { error ->
+                modelHint = Res.get(R.string.models_fetch_failed, error.userMessage()) +
+                    if (!stored.hasKey) Res.get(R.string.models_fetch_needs_key) else ""
+            }
+            // 落库：设置页的「模型」选择器读的是这份，重启后也还在
+            result.getOrNull()?.let { settingsStore.setModelIds(it, source.activeApiProfileId, source.baseUrl) }
             refreshingModels = false
         }
     }
 
     // ── 发送 ──────────────────────────────────────────────
 
-    fun send(prompt: String, attachments: List<Attachment> = emptyList()) {
+    fun send(prompt: String, attachments: List<Attachment> = emptyList(), onPersisted: () -> Unit = {}) {
         val text = prompt.trim()
         // 允许「只有附件、没有文字」—— 丢一张图进来说"看看这个"是最自然的用法
-        if ((text.isEmpty() && attachments.isEmpty()) || isStreaming) return
+        if ((text.isEmpty() && attachments.isEmpty()) || isStreaming || switching) return
 
         if (!stored.hasKey && providerKind != ProviderKind.OPENCODE_GO) {
             banner = Res.get(R.string.error_no_api_key)
             return
         }
 
+        /*
+         * 还没选模型就发：自定义服务商的 `defaultModel` 是空串，而请求里的
+         * `model` 字段一旦为空，服务端只会回一句看不懂的 400。在这里拦下来
+         * 并直接说"去哪儿选"。
+         */
+        if (stored.modelId.isBlank()) {
+            banner = Res.get(R.string.error_no_model)
+            return
+        }
+
         banner = null
+        imageSkipNotice = null
 
+        val requestedGeneration = switchGeneration
         viewModelScope.launch {
-            // 会话还在切换 → 等它读完再发，否则消息会被插进半成品列表（顺序颠倒）
-            switchJob?.join()
+            if (!sendMutex.tryLock()) return@launch
+            try {
+                // 会话还在切换 → 等它读完再发，否则消息会被插进半成品列表（顺序颠倒）
+                switchJob?.join()
+                if (requestedGeneration != switchGeneration) return@launch
+                val conversationId = ensureConversation(requestedGeneration) ?: return@launch
+                val generation = requestedGeneration
+                val model = settings.model.id
 
-            val conversationId = ensureConversation()
+                val user = repository.appendUserMessage(conversationId, text, attachments)
+                if (generation != switchGeneration || conversationId != currentConversationId) return@launch
+                onPersisted()
+                // 首条用户消息会触发库里自动命名，顶栏同步一次
+                currentConversationTitle = repository.findConversation(conversationId)?.title
+                if (generation != switchGeneration || conversationId != currentConversationId) return@launch
+                messages += user
 
-            val user = repository.appendUserMessage(conversationId, text, attachments)
-            // 首条用户消息会触发库里自动命名，顶栏同步一次
-            currentConversationTitle = repository.findConversation(conversationId)?.title
-            messages += user
+                // 回复挂在**刚发的这条**下面
+                val assistantId = repository.beginAssistantMessage(
+                    conversationId = conversationId,
+                    parentId = user.id,
+                    // 记下这条是谁写的 —— 事后换模型时，历史才分得清
+                    model = model,
+                )
+                if (generation != switchGeneration || conversationId != currentConversationId) return@launch
+                messages += UiMessage(
+                    id = assistantId,
+                    role = MessageRole.ASSISTANT,
+                    content = "",
+                    reasoning = "",
+                    status = MessageStatus.STREAMING,
+                    parentId = user.id,
+                    /*
+                     * 这条内存对象是**手工构造**的，不走 `MessageEntity.toUi()`，
+                     * 所以字段要一个个搬 —— 漏掉一个，它就会在整段流式期间缺失。
+                     * （`model` 就漏过一次：库里写了、界面上看不到。）
+                     *
+                     * 重新生成那条路径没这个问题：它走 `reloadPath` 从库读回来。
+                     */
+                    model = model,
+                )
 
-            // 回复挂在**刚发的这条**下面
-            val assistantId = repository.beginAssistantMessage(
-                conversationId = conversationId,
-                parentId = user.id,
-                // 记下这条是谁写的 —— 事后换模型时，历史才分得清
-                model = settings.model.id,
-            )
-            messages += UiMessage(
-                id = assistantId,
-                role = MessageRole.ASSISTANT,
-                content = "",
-                reasoning = "",
-                status = MessageStatus.STREAMING,
-                parentId = user.id,
-                /*
-                 * 这条内存对象是**手工构造**的，不走 `MessageEntity.toUi()`，
-                 * 所以字段要一个个搬 —— 漏掉一个，它就会在整段流式期间缺失。
-                 * （`model` 就漏过一次：库里写了、界面上看不到。）
-                 *
-                 * 重新生成那条路径没这个问题：它走 `reloadPath` 从库读回来。
-                 */
-                model = settings.model.id,
-            )
-
-            startStream(conversationId, assistantId)
+                startStream(conversationId, assistantId)
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                android.util.Log.e("SimpleChat/Send", "Preparing message failed", error)
+                banner = Res.get(R.string.error_send_failed, error.userMessage())
+            } finally {
+                sendMutex.unlock()
+            }
         }
     }
 
@@ -605,9 +791,11 @@ class ChatViewModel(
      * 一个不存在的 id —— 此时直接往它下面插消息会撞外键约束。
      * 这里顺手把内存状态清干净，界面也就自然回到空态。
      */
-    private suspend fun ensureConversation(): String {
+    private suspend fun ensureConversation(generation: Int): String? {
         val existing = currentConversationId
-        if (existing != null && repository.findConversation(existing) != null) return existing
+        val exists = existing != null && repository.findConversation(existing) != null
+        if (generation != switchGeneration) return null
+        if (exists) return existing
 
         messages.clear()
         compaction = null
@@ -621,6 +809,7 @@ class ChatViewModel(
             // 用户在发第一条消息之前就起好了名 → 直接用它，不再让 AI 起
             title = pendingTitle ?: Res.get(R.string.conversation_default_title),
         )
+        if (generation != switchGeneration) return null
         if (pendingTitle != null) {
             // 名字是用户起的，`maybeGenerateTitle` 不该覆盖它
             titleGeneratedFor = id
@@ -632,7 +821,9 @@ class ChatViewModel(
         currentConversationId = id
         // 新会话刚建出来，标题也要开始观察（首条消息会触发库里自动命名）
         observeTitle(id)
-        currentConversationTitle = repository.findConversation(id)?.title
+        val title = repository.findConversation(id)?.title
+        if (generation != switchGeneration) return null
+        currentConversationTitle = title
         return id
     }
 
@@ -644,7 +835,9 @@ class ChatViewModel(
      * 原地修补要处理的组合太多，读一遍反而又快又不会错。
      */
     private suspend fun reloadPath(conversationId: String) {
+        val generation = switchGeneration
         val path = repository.loadActivePath(conversationId)
+        if (conversationId != currentConversationId || generation != switchGeneration) return
         messages.clear()
         messages.addAll(path)
         pathRevision++
@@ -665,7 +858,7 @@ class ChatViewModel(
         if (compacting || isStreaming) return
         val conversationId = currentConversationId ?: return
 
-        val existing = compaction
+        val existing = validCompaction(messages, compaction)
 
         /*
          * **增量滚动压缩**：只总结上次摘要之后的新增部分。
@@ -708,6 +901,7 @@ class ChatViewModel(
         compacting = true
         compactPreview = ""
         banner = null
+        imageSkipNotice = null
 
         compactJob = viewModelScope.launch {
             val transcript = buildString {
@@ -757,11 +951,14 @@ class ChatViewModel(
                             compactPreview = collected.toString()
                         }
 
-                        is StreamEvent.Error -> failure = event.message
+                        // 流内错误对象是**上游网关原文**：先翻成人话，认不出才保留原文
+                        is StreamEvent.Error -> failure = serverErrorText(event.message)
                         else -> Unit
                     }
                 }
-            } catch (t: Throwable) {
+            } catch (t: kotlinx.coroutines.CancellationException) {
+                throw t
+            } catch (t: Exception) {
                 failure = t.userMessage()
             }
 
@@ -781,10 +978,19 @@ class ChatViewModel(
                 createdAt = existing?.createdAt ?: System.currentTimeMillis(),
                 updatedAt = System.currentTimeMillis(),
             )
-            repository.saveCompaction(entity)
-            compaction = entity
-            compacting = false
-            compactPreview = ""
+            try {
+                repository.saveCompaction(entity)
+                if (conversationId == currentConversationId) compaction = entity
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                if (conversationId == currentConversationId) banner = Res.get(R.string.compact_failed_detail, error.userMessage())
+            } finally {
+                if (conversationId == currentConversationId) {
+                    compacting = false
+                    compactPreview = ""
+                }
+            }
         }
     }
 
@@ -815,11 +1021,77 @@ class ChatViewModel(
     /**
      * 当前会话的上下文占用与性能统计。
      *
-     * 用 `derivedStateOf` 缓存：流式期间每 50ms 就会重组一次，
-     * 若每次都对全部消息重扫一遍，长会话里会白白吃掉帧预算。
+     * ### 为什么不用 `derivedStateOf`
+     *
+     * 这段统计要**扫一遍全部消息的正文**来估 token。写成 `derivedStateOf` 时它依赖
+     * `messages` 这个快照列表 —— 而流式期间列表每 16ms 就变一次，于是它每帧都把
+     * 整条会话重新扫一遍（三十万 token 的会话 ≈ 每帧几十万字符 + 若干次全量 map）。
+     * 真机表现就是：长会话里一开始生成，整个界面就发涩、滑不动。
+     *
+     * 现在改成 `snapshotFlow` + 防抖 + 后台线程：输入栏上那行统计晚几百毫秒更新
+     * 完全无所谓，而主线程不再为它做任何与正文长度相关的工作。
      */
-    val contextStats: ContextStats by derivedStateOf {
-        val active = compaction
+    var contextStats by mutableStateOf(emptyContextStats())
+        private set
+
+    /**
+     * **最近一次请求**的真实用量（服务端在流末尾回报的，不是本地估算）。
+     *
+     * 只保留最近一次：缓存命中率说的是"这一轮的前缀有没有被复用"，
+     * 跨轮聚合反而会把它稀释成一个看不出变化的平均数。
+     * 切换会话时清空 —— 新会话还没发过请求，显示上一轮的数字是错的。
+     */
+    var lastUsage by mutableStateOf<RequestUsage?>(null)
+        private set
+
+    /**
+     * 记录用量。
+     *
+     * 两个通道都是一条流里**分两次**报的（Anthropic：`message_start` 只有输入侧、
+     * `message_delta` 只有输出侧；OpenAI 通道有些网关也会拆开），所以这里做合并：
+     * 有值就覆盖、没值就沿用上一次，缺字段不能把已有数据冲成 0。
+     */
+    private fun recordUsage(event: StreamEvent.Usage) {
+        val previous = lastUsage
+        lastUsage = RequestUsage(
+            promptTokens = event.promptTokens.takeIf { it > 0 } ?: previous?.promptTokens ?: 0,
+            completionTokens = maxOf(event.completionTokens, previous?.completionTokens ?: 0),
+            cacheHitTokens = event.cacheHitTokens ?: previous?.cacheHitTokens,
+        )
+    }
+
+    private fun emptyContextStats() = ContextStats(
+        usedTokens = 0,
+        windowTokens = settings.model.contextWindow,
+        messageCount = messages.size,
+        totalTokens = 0,
+        compactedTokenSaving = 0,
+        avgTtftMs = null,
+        avgTps = null,
+        totalThinkingSeconds = null,
+        hasCompaction = compaction != null,
+    )
+
+    /**
+     * 统计的**输入快照**。
+     *
+     * 刻意做成一个 data class 而不是在 flow 里直接读各状态：`snapshotFlow` 用
+     * `equals` 判"有没有变"，这里一次读全，语义最清楚（消息 / 设置 / 预设 / 压缩
+     * 任何一项变了都要重算）。
+     */
+    @Immutable
+    private data class StatsInput(
+        val messages: List<UiMessage>,
+        val settings: ConversationSettings,
+        val presets: List<Preset>,
+        val compaction: CompactionEntity?,
+    )
+
+    private fun computeContextStats(input: StatsInput): ContextStats {
+        val messages = input.messages
+        val settings = input.settings
+        val presets = input.presets
+        val active = validCompaction(messages, input.compaction)
 
         // —— 实际会发给 API 的部分 ——
         val system = settings.composedSystemPrompt(presets)
@@ -839,7 +1111,7 @@ class ChatViewModel(
         val tpsList = messages.mapNotNull { it.tps }
         val thinking = messages.mapNotNull { it.reasoningSeconds }
 
-        ContextStats(
+        return ContextStats(
             usedTokens = TokenEstimate.ofAll(inContext) + attachmentTokens,
             windowTokens = settings.model.contextWindow,
             messageCount = messages.size,
@@ -945,22 +1217,51 @@ class ChatViewModel(
     /**
      * 编辑一条消息。
      *
-     * 新版本挂在**原消息的父亲**下，成为它的**兄弟**：
-     * 旧的那条连同它**整棵子树**原样留着，切回去就能看到。
+     * 两个出口，两条完全不同的路：
      *
-     * - [resend] = false：只换文字，新兄弟没有子树 → 路径在此结束
-     * - [resend] = true：换文字后在新兄弟下再生成一条回复
+     * - **[resend] = false（「保存」）**：**原地**改这一条的文字，不新增版本、不碰下游。
+     *   用户改个错别字不该冒出 `‹ 1/2 ›`，更不该让会话下半段当场消失 ——
+     *   早先这里和「保存并发送」共用 `addActiveVariant`，于是"保存"也长出一条
+     *   没有子树的新分支，看起来就是"保存把后面的聊天删了"。
+     *
+     * - **[resend] = true（「保存并发送」）**：新版本挂在**原消息的父亲**下，成为它的
+     *   **兄弟**；旧的那条连同它**整棵子树**原样留着，切回去就能看到。
+     *   然后在新兄弟下再生成一条回复（分支 + 继续往下）。
      *
      * **两种角色都不删任何东西。** 这正是换成树模型换来的东西。
      */
-    fun editMessage(target: UiMessage, newText: String, resend: Boolean, attachments: List<Attachment>? = null) {
-        if (isStreaming) return
+    fun editMessage(target: UiMessage, newText: String, resend: Boolean, attachments: List<Attachment>? = null, onPersisted: () -> Unit = {}) {
+        if (isStreaming || switching) return
         val text = newText.trim()
         val kept = attachments ?: target.attachments
         if (text.isEmpty() && kept.isEmpty()) return
         val conversationId = currentConversationId ?: return
 
+        val generation = switchGeneration
         viewModelScope.launch {
+            if (!sendMutex.tryLock()) return@launch
+            try {
+            if (generation != switchGeneration || conversationId != currentConversationId) return@launch
+            if (!resend) {
+                /*
+                 * 「保存」：原地换文字。
+                 *
+                 * `timeline` 必须跟着换 —— 扩展通道的界面和请求都读它，只改 `content`
+                 * 会出现"保存了却没变"（OpenAI 通道生效、Anthropic 通道不生效）。
+                 * 思考 / 搜索 / 读链接块保持原序，它们描述的是这段答案的来历。
+                 */
+                repository.editMessageInPlace(
+                    id = target.id,
+                    content = text,
+                    attachments = kept,
+                    timeline = rewriteTimelineText(target.timeline, text),
+                )
+                if (generation != switchGeneration || conversationId != currentConversationId) return@launch
+                onPersisted()
+                reloadPath(conversationId)
+                repository.touchConversation(conversationId)
+                return@launch
+            }
             val fresh = repository.addActiveVariant(
                 conversationId = conversationId,
                 parentId = target.parentId,
@@ -971,24 +1272,26 @@ class ChatViewModel(
                  * 用户只想改个错别字，回头发现图没了，而且旧版本也翻不回来。
                  */
                 attachments = kept,
-                // 仅改文字时保留思考内容；重发时旧思考已与新回复无关
-                reasoning = target.reasoning.takeIf { !resend && target.role == MessageRole.ASSISTANT },
+                // 重发时旧思考已与新回复无关（新回复会重新思考）
+                reasoning = null,
+            )
+            if (generation != switchGeneration || conversationId != currentConversationId) return@launch
+            onPersisted()
+
+            // 回复挂在**新的**这条下面
+            val replyId = repository.beginAssistantMessage(
+                conversationId = conversationId,
+                parentId = fresh.id,
+                model = settings.model.id,
             )
 
-            val replyId = if (resend) {
-                // 回复挂在**新的**这条下面
-                repository.beginAssistantMessage(
-                    conversationId = conversationId,
-                    parentId = fresh.id,
-                    model = settings.model.id,
-                )
-            } else {
-                null
-            }
-
             reloadPath(conversationId)
-            replyId?.let { startStream(conversationId, it) }
-            if (replyId == null) repository.touchConversation(conversationId)
+            startStream(conversationId, replyId)
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                banner = Res.get(R.string.error_send_failed, error.userMessage())
+            } finally { sendMutex.unlock() }
         }
     }
 
@@ -999,6 +1302,11 @@ class ChatViewModel(
     /** 导出当前会话为 **Markdown 文稿**；尚未落库的新对话返回 null。 */
     suspend fun exportCurrentConversationMarkdown(): String? =
         currentConversationId?.let { repository.exportConversationMarkdown(it) }
+
+    suspend fun exportConversationFile(file: java.io.File, conversationId: String, markdown: Boolean) {
+        if (markdown) repository.exportMarkdown(file, conversationId)
+        else repository.exportBackup(file, onlyConversation = conversationId)
+    }
 
     // ── 未发送的输入草稿 ──────────────────────────────────
 
@@ -1062,14 +1370,68 @@ class ChatViewModel(
     fun stop() {
         if (!isStreaming) return
         stoppedByUser = true
+        ++streamGeneration
+        isStreaming = false
         streamJob?.cancel()
         streamJob = null
+        // 用户主动停止：前台服务立刻收掉，不留一条"正在生成"的通知
+        BackgroundGeneration.sync(false)
+    }
+
+    /**
+     * ViewModel 被回收（退出对话页 / Activity 结束）。
+     *
+     * 流随 `viewModelScope` 一起取消，前台服务也必须收掉 ——
+     * 否则会留下一条永远"正在生成"的通知。
+     */
+    override fun onCleared() {
+        BackgroundGeneration.sync(false)
+        super.onCleared()
+    }
+
+    /**
+     * 请求**还没发出去**就失败的收尾。
+     *
+     * 与流式里的失败走同一套表现（回复上挂红字 + 重试按钮），但不必经过网络层：
+     * 空的流式气泡留在界面上等下一个 token，用户只会以为"卡住了"。
+     */
+    private fun rejectBeforeSend(replyId: String, message: String) {
+        val conversationId = currentConversationId ?: return
+        patch(replyId) { it.copy(status = MessageStatus.ERROR, errorMessage = message) }
+        viewModelScope.launch {
+            runCatching {
+                repository.finishMessage(
+                    id = replyId,
+                    content = "",
+                    reasoning = null,
+                    status = MessageStatus.ERROR,
+                    errorMessage = message,
+                )
+                repository.touchConversation(conversationId)
+            }
+        }
     }
 
     // ── 流式实现 ──────────────────────────────────────────
 
     private fun startStream(conversationId: String, replyId: String, prefix: UiMessage? = null) {
+        if (conversationId != currentConversationId) return
+        /*
+         * ★ **发请求之前先验 Key 的字符集。**
+         *
+         * `Authorization` 头只接受可见 ASCII。Key 里混进中文 / 全角 / 换行时，
+         * OkHttp 抛的是 `Unexpected char 0x4f55 at 8 in Authorization value` ——
+         * 码点是第一个非法字符，用户既不知道是哪个字段，也不知道该改什么。
+         * 在这里先拦下，把这条回复直接标成错误，文案说清楚去哪儿改。
+         */
+        if (!ApiKey.isHeaderSafe(stored.apiKey)) {
+            rejectBeforeSend(replyId = replyId, message = Res.get(R.string.error_api_key_chars))
+            return
+        }
+        val generation = ++streamGeneration
         isStreaming = true
+        // 生成期间把进程提到前台服务优先级：退到后台 / 熄屏也继续收
+        BackgroundGeneration.sync(true)
         stoppedByUser = false
         lastCheckpointAt = System.currentTimeMillis()
         val extended = apiStyle == ApiStyle.ANTHROPIC
@@ -1106,6 +1468,12 @@ class ChatViewModel(
             var timeline: List<ReplyBlock> = prefix?.timeline.orEmpty()
             var dirty = false
 
+            fun publishBuffered() {
+                if (reasonBuf.isNotEmpty()) { reasoningText += reasonBuf.toString(); reasonBuf.clear() }
+                if (contentBuf.isNotEmpty()) { contentText += contentBuf.toString(); contentBuf.clear() }
+                patch(replyId) { it.copy(reasoning = reasoningText.ifEmpty { null }, content = contentText) }
+            }
+
             /** 正文（或正文块）一出现 = 思维链已经写完，思考栏当场收口。 */
             fun noteBody() {
                 if (firstTokenAt == null) firstTokenAt = System.currentTimeMillis()
@@ -1139,10 +1507,9 @@ class ChatViewModel(
                             )
                         }
                     } else {
-                        flush(replyId, reasonBuf, contentBuf)
+                        publishBuffered()
                     }
-                    reasoningText = messages.firstOrNull { it.id == replyId }?.reasoning.orEmpty()
-                    contentText = messages.firstOrNull { it.id == replyId }?.content.orEmpty()
+                    if (accumulator != null) { reasoningText = accumulator.thinking; contentText = accumulator.answer }
                     dirty = false
 
                     // §4.4：流中每约 1.5s 落一次盘，崩溃不丢内容
@@ -1160,6 +1527,7 @@ class ChatViewModel(
             }
 
             var failure: String? = null
+            var cancelled = false
             var serverTitle: String? = null
 
             try {
@@ -1201,11 +1569,13 @@ class ChatViewModel(
                                 dirty = true
                             }
 
-                            is StreamEvent.Usage -> Unit
+                            is StreamEvent.Usage -> recordUsage(event)
 
                             StreamEvent.Done -> Unit
 
-                            is StreamEvent.Error -> failure = event.message
+                            // 流内错误对象是**上游网关原文**（如 `No available channel …`）：
+                            // 先翻成人话，认不出才保留原文（见 `serverErrorText`）
+                            is StreamEvent.Error -> failure = serverErrorText(event.message)
 
                             // 块通道不该出现这两类增量；出现了说明通道配错，忽略
                             is StreamEvent.Content, is StreamEvent.Reasoning -> Unit
@@ -1251,17 +1621,23 @@ class ChatViewModel(
                                 dirty = true
                             }
 
-                            is StreamEvent.Usage -> Unit // 后续接入用量与成本展示
+                            /* 有些网关把用量放在流末尾单独一帧 —— 这里如实收下，
+                               缓存命中率就是从这里来的（见 recordUsage）。 */
+                            is StreamEvent.Usage -> recordUsage(event)
 
                             StreamEvent.Done -> Unit
 
-                            is StreamEvent.Error -> failure = event.message
+                            // 流内错误对象是**上游网关原文**（如 `No available channel …`）：
+                            // 先翻成人话，认不出才保留原文（见 `serverErrorText`）
+                            is StreamEvent.Error -> failure = serverErrorText(event.message)
 
                             // 块级事件只属于 Anthropic 通道；这条路径上忽略
                             else -> Unit
                         }
                     }
                 }
+            } catch (t: kotlinx.coroutines.CancellationException) {
+                cancelled = true
             } catch (t: Throwable) {
                 if (!stoppedByUser) failure = t.userMessage()
             } finally {
@@ -1277,7 +1653,7 @@ class ChatViewModel(
                         )
                     }
                 } else {
-                    flush(replyId, reasonBuf, contentBuf)
+                    publishBuffered()
                 }
             }
 
@@ -1291,7 +1667,7 @@ class ChatViewModel(
              * 用户看到的只有"写完了，然后没了"。那是数据丢失，客户端没有理由替服务端做这件事。
              */
             val status = when {
-                stoppedByUser -> MessageStatus.STOPPED
+                cancelled || generation != streamGeneration -> MessageStatus.STOPPED
                 failure != null -> MessageStatus.ERROR
                 else -> MessageStatus.DONE
             }
@@ -1299,8 +1675,8 @@ class ChatViewModel(
             val seconds = (finishedAt - startedAt).coerceAtLeast(1) / 1000f
             // 粗估：中文约 1 token ≈ 1.6 字符，仅用于性能仪表展示
             val tps = if (contentChars > 0) (contentChars / 1.6f) / seconds else null
-            val finalContent = messages.firstOrNull { it.id == replyId }?.content.orEmpty()
-            val finalReasoning = messages.firstOrNull { it.id == replyId }?.reasoning
+            val finalContent = accumulator?.answer ?: contentText
+            val finalReasoning = accumulator?.thinking ?: reasoningText
             /*
              * **真实**思考时长 = 首条思维链 → 首条正文。
              *
@@ -1329,7 +1705,7 @@ class ChatViewModel(
             }
 
             // 终写一次：即使进程被杀，内容也已落库
-            withContext(NonCancellable) {
+            val persisted = withContext(NonCancellable) {
                 runCatching {
                     repository.finishMessage(
                         id = replyId,
@@ -1344,7 +1720,13 @@ class ChatViewModel(
                         stopReason = accumulator?.stopReason,
                     )
                     repository.touchConversation(conversationId)
-                }
+                }.onFailure { error ->
+                    android.util.Log.e("SimpleChat/Save", "Reply persistence failed: ${error.javaClass.simpleName}")
+                    if (conversationId == currentConversationId) {
+                        banner = Res.get(R.string.reply_save_failed)
+                        patch(replyId) { it.copy(status = MessageStatus.ERROR, errorMessage = Res.get(R.string.reply_save_failed)) }
+                    }
+                }.isSuccess
             }
 
             /*
@@ -1367,8 +1749,15 @@ class ChatViewModel(
              * `stream was reset` 就是上下各显示一次。banner 只留给"与某条消息无关"的
              * 全局提示（未配置 Key、压缩失败等）。
              */
-            isStreaming = false
-            streamJob = null
+            if (generation == streamGeneration) {
+                isStreaming = false
+                streamJob = null
+                // 生成结束：前台服务退回普通优先级，通知随之消失
+                BackgroundGeneration.sync(false)
+                if (persisted && status == MessageStatus.DONE && conversationId == currentConversationId) {
+                    replyCompletions.tryEmit(CompletedReply(conversationId, replyId))
+                }
+            }
 
             /*
              * 首轮回复落地后，用一个 **flash 档模型**给会话起个标题。
@@ -1378,7 +1767,7 @@ class ChatViewModel(
              *
              * 扩展通道已经由服务端给了标题（[serverTitle]），就不再自己发一轮请求。
              */
-            if (status == MessageStatus.DONE && title.isNullOrEmpty()) {
+            if (generation == streamGeneration && conversationId == currentConversationId && status == MessageStatus.DONE && title.isNullOrEmpty()) {
                 maybeGenerateTitle(conversationId)
             }
         }
@@ -1391,7 +1780,8 @@ class ChatViewModel(
      * 所以压缩摘要只能**拼进系统提示词**，不能像 OpenAI 通道那样再塞一条 system 消息。
      */
     private suspend fun buildAnthropicRequestNow(prefix: UiMessage?): AnthropicRequest {
-        val active = compaction
+        skippedNoVision = 0; skippedUnreadable = 0
+        val active = validCompaction(messages, compaction)
         val system = buildString {
             append(settings.composedSystemPrompt(presets))
             if (active != null && active.summary.isNotBlank()) {
@@ -1422,6 +1812,14 @@ class ChatViewModel(
                 else message.copy(attachments = outgoingAttachments(message.attachments))
             }
 
+        /*
+         * 官方域才发 DeepSeek 扩展字段（safety_check / 搜索工具 / 服务端标题 /
+         * latest_reminder 角色 / thinking.type=disabled）。自建网关或 Claude 兼容中转
+         * 遇到这些会 400，而不是"忽略" —— 见 `buildAnthropicRequest` 的说明。
+         */
+        val officialDeepSeek = isOfficialDeepSeekEndpoint(
+            stored.baseUrl.ifBlank { providerKind.defaultBaseUrl },
+        )
         return buildAnthropicRequest(
             model = settings.model.id,
             systemPrompt = system,
@@ -1432,7 +1830,12 @@ class ChatViewModel(
             latestReminder = latestReminder(),
             maxTokens = settings.maxTokens,
             prefix = prefix,
-        )
+            deepSeekExtensions = officialDeepSeek,
+            temperature = settings.temperature.toDouble(),
+            topP = settings.topP.toDouble(),
+        ).also { request ->
+            if (request.messages.none { it.role == "user" }) throw com.simplechat.app.data.AppTextException(R.string.error_no_sendable_messages)
+        }
     }
 
     /**
@@ -1591,15 +1994,23 @@ class ChatViewModel(
         if (!settings.model.supportsVision) {
             filtered = attachments.filterNot { it.isImage }
             val dropped = attachments.size - filtered.size
-            if (dropped > 0) banner = Res.get(R.string.images_skipped_no_vision, dropped)
+            skippedNoVision += dropped
         }
         // 字节读回 + 图片按真实内容校正（格式不收的转码、坏图丢掉）。见 ApiImage
         val (prepared, unreadable) = repository.prepareRequestAttachments(filtered)
-        if (unreadable > 0) banner = Res.get(R.string.images_skipped_unreadable, unreadable)
+        skippedUnreadable += unreadable
+        if (showImageSkipNotice) {
+            imageSkipNotice = when {
+                skippedUnreadable > 0 -> Res.get(R.string.images_skipped_unreadable, skippedUnreadable)
+                skippedNoVision > 0 -> Res.get(R.string.images_skipped_no_vision, skippedNoVision)
+                else -> null
+            }
+        }
         return prepared
     }
 
     private suspend fun buildRequestMessages(): List<OutMessageDto> {
+        skippedNoVision = 0; skippedUnreadable = 0
         val request = mutableListOf<OutMessageDto>()
 
         val system = settings.composedSystemPrompt(presets)
@@ -1611,7 +2022,7 @@ class ChatViewModel(
          * 压缩摘要以 system 身份插在最前，并跳过被它覆盖的那些 slot。
          * 这是「只改变发给 API 的内容」的落点 —— 本地消息一条没动。
          */
-        val active = compaction
+        val active = validCompaction(messages, compaction)
         if (active != null && active.summary.isNotBlank()) {
             request += OutMessageDto(
                 role = "system",
@@ -1623,20 +2034,33 @@ class ChatViewModel(
 
         // 顺序规则见 `orderedOutgoingMessages`（纯函数，有单测钉死）
         orderedOutgoingMessages(messages, active).forEach { message ->
+            /*
+             * 空消息不发：历史里出错/被中断的 assistant、既没正文也没附件的 user
+             * 是可能存在的，而部分兼容网关对空 `content` 直接 400 ——
+             * 一条空消息不值得让整段历史发不出去（见 `isSendableOutgoing`）。
+             */
+            val outgoing = if (message.role == MessageRole.USER && message.attachments.isNotEmpty()) {
+                message.copy(attachments = outgoingAttachments(message.attachments))
+            } else message
+            if (!isSendableOutgoing(outgoing)) return@forEach
             request += OutMessageDto(
                 role = if (message.role == MessageRole.USER) "user" else "assistant",
                 /*
                  * 只有 user 消息可能带图；组装规则见 `userContent`
                  * （无附件 → 纯字符串；只有文本附件 → 纯字符串；有图 → content 数组）。
+                 *
+                 * assistant 消息即使历史里挂着附件也只发正文：图片放进 assistant
+                 * 在协议里是不合法的（会 400），而 AI 回复本来也不该带图。
                  */
-                content = if (message.attachments.isEmpty()) {
+                content = if (message.role != MessageRole.USER || message.attachments.isEmpty()) {
                     MessageContent.text(message.content)
                 } else {
-                    userContent(message.content, outgoingAttachments(message.attachments))
+                    userContent(outgoing.content, outgoing.attachments)
                 },
             )
         }
 
+        if (request.none { it.role == "user" }) throw com.simplechat.app.data.AppTextException(R.string.error_no_sendable_messages)
         return request
     }
 
@@ -1683,6 +2107,14 @@ class ChatViewModel(
          */
         private const val SETTINGS_PERSIST_DEBOUNCE_MS = 400L
 
+        /**
+         * 上下文统计的更新防抖。
+         *
+         * 统计要扫全部正文估 token；流式期间消息每 16ms 变一次，逐次重算会把主线程
+         * 吃穿。输入栏上那行数字晚 250ms 更新，用户完全感知不到。
+         */
+        private const val ContextStatsDebounceMs = 250L
+
         /** 压缩时保留最近多少条完整消息。 */
         private const val KEEP_RECENT = 6
 
@@ -1718,4 +2150,11 @@ private fun String.toConversationModeSafe(): ConversationMode =
  * `internal` 是为了能单测 —— 取整边界是最容易写错、又最不容易被发现的地方。
  */
 internal fun thinkingSeconds(ms: Long): Long = ((ms + 500) / 1000).coerceAtLeast(1)
+
+
+
+
+
+
+
 

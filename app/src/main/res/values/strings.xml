@@ -12,6 +12,26 @@
 -->
 <resources>
     <string name="app_name">myDeepSeek</string>
+    <string name="latex_compatible_source">兼容排版 · 查看原文</string>
+    <string name="latex_show_rendered">返回兼容排版</string>
+    <string name="latex_source_fallback">此排版暂不支持，已完整保留原文</string>
+    <string name="auto_read_aloud_on">自动朗读已开启，点按关闭并停止朗读</string>
+    <string name="auto_read_aloud_off">自动朗读已关闭，点按开启</string>
+    <string name="api_profiles_title">API 配置管理</string>
+    <string name="api_profile_current">当前配置</string>
+    <string name="api_profiles_hint">每份配置独立保存地址、模型、协议与加密 Key，修改后自动保存，点按配置即可切换。配置和 Key 仅保存在本机，不包含在对话备份中。</string>
+    <string name="api_profile_selected">正在使用</string>
+    <string name="api_profile_key_saved">Key 已加密保存</string>
+    <string name="api_profile_new">新建配置</string>
+    <string name="api_profile_new_hint">创建一份空白的自定义 API 配置</string>
+    <string name="api_profile_copy">复制当前配置</string>
+    <string name="api_profile_copy_hint">另存一份，地址、模型和 Key 一并保留，后续独立修改</string>
+    <string name="api_profile_rename">重命名配置</string>
+    <string name="api_profile_delete">删除配置</string>
+    <string name="api_profile_delete_body">删除“%1$s”及其中保存的 Key？对话记录会保留。删除当前配置后将切换到另一份配置。</string>
+    <string name="api_profile_name_hint">例如：DeepSeek 日常、自建服务器</string>
+    <string name="api_profile_save_failed">无法安全保存 API Key，原配置已保留，请重试。</string>
+    <string name="reply_save_failed">回复未能保存到本机，请先复制内容并检查可用存储空间。</string>
 
     <!-- ── 通用动作 ─────────────────────────────────────── -->
     <string name="action_cancel">取消</string>
@@ -20,6 +40,7 @@
     <string name="action_edit">编辑</string>
     <string name="action_close">关闭</string>
     <string name="action_copy">复制</string>
+    <string name="action_select_text">选择文本</string>
     <string name="action_back">返回</string>
     <string name="action_clear">清空</string>
     <string name="action_retry">重试</string>
@@ -66,12 +87,21 @@
     <string name="error_http_too_large">这次请求太大（图片或历史过长），请减少内容后重试</string>
     <string name="error_http_rate_limited">请求太频繁，请稍等片刻再试</string>
     <string name="error_no_api_key">尚未配置 API Key。请在设置 → API 配置中填写后重试。</string>
+    <string name="error_api_key_chars">API Key 含非 ASCII 字符，请在设置 → API 中重新粘贴。</string>
+    <string name="api_key_illegal_chars">含非法字符 %1$s，请粘贴纯英文 Key。</string>
+    <string name="error_no_model">还没有选择模型。请在设置 → API 配置里选一个（自定义端点先「测试连接」拉取，或手动填写模型 id）。</string>
     <string name="error_request_failed">请求失败</string>
+    <string name="error_send_failed">发送失败：%1$s</string>
+    <string name="error_no_sendable_messages">当前没有可发送的用户消息，请重新输入消息，或清除已失效的上下文摘要后重试</string>
+    <string name="conversation_load_failed">打开对话失败：%1$s</string>
     <string name="error_no_content">模型没有返回内容</string>
     <string name="error_write_failed">无法写入所选位置</string>
     <string name="error_delete_failed">删除失败：%1$s</string>
     <string name="error_import_failed">导入失败：%1$s</string>
     <string name="export_done">已导出到所选位置</string>
+    <string name="export_preparing_progress">正在生成备份：%1$d%%</string>
+    <string name="export_saving_progress">正在保存文件：%1$d%%</string>
+    <string name="error_export_attachment_missing">部分图片原件无法读取，请检查附件后重试</string>
     <string name="export_failed">导出失败：%1$s</string>
     <string name="export_failed_short">导出失败</string>
     <string name="import_read_failed">读取文件失败</string>
@@ -88,6 +118,7 @@
     <string name="settings_group_account">账户</string>
     <string name="settings_group_personal">个性化</string>
     <string name="settings_group_backup">备份</string>
+    <string name="settings_group_diagnostics">诊断</string>
     <string name="settings_group_reset">重置</string>
     <string name="settings_group_service">服务</string>
     <string name="settings_group_auth">鉴权</string>
@@ -97,6 +128,8 @@
     <string name="settings_accent">主题色</string>
     <string name="settings_auto_collapse">自动折叠思考内容</string>
     <string name="settings_about_title">关于 myDeepSeek</string>
+    <string name="generation_channel">生成进度</string>
+    <string name="generation_running_title">正在生成回复</string>
     <string name="settings_export_all">导出所有数据</string>
     <string name="settings_export_all_summary">导出会话、消息与全部版本</string>
     <string name="settings_import_all">导入所有数据</string>
@@ -124,6 +157,19 @@
     <string name="import_mode_replace_same">覆盖同名（同名对话替换为本包内容）</string>
     <string name="import_mode_rename">同名新命名（两条都留，新的加「副本」后缀）</string>
     <string name="import_done">导入完成（%1$s）：会话 %2$d 个 · 消息 %3$d 条</string>
+    <string name="import_partial">导入未完整完成（%1$s）：成功 %2$d 个会话 · %3$d 条消息，请查看导入报告</string>
+    <string name="import_index_unverified"> · 无法核验归档索引，不能确认会话清单完整</string>
+    <string name="import_repaired_messages"> · 已保留并修复 %1$d 条断链或循环消息</string>
+    <string name="import_report_export">导出最近一次导入报告</string>
+    <string name="import_report_hint">查看各会话的导入状态与失败原因</string>
+    <string name="crash_report_export">导出最近一次崩溃诊断</string>
+    <string name="crash_report_hint">仅包含设备、版本和异常堆栈，不含聊天正文或密钥</string>
+    <string name="crash_report_missing">暂无崩溃诊断记录</string>
+    <string name="import_report_missing">暂无导入报告，请先执行一次导入</string>
+    <string name="large_message_paged">长消息分页显示，全文已完整保存</string>
+    <string name="large_message_reasoning">思考内容</string>
+    <string name="page_previous">上一页</string>
+    <string name="page_next">下一页</string>
     <string name="import_done_expected"> · 归档共 %1$d 个会话</string>
     <string name="import_done_duplicates"> · 已有 %1$d 个</string>
     <string name="import_done_failed"> · %1$d 个未能导入：%2$s</string>
@@ -135,6 +181,9 @@
     <string name="import_fail_broken_tree">消息结构异常</string>
     <string name="import_fail_missing_entry">归档缺少会话文件</string>
     <string name="import_fail_write_failed">写入失败</string>
+    <string name="import_fail_space">设备存储空间不足，请释放空间后重新增量导入</string>
+    <string name="import_fail_memory">设备可用内存不足，请关闭其他应用后重试</string>
+    <string name="import_report_not_saved">详细对账文件未能保存，请检查可用存储空间；以上统计仍有效</string>
     <string name="err_archive_damaged">压缩包不完整或已损坏（可能下载中断），请重新导出后再试</string>
 
     <!-- ── 设置：预设 ───────────────────────────────────── -->
@@ -163,10 +212,26 @@
 
     <!-- ── 设置：关于 ───────────────────────────────────── -->
     <string name="about_version">版本</string>
+    <string name="about_update">更新</string>
+    <string name="about_check_update">检查更新</string>
+    <string name="about_current_version">当前 v%1$s</string>
+    <string name="update_new_title">发现新版本 %1$s</string>
+    <string name="update_up_to_date">已是最新版</string>
+    <string name="update_failed">检查失败</string>
+    <string name="update_open">前往下载</string>
     <string name="about_package">包名</string>
     <string name="about_project">项目</string>
     <string name="about_project_url">项目地址</string>
     <string name="about_licenses">开源许可</string>
+    <string name="licenses_count">%1$d 个组件</string>
+    <string name="licenses_third_party">第三方组件</string>
+    <string name="licenses_reference_title">参考实现</string>
+    <string name="credit_deepseek_demo">DeepSeek Chat Demo — 聊天记录导入</string>
+    <string name="license_version">版本</string>
+    <string name="license_type">许可证</string>
+    <string name="license_copyright">版权所有</string>
+    <string name="license_project">项目主页</string>
+    <string name="license_full_text">许可证全文</string>
     <string name="about_icon">图标</string>
     <string name="about_libs_net">网络与序列化</string>
     <string name="about_libs_storage">存储与界面</string>
@@ -338,6 +403,8 @@
     <string name="stats_avg_ttft">平均首字延迟</string>
     <string name="stats_avg_tps">平均生成速度</string>
     <string name="stats_total_thinking">累计思考时长</string>
+    <string name="stats_cache_hit">缓存命中（最近一次）</string>
+    <string name="stats_cache_hit_value">%1$s / %2$s · %3$d%%</string>
     <string name="stats_seconds">%1$d 秒</string>
 
     <!-- 上下文压缩 -->
@@ -373,6 +440,7 @@
     <!-- ==== 来自 g3 组 ==== -->
 <!-- ── 消息列表 / 消息操作（MessageList.kt、MessageEditDialog.kt、MessageIndex.kt） ── -->
     <string name="msg_regenerate">重新生成</string>
+    <string name="reply_waiting">加载中</string>
     <string name="msg_continue">继续生成</string>
     <string name="msg_fork_from_here">从这里新建对话</string>
     <string name="msg_expand_all">展开全部</string>
@@ -514,7 +582,6 @@
     <string name="mermaid_loading">图表生成中…</string>
     <string name="settings_export_archive">导出全部对话（ZIP 归档）</string>
     <string name="settings_export_archive_summary">包含所有对话与附件的完整备份，另附每个对话的 Markdown 文稿；可直接用于导入恢复。</string>
-
     <!-- ── 同步（WebDAV） ───────────────────────────────── -->
     <string name="settings_sync">云端同步</string>
     <string name="settings_sync_summary">WebDAV（坚果云 / Nextcloud）</string>
@@ -552,5 +619,23 @@
     <string name="sync_progress_pull">拉取 %1$d/%2$d</string>
     <string name="sync_progress_upload">上传 %1$d/%2$d</string>
     <string name="sync_hint">坚果云：地址填 https://dav.jianguoyun.com/dav/，密码用「第三方应用密码」。网盘上是一个目录：一个会话一个文件（只传变化过的）、图片按内容哈希单独存，单次上传很小，断了也能接着传。</string>
+    <string name="images_never_remind">不再提醒</string>
+    <string name="settings_image_skip_notice">图片跳过提醒</string>
+    <string name="search_role_user">用户消息</string>
+    <string name="search_role_assistant">AI 回复</string>
+    <string name="search_title_match">标题匹配</string>
+    <string name="search_load_more">加载更多结果</string>
+
+    <!-- ── 上游用到、本仓库合并时补回 ──────────────── -->
+    <string name="api_model_unset">未选择</string>
+    <string name="api_model_empty_hint">还没有模型列表。先点「测试连接」拉取这个端点的模型，也可以手动填写。</string>
+    <string name="api_model_manual">手动填写模型</string>
+    <string name="tts_voice_stella">Stella（女声 · DeepSeek 官方）</string>
+    <string name="tts_voice_tide">Tide（男声 · DeepSeek 官方）</string>
+    <string name="tts_voice_official_section">DeepSeek 官方音色</string>
+    <string name="tts_voice_official_hint">官方音色需要：「服务商」为 DeepSeek 官方、Base URL 指向 api.deepseek.com，并已填写 API Key。其余服务商请用上方系统音色。</string>
+    <string name="tts_official_unavailable">当前服务商不支持 DeepSeek 官方朗读，请到设置里换回系统音色</string>
+    <string name="tts_official_failed">官方朗读失败：%1$s</string>
+    <string name="tts_official_empty">这段内容没有可朗读的正文（代码块与表格会被跳过）</string>
 </resources>
 

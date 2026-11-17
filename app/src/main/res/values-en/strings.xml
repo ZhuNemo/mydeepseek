@@ -10,6 +10,26 @@
 -->
 <resources>
     <string name="app_name">myDeepSeek</string>
+    <string name="latex_compatible_source">Compatible layout · View source</string>
+    <string name="latex_show_rendered">Back to compatible layout</string>
+    <string name="latex_source_fallback">This layout is not supported yet. The complete source is shown below.</string>
+    <string name="auto_read_aloud_on">Auto read aloud is on. Tap to turn off and stop playback.</string>
+    <string name="auto_read_aloud_off">Auto read aloud is off. Tap to turn on.</string>
+    <string name="api_profiles_title">API profiles</string>
+    <string name="api_profile_current">Current profile</string>
+    <string name="api_profiles_hint">Each profile keeps its own URL, model, protocol and encrypted key. Changes save automatically; tap a profile to switch. Profiles and keys stay on this device and are excluded from chat backups.</string>
+    <string name="api_profile_selected">In use</string>
+    <string name="api_profile_key_saved">Key saved securely</string>
+    <string name="api_profile_new">New profile</string>
+    <string name="api_profile_new_hint">Start with a blank custom API profile</string>
+    <string name="api_profile_copy">Copy current profile</string>
+    <string name="api_profile_copy_hint">Keep the URL, model and key in a separate editable profile</string>
+    <string name="api_profile_rename">Rename profile</string>
+    <string name="api_profile_delete">Delete profile</string>
+    <string name="api_profile_delete_body">Delete “%1$s” and its saved key? Chats will remain. Deleting the active profile switches to another profile.</string>
+    <string name="api_profile_name_hint">For example: Everyday DeepSeek, Home server</string>
+    <string name="api_profile_save_failed">The API key could not be saved securely. Your previous settings were kept. Try again.</string>
+    <string name="reply_save_failed">The reply could not be saved. Copy its text and check available storage.</string>
 
     <!-- ── Actions ──────────────────────────────────────── -->
     <string name="action_cancel">Cancel</string>
@@ -18,6 +38,7 @@
     <string name="action_edit">Edit</string>
     <string name="action_close">Close</string>
     <string name="action_copy">Copy</string>
+    <string name="action_select_text">Select text</string>
     <string name="action_back">Back</string>
     <string name="action_clear">Clear</string>
     <string name="action_retry">Retry</string>
@@ -64,12 +85,21 @@
     <string name="error_http_too_large">The request is too large (images or history). Reduce it and retry</string>
     <string name="error_http_rate_limited">Too many requests. Wait a moment and retry</string>
     <string name="error_no_api_key">No API key yet. Fill it in under Settings → API, then retry.</string>
+    <string name="error_api_key_chars">The API key contains non-ASCII characters (Chinese, full-width punctuation or line breaks), which cannot be sent in a request header. Re-paste a plain ASCII key under Settings → API → API Key.</string>
+    <string name="api_key_illegal_chars">An API key may only contain visible ASCII characters; found an illegal character %1$s (pasting often brings in Chinese text, full-width punctuation or line breaks).</string>
+    <string name="error_no_model">No model selected yet. Pick one under Settings → API (tap “Test connection” to fetch a custom endpoint’s models, or enter the model id manually).</string>
     <string name="error_request_failed">Request failed</string>
     <string name="error_no_content">The model returned no content</string>
+    <string name="error_send_failed">Send failed: %1$s</string>
+    <string name="error_no_sendable_messages">There is no user message to send. Enter a new message or clear the outdated context summary and try again.</string>
+    <string name="conversation_load_failed">Could not open conversation: %1$s</string>
     <string name="error_write_failed">Could not write to the chosen location</string>
     <string name="error_delete_failed">Delete failed: %1$s</string>
     <string name="error_import_failed">Import failed: %1$s</string>
     <string name="export_done">Exported to the chosen location</string>
+    <string name="export_preparing_progress">Preparing backup: %1$d%%</string>
+    <string name="export_saving_progress">Saving file: %1$d%%</string>
+    <string name="error_export_attachment_missing">Some original images could not be read. Check the attachments and try again.</string>
     <string name="export_failed">Export failed: %1$s</string>
     <string name="export_failed_short">Export failed</string>
     <string name="import_read_failed">Could not read the file</string>
@@ -86,6 +116,7 @@
     <string name="settings_group_account">Account</string>
     <string name="settings_group_personal">Personal</string>
     <string name="settings_group_backup">Backup</string>
+    <string name="settings_group_diagnostics">Diagnostics</string>
     <string name="settings_group_reset">Reset</string>
     <string name="settings_group_service">Service</string>
     <string name="settings_group_auth">Auth</string>
@@ -95,6 +126,8 @@
     <string name="settings_accent">Accent color</string>
     <string name="settings_auto_collapse">Auto-collapse thinking</string>
     <string name="settings_about_title">About myDeepSeek</string>
+    <string name="generation_channel">Generation progress</string>
+    <string name="generation_running_title">Generating reply</string>
     <string name="settings_export_all">Export all data</string>
     <string name="settings_export_all_summary">Exports conversations, messages and all versions</string>
     <string name="settings_import_all">Import all data</string>
@@ -122,6 +155,19 @@
     <string name="import_mode_replace_same">Overwrite same name (replace them with the file)</string>
     <string name="import_mode_rename">Keep both (imported one gets a copy suffix)</string>
     <string name="import_done">Imported from %1$s: %2$d conversations · %3$d messages</string>
+    <string name="import_partial">Import incomplete (%1$s): %2$d conversations · %3$d messages saved. Check the import report.</string>
+    <string name="import_index_unverified"> · Archive index could not be verified; the session list may be incomplete</string>
+    <string name="import_repaired_messages"> · Preserved and repaired %1$d orphaned or cyclic messages</string>
+    <string name="import_report_export">Export latest import report</string>
+    <string name="import_report_hint">Review each conversation’s import status and any failure reasons</string>
+    <string name="crash_report_export">Export latest crash diagnostics</string>
+    <string name="crash_report_hint">Device, version and stack frames only; no chat content or API keys</string>
+    <string name="crash_report_missing">No crash diagnostic record is available</string>
+    <string name="import_report_missing">No import report is available. Import a backup first.</string>
+    <string name="large_message_paged">Long message shown in pages. Full text is saved.</string>
+    <string name="large_message_reasoning">Reasoning</string>
+    <string name="page_previous">Previous</string>
+    <string name="page_next">Next</string>
     <string name="import_done_expected"> · %1$d conversations in the archive</string>
     <string name="import_done_duplicates"> · %1$d already present</string>
     <string name="import_done_failed"> · %1$d could not be imported: %2$s</string>
@@ -161,10 +207,26 @@
 
     <!-- ── Settings: about ──────────────────────────────── -->
     <string name="about_version">Version</string>
+    <string name="about_update">Update</string>
+    <string name="about_check_update">Check for updates</string>
+    <string name="about_current_version">Current v%1$s</string>
+    <string name="update_new_title">New version %1$s</string>
+    <string name="update_up_to_date">Up to date</string>
+    <string name="update_failed">Check failed</string>
+    <string name="update_open">Open download</string>
     <string name="about_package">Package</string>
     <string name="about_project">Project</string>
     <string name="about_project_url">Repository</string>
     <string name="about_licenses">Open-source licenses</string>
+    <string name="licenses_count">%1$d components</string>
+    <string name="licenses_third_party">Third-party components</string>
+    <string name="licenses_reference_title">References</string>
+    <string name="credit_deepseek_demo">DeepSeek Chat Demo — chat history import</string>
+    <string name="license_version">Version</string>
+    <string name="license_type">License</string>
+    <string name="license_copyright">Copyright</string>
+    <string name="license_project">Project page</string>
+    <string name="license_full_text">License text</string>
     <string name="about_icon">Icon</string>
     <string name="about_libs_net">Networking &amp; serialization</string>
     <string name="about_libs_storage">Storage &amp; UI</string>
@@ -336,6 +398,8 @@
     <string name="stats_avg_ttft">Average time to first token</string>
     <string name="stats_avg_tps">Average generation speed</string>
     <string name="stats_total_thinking">Total thinking time</string>
+    <string name="stats_cache_hit">Prompt cache hit (latest)</string>
+    <string name="stats_cache_hit_value">%1$s / %2$s · %3$d%%</string>
     <string name="stats_seconds">%1$d seconds</string>
 
     <!-- Context compaction -->
@@ -372,6 +436,7 @@
     <!-- ==== from group g3 ==== -->
 <!-- ── Message list / message actions ─────────────────────── -->
     <string name="msg_regenerate">Regenerate</string>
+    <string name="reply_waiting">Loading</string>
     <string name="msg_continue">Continue generating</string>
     <string name="msg_fork_from_here">Start a new chat from here</string>
     <string name="msg_expand_all">Expand all</string>
@@ -514,7 +579,6 @@
     <string name="mermaid_loading">Rendering diagram…</string>
     <string name="settings_export_archive">Export all chats (ZIP archive)</string>
     <string name="settings_export_archive_summary">A complete backup of every chat and attachment, plus a Markdown document per chat. Can be imported back directly.</string>
-
     <!-- ── Sync (WebDAV) ────────────────────────────────── -->
     <string name="settings_sync">Cloud sync</string>
     <string name="settings_sync_summary">WebDAV (Nutstore / Nextcloud)</string>
@@ -552,5 +616,26 @@
     <string name="sync_progress_pull">Pulling %1$d/%2$d</string>
     <string name="sync_progress_upload">Uploading %1$d/%2$d</string>
     <string name="sync_hint">Nutstore: use https://dav.jianguoyun.com/dav/ with an app password. The remote side is a folder: one file per chat (only changed ones are uploaded) plus images keyed by content hash, so each request stays small and an interrupted sync resumes where it stopped.</string>
+    <string name="import_fail_space">Not enough storage. Free space and retry incremental import.</string>
+    <string name="import_fail_memory">Not enough available memory. Close other apps and retry.</string>
+    <string name="import_report_not_saved">The detailed import report could not be saved. Check available storage; the counts above are still valid.</string>
+    <string name="images_never_remind">Don’t remind again</string>
+    <string name="settings_image_skip_notice">Skipped image notices</string>
+    <string name="search_role_user">User message</string>
+    <string name="search_role_assistant">AI reply</string>
+    <string name="search_title_match">Title match</string>
+    <string name="search_load_more">Load more results</string>
+
+    <!-- ── 上游用到、本仓库合并时补回 ──────────────── -->
+    <string name="api_model_unset">Not set</string>
+    <string name="api_model_empty_hint">No models yet. Tap “Test connection” to fetch this endpoint’s models, or enter one manually.</string>
+    <string name="api_model_manual">Enter model manually</string>
+    <string name="tts_voice_stella">Stella (female · DeepSeek official)</string>
+    <string name="tts_voice_tide">Tide (male · DeepSeek official)</string>
+    <string name="tts_voice_official_section">DeepSeek official voices</string>
+    <string name="tts_voice_official_hint">Official voices need the DeepSeek provider selected, a Base URL pointing at api.deepseek.com, and an API key. With other providers, use the system voices above.</string>
+    <string name="tts_official_unavailable">This provider does not support DeepSeek official read-aloud. Pick a system voice in settings.</string>
+    <string name="tts_official_failed">Official read-aloud failed: %1$s</string>
+    <string name="tts_official_empty">Nothing to read aloud here (code blocks and tables are skipped)</string>
 </resources>
 

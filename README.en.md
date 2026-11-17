@@ -33,6 +33,18 @@ targeted changes and a few real bug fixes (see [CODE_REVIEW.md](CODE_REVIEW.md))
 - JSON backup, ZIP archive with per-chat Markdown, Markdown export; imports from Chatbox and DeepSeek exports.
 - Dark mode, accent colours, font scale, Chinese/English UI.
 
+### Merge status: up to v1.1.5
+
+The fork started from v1.1.3 and now carries everything upstream shipped after it (v1.1.4 + v1.1.5):
+API profiles (several endpoint/model/key sets, one tap to switch), global search with paging and
+jump-to-message, text selection, background generation, check-for-updates, and the open-source
+license list.
+
+Both sides were kept — conflicts were resolved semantically rather than by picking a winner.
+Upstream also rewrote the user bubble and also fixed the TTS crash on Huawei ROMs; those
+implementations were taken, then the square image preview was layered back on top.
+See `CODE_REVIEW.md` for the per-file decisions.
+
 ## Build
 
 Requirements: **JDK 21** (Android Studio's bundled JBR 21 works), Android SDK platform 37 / build-tools 37.0.0.

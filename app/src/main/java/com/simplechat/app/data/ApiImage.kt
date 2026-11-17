@@ -8,38 +8,9 @@ import java.util.Base64
 import kotlin.math.max
 
 /**
- * 图片**按真实内容**判断格式，并把"服务端一定收得下"的字节交给请求层。
- *
- * ### 为什么不能相信 `Attachment.mime`
- *
- * 历史里的图片来自三条完全不同的路：本应用自己压的 JPEG、DeepSeek 导出里的原件、
- * Chatbox 备份里的原件。后两条路带进来的是什么格式、`mime` 字段写的是什么，
- * 我们**从来没有保证过**。而服务端的判据只有一条：真实内容。
- *
- * 表现就是这句报错（v1.1.3 之前多位用户遇到）：
- *
- * ```text
- * messages.18.content.0: You have uploaded an unsupported image.
- * Please make sure your image is valid and in a supported image format.
- * ```
- *
- * 更糟的是它**每一轮都会复现**：坏图在历史里，每次请求都会被重新带上，
- * 于是这个会话再也发不出去 —— 用户只会觉得"导入坏了"。
- *
- * ### 服务端认什么
- *
- * 官方 Vision 指南：JPEG / PNG / GIF / WebP，**格式由实际内容判断**，
- * 不看文件名、也不看声明的 MIME。所以：
- *
- * - 内容确实是这四种 → 原样发，`media_type` 用**内容**对应的那个；
- * - 内容是别的格式（HEIC / AVIF / BMP / TIFF…）或认不出来 → 本地转成 JPEG；
- * - 转不出来（数据损坏）→ 这张图不发了，宁可少一张图，也不能让整个会话作废。
- *
- * ### 尺寸与体积
- *
- * 服务端会把图缩到约 1300×1300 再算 token，原样发几 MB 的 PNG 只是白占带宽、
- * 白等上传。所以超过 [PassthroughBytes] 的图统一转成 [ApiImageMaxSide] 的 JPEG；
- * 单张 base64 也守住 32MiB 的硬上限（见 [MaxBase64Chars]）。
+ * Normalize request images using an actual bounded Android decode and JPEG encode.
+ * File signatures and dimensions alone cannot validate pixel data, profiles or container features.
+ * Local originals remain unchanged; unreadable images are omitted only from the request.
  */
 object ApiImage {
 
@@ -48,19 +19,46 @@ object ApiImage {
 
     private const val JpegQuality = 88
 
-    /**
-     * 原图多大以内可以原样发。
-     *
-     * 1.5MB 是"截图"与"照片"的分界附近：截图多半是几百 KB 的 PNG（文字清晰度靠无损），
-     * 而更大的图在服务端反正会被缩小 —— 本地先缩反而省时省流量。
-     */
-    private const val PassthroughBytes = 1_500_000
-
     /** 单张图 base64 的保守上限。服务端单图上限 32MiB、整包 48MiB，这里留出余量。 */
     private const val MaxBase64Chars = 12 * 1024 * 1024
 
     /**
-     * 可以原样发出去的四个格式；[mime] 是请求里 `media_type` 的唯一合法取值。
+     * 单边像素上限，**故意取 4096 而不是官方的 8192**。
+     *
+     * 官方 Vision 指南写的是"单边 ≤8192px，但一次请求里 ≥15 张图时降到 4096px"。
+     * 整理单张图时拿不到"本轮一共几张图"，而历史会话一轮带十几二十张图是常态 ——
+     * 所以只能按 4096 这个保守值判定：多转码一次只损失一点清晰度，
+     * 判错的代价是**整轮请求 400**（也就是这次要修的 bug）。
+     */
+    private const val MaxImageSide = 4096
+
+    /** 总像素上限。和官方"总像素"口径保持一致，同时兜住畸形文件头。 */
+    private const val MaxImagePixels = 30_000_000
+
+    /**
+     * 这张图的尺寸是否超过服务端能收的上限。**纯函数**，不碰 `BitmapFactory`。
+     *
+     * 规则（任一命中即超限）：
+     * - 宽或高 > [MaxImageSide]；
+     * - 宽 × 高 > [MaxImagePixels]；
+     * - 宽/高 ≤ 0。尺寸必须是正数，0 或负数只可能来自解析失败或伪造的文件头，
+     *   也就是"无法证明尺寸合规" —— 这种图不能原样发，否则又回到
+     *   "魔数对但内容是坏的"那条被服务端拒的老路。
+     *
+     * 乘法用 `Long`：文件头里的宽高是 32 位字段，`width * height` 用 `Int` 会溢出成
+     * 负数，那样一张巨大的图反而会被判成"没超限"。
+     *
+     * 为什么是纯函数：这条判定是本次修复的核心，必须能在 JVM 单测里跑
+     * （`BitmapFactory` 的实际解码由 Android 设备测试覆盖）。
+     */
+    fun exceedsDimensionLimit(width: Int, height: Int): Boolean {
+        if (width <= 0 || height <= 0) return true
+        if (width > MaxImageSide || height > MaxImageSide) return true
+        return width.toLong() * height.toLong() > MaxImagePixels
+    }
+
+    /**
+     * 可识别的图片容器；[mime] 用于导入和 MIME 修正，发送时仍统一解码转为 JPEG。
      *
      * `null` 表示"内容不是服务端认的格式" —— 这类必须转码。
      */
@@ -144,135 +142,84 @@ object ApiImage {
     fun legalMediaType(mime: String?): String =
         mime?.trim()?.lowercase()?.takeIf { it in DeclaredMimes } ?: "image/jpeg"
 
-    /**
-     * 把一张图整理成请求可用的形态。
-     *
-     * @return null 表示这张图**发不出去**（数据为空、损坏、或格式连转码都解不开）。
-     *   调用方应当跳过它并如实告诉用户，而不是让整轮请求 400。
-     */
-    fun prepare(bytes: ByteArray): Prepared? {
-        if (bytes.isEmpty()) return null
-        val format = detect(bytes)
+    fun prepare(bytes: ByteArray): Prepared? = prepare { bytes.inputStream() }
 
-        // 快路径：内容就是服务端认的四种，且体积不大 → 原样发（无损，最省事）
-        if (format.mime != null && bytes.size <= PassthroughBytes) {
-            val base64 = Base64.getEncoder().encodeToString(bytes)
-            if (base64.length <= MaxBase64Chars) {
-                return Prepared(base64, format.mime, transcoded = false)
+    /** Reopenable source keeps large imported originals off the Java heap. */
+    fun prepare(open: () -> java.io.InputStream): Prepared? {
+        return try {
+            val key = open().use { input ->
+                val digest = MessageDigest.getInstance("SHA-256")
+                val buffer = ByteArray(64 * 1024)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    if (read > 0) digest.update(buffer, 0, read)
+                }
+                digest.digest().joinToString("") { "%02x".format(it) }
             }
-        }
-
-        val key = sha256(bytes)
-        cached(key)?.let { return it }
-
-        // 需要转码：格式不收，或者文件太大
-        val jpeg = transcodeToJpeg(bytes)
-        if (jpeg != null) {
-            val base64 = Base64.getEncoder().encodeToString(jpeg)
-            if (base64.length <= MaxBase64Chars) {
-                val prepared = Prepared(base64, Format.JPEG.mime!!, transcoded = true)
-                remember(key, prepared)
-                return prepared
-            }
-        }
-
-        // 转不了但内容本身是合法格式且没有超硬上限 → 原样发（例如超大 PNG 解码失败）
-        if (format.mime != null) {
-            val base64 = Base64.getEncoder().encodeToString(bytes)
-            if (base64.length <= MaxBase64Chars) return Prepared(base64, format.mime, transcoded = false)
-        }
-        return null
+            cached(key)?.let { return it }
+            val jpeg = transcodeToJpeg(open) ?: return null
+            val encoded = Base64.getEncoder().encodeToString(jpeg)
+            if (encoded.length > MaxBase64Chars) return null
+            Prepared(encoded, "image/jpeg", transcoded = true).also { remember(key, it) }
+        } catch (_: Exception) { null }
+          catch (_: OutOfMemoryError) { null }
     }
 
-    /**
-     * 解码 → 缩到 [ApiImageMaxSide] → 压成 JPEG。
-     *
-     * 用 `inSampleSize` 先按 2 的幂降采样，避免一张 8000×6000 的拍照图在解码阶段
-     * 就吃掉上百兆堆；剩下的零头再交给 `createScaledBitmap`。
-     */
-    private fun transcodeToJpeg(bytes: ByteArray): ByteArray? {
-        val bounds = runCatching {
-            BitmapFactory.Options().apply { inJustDecodeBounds = true }.also { options ->
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
-            }
-        }.getOrNull() ?: return null
-        val width = bounds.outWidth
-        val height = bounds.outHeight
-        if (width <= 0 || height <= 0) return null
-
+    private fun transcodeToJpeg(open: () -> java.io.InputStream): ByteArray? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        open().use { BitmapFactory.decodeStream(it, null, bounds) }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
         var sample = 1
-        while (max(width, height) / (sample * 2) >= ApiImageMaxSide) sample *= 2
+        while (max(bounds.outWidth, bounds.outHeight) / sample > ApiImageMaxSide) sample *= 2
         val options = BitmapFactory.Options().apply {
             inSampleSize = sample
             inPreferredConfig = Bitmap.Config.ARGB_8888
         }
-        val decoded = runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) }
-            .getOrNull() ?: return null
+        val decoded = open().use { BitmapFactory.decodeStream(it, null, options) } ?: return null
         var scaled: Bitmap? = null
-        var flattened: Bitmap? = null
+        var solid: Bitmap? = null
         return try {
             val longest = max(decoded.width, decoded.height)
             val source = if (longest > ApiImageMaxSide) {
                 val ratio = ApiImageMaxSide.toFloat() / longest
-                val w = (decoded.width * ratio).toInt().coerceAtLeast(1)
-                val h = (decoded.height * ratio).toInt().coerceAtLeast(1)
-                Bitmap.createScaledBitmap(decoded, w, h, true).also { scaled = it }
-            } else {
-                decoded
+                Bitmap.createScaledBitmap(decoded, (decoded.width * ratio).toInt().coerceAtLeast(1),
+                    (decoded.height * ratio).toInt().coerceAtLeast(1), true).also { scaled = it }
+            } else decoded
+            // Flatten transparency and remove source-specific profiles/animation/container metadata.
+            val output = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888).also { solid = it }
+            android.graphics.Canvas(output).apply {
+                drawColor(android.graphics.Color.WHITE)
+                drawBitmap(source, 0f, 0f, null)
             }
-            // JPEG 没有透明通道：直接压会把透明区域变成黑块（与 AttachmentImport 同一个坑）
-            val solid = if (source.hasAlpha()) {
-                Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888).also {
-                    flattened = it
-                    android.graphics.Canvas(it).apply {
-                        drawColor(android.graphics.Color.WHITE)
-                        drawBitmap(source, 0f, 0f, null)
-                    }
-                }
-            } else {
-                source
+            ByteArrayOutputStream().use { buffer ->
+                if (!output.compress(Bitmap.CompressFormat.JPEG, JpegQuality, buffer)) return null
+                buffer.toByteArray().takeIf { it.isNotEmpty() }
             }
-            val buffer = ByteArrayOutputStream()
-            solid.compress(Bitmap.CompressFormat.JPEG, JpegQuality, buffer)
-            buffer.toByteArray().takeIf { it.isNotEmpty() }
-        } catch (error: Throwable) {
-            // 单张图转码失败不该拖垮整轮请求，交给调用方按"这张发不出去"处理
-            null
         } finally {
-            runCatching { decoded.recycle() }
-            scaled?.let { runCatching { it.recycle() } }
-            flattened?.let { runCatching { it.recycle() } }
+            solid?.recycle()
+            scaled?.takeIf { it !== decoded }?.recycle()
+            decoded.recycle()
         }
     }
-
-    // ── 转码结果的小缓存 ─────────────────────────────────
-    //
-    // 历史里的图**每轮都要重发**，同一张 HEIC 每次发送都转码一遍纯属浪费。
-    // 缓存的是"转码后的 base64"，键是原图字节的哈希（内容不同绝不会撞）。
 
     private const val CacheChars = 8 * 1024 * 1024
-
-    private val cache = object : LinkedHashMap<String, Prepared>() {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Prepared>?): Boolean {
-            var total = 0
-            for (value in values) {
-                total += value.base64.length
-                if (total > CacheChars) return true
-            }
-            return false
-        }
-    }
+    private val cache = LinkedHashMap<String, Prepared>(16, 0.75f, true)
+    private var cachedChars = 0
 
     @Synchronized
     private fun cached(key: String): Prepared? = cache[key]
 
     @Synchronized
     private fun remember(key: String, value: Prepared) {
+        if (value.base64.length > CacheChars) return
+        cache.remove(key)?.let { cachedChars -= it.base64.length }
         cache[key] = value
-    }
-
-    private fun sha256(bytes: ByteArray): String {
-        val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
-        return digest.joinToString(separator = "") { "%02x".format(it) }
+        cachedChars += value.base64.length
+        while (cachedChars > CacheChars) {
+            val first = cache.entries.iterator().next()
+            cachedChars -= first.value.base64.length
+            cache.remove(first.key)
+        }
     }
 }

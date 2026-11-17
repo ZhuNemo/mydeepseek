@@ -5,6 +5,7 @@ import com.simplechat.app.net.ApiStyle
 import com.simplechat.app.net.ProviderKind
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
@@ -18,6 +19,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.encodeToString
 
 private val Context.settingsDataStore: DataStore<Preferences> by preferencesDataStore(
     name = "simplechat_settings",
@@ -25,6 +27,38 @@ private val Context.settingsDataStore: DataStore<Preferences> by preferencesData
 
 /** 语言档位（[AppLanguage] 的枚举名）。抽到文件级，供 [readStoredLanguageSync] 共用。 */
 private val LANGUAGE_KEY = stringPreferencesKey("language_id")
+
+/**
+ * 「这个端点有哪些模型」的持久化格式（换行分隔）。
+ *
+ * 为什么不存 JSON：这里只有一串 id，没有结构；换行在模型 id 里不可能出现
+ * （OpenAI 兼容端点用 `[a-zA-Z0-9._:/-]`），于是编解码就是两行 `map`，
+ * 而 JSON 要引解析器、还要处理坏数据。读取侧对任何异常输入都只说"没有列表"。
+ */
+internal object ModelIdList {
+
+    /**
+     * 上限。正常端点几十个，这里只为拦住"网关把整张目录表倒出来"的极端情况 ——
+     * 几千个 id 会撑大 DataStore，而选择器里也没人翻得到底。
+     */
+    const val MAX_IDS = 500
+
+    fun encode(ids: List<String>): String = ids
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+        .distinct()
+        .take(MAX_IDS)
+        .joinToString("\n")
+
+    fun decode(raw: String?): List<String> = raw
+        ?.lineSequence()
+        ?.map { it.trim() }
+        ?.filter { it.isNotEmpty() }
+        ?.distinct()
+        ?.take(MAX_IDS)
+        ?.toList()
+        .orEmpty()
+}
 
 /**
  * 同步读语言档位 —— 只为 `attachBaseContext`：那时一切异步入口都还没起来。
@@ -36,20 +70,20 @@ internal fun readStoredLanguageSync(context: Context): AppLanguage = runCatching
     }
 }.getOrDefault(AppLanguage.SYSTEM)
 
+/** 持久化的全局配置。 */
 /**
  * WebDAV 同步的默认落点（相对网盘根）。
  *
- * 放在**顶层**而不是 `StoredSettings` 的 companion 里：主构造参数的默认值
- * 引用同类的 companion 成员在部分编译器版本上会报初始化顺序问题，
- * 顶层常量没有这个歧义。
+ * 同步在网盘上是一个**目录**（`meta.json` + `conv/` + `media/`），不是一个文件。
+ * 放在顶层而不是 companion 里：主构造参数的默认值引用同类的 companion 成员
+ * 在部分编译器版本上会报初始化顺序问题，顶层常量没有这个歧义。
  */
 const val DEFAULT_DAV_PATH = "myDeepSeek"
 
 /**
  * 远程路径归一成**目录**。
  *
- * 同步在网盘上是一个目录（`meta.json` + `conv/` + `media/`），不是一个文件。
- * 但上一版填的是文件路径（`myDeepSeek/sync.jsonl`）—— 这里自动取它的父目录，
+ * 上一版填的是文件路径（`myDeepSeek/sync.jsonl`）—— 这里自动取它的父目录，
  * 老配置不用重填，也不会因为多了一层 `sync.jsonl/` 目录而错位。
  */
 internal fun normalizeDavDir(raw: String?): String {
@@ -62,12 +96,15 @@ internal fun normalizeDavDir(raw: String?): String {
     return trimmed
 }
 
-/** 持久化的全局配置。 */
 data class StoredSettings(
     val providerId: String = "DEEPSEEK",
     val baseUrl: String = "https://api.deepseek.com",
     val modelId: String = "deepseek-flash",
     val apiKey: String = "",
+    val apiProfiles: List<ApiProfile> = emptyList(),
+    val activeApiProfileId: String = "legacy",
+    val autoReadAloud: Boolean = false,
+    val showImageSkipNotice: Boolean = true,
     val reasoningLevelId: String = "OFF",
     val temperature: Float = 1.0f,
     val topP: Float = 1.0f,
@@ -118,6 +155,16 @@ data class StoredSettings(
     val ttsVoiceName: String = "",
     val ttsVoiceLabel: String = "",
 
+    /**
+     * 当前端点 `/models` 拉回来的模型 id（[ModelIdList] 编解码）。
+     *
+     * 存下来而不是只放内存：拉取动作发生在「测试连接」或对话面板的刷新里，
+     * 而用户随后进设置页选模型可能已经过了一次重启 —— 列表一丢，选择器就只剩
+     * 内置能力表（自定义端点干脆是空的），于是"能拉到模型，却选不到模型"。
+     * 端点（服务商 / Base URL）一换就清空，见 [SettingsStore.setProvider]。
+     */
+    val modelIds: List<String> = emptyList(),
+
     // ── WebDAV 同步 ─────────────────────────────────────
     /**
      * 服务器地址（例如坚果云的 `https://dav.jianguoyun.com/dav/`）。
@@ -127,17 +174,13 @@ data class StoredSettings(
     val davUser: String = "",
     /** 应用密码（坚果云的「第三方应用密码」），与 API Key 一样只存密文。 */
     val davPassword: String = "",
-    /**
-     * 远程**目录**（相对服务器根），同步数据都放在这里面。
-     *
-     * 带一层目录而不是直接扔在根下：多数网盘的根目录是用户自己的文件区，
-     * 往里面丢一堆文件既容易撞名，也难看。
-     */
+    /** 远程**目录**（相对服务器根），同步数据都放在这里面。 */
     val davPath: String = DEFAULT_DAV_PATH,
     /** 打开应用时自动同步一次。默认关：网络与计费都该由用户决定。 */
     val davAutoSync: Boolean = false,
     /** 上次成功同步的时间（毫秒）；0 = 从未同步。 */
     val davLastSyncAt: Long = 0L,
+
 ) {
     val hasKey: Boolean get() = apiKey.isNotBlank()
 
@@ -172,14 +215,21 @@ data class StoredSettings(
  * 密钥随应用卸载 / 清除数据一起消失，届时解不开只会当"未设置"处理，
  * 不会崩，也不会把密文当 Key 发出去。
  */
-class SettingsStore(private val context: Context) {
+class SettingsStore(
+    private val context: Context,
+    private val preferences: DataStore<Preferences> = context.settingsDataStore,
+) {
 
-    val flow: Flow<StoredSettings> = context.settingsDataStore.data.map { prefs ->
+    val flow: Flow<StoredSettings> = preferences.data.map { prefs ->
         StoredSettings(
             providerId = prefs[Keys.PROVIDER] ?: StoredSettings().providerId,
             baseUrl = prefs[Keys.BASE_URL] ?: StoredSettings().baseUrl,
             modelId = prefs[Keys.MODEL] ?: StoredSettings().modelId,
             apiKey = readApiKey(prefs),
+            apiProfiles = profileRows(prefs),
+            activeApiProfileId = prefs[Keys.ACTIVE_PROFILE] ?: "legacy",
+            autoReadAloud = prefs[Keys.AUTO_READ_ALOUD] ?: false,
+            showImageSkipNotice = prefs[Keys.IMAGE_SKIP_NOTICE] ?: true,
             reasoningLevelId = prefs[Keys.REASONING] ?: StoredSettings().reasoningLevelId,
             temperature = prefs[Keys.TEMPERATURE] ?: StoredSettings().temperature,
             topP = prefs[Keys.TOP_P] ?: StoredSettings().topP,
@@ -198,10 +248,11 @@ class SettingsStore(private val context: Context) {
             locationRegion = prefs[Keys.LOCATION] ?: StoredSettings().locationRegion,
             ttsVoiceName = prefs[Keys.TTS_VOICE] ?: StoredSettings().ttsVoiceName,
             ttsVoiceLabel = prefs[Keys.TTS_VOICE_LABEL] ?: StoredSettings().ttsVoiceLabel,
+            modelIds = ModelIdList.decode(prefs[Keys.MODEL_IDS]),
             davUrl = prefs[Keys.DAV_URL] ?: StoredSettings().davUrl,
             davUser = prefs[Keys.DAV_USER] ?: StoredSettings().davUser,
             davPassword = readDavPassword(prefs),
-            davPath = normalizeDavDir(prefs[Keys.DAV_PATH] ?: DEFAULT_DAV_PATH),
+            davPath = normalizeDavDir(prefs[Keys.DAV_PATH]),
             davAutoSync = prefs[Keys.DAV_AUTO_SYNC] ?: StoredSettings().davAutoSync,
             davLastSyncAt = prefs[Keys.DAV_LAST_SYNC] ?: StoredSettings().davLastSyncAt,
         )
@@ -209,122 +260,6 @@ class SettingsStore(private val context: Context) {
         // Keystore 解密要过 Binder：放到 IO 上，别在 Compose 的组合线程里做。
         // ⚠️ 必须在 `map { }` **外面** —— 写进 lambda 里就成了对 StoredSettings 调 flowOn。
         .flowOn(Dispatchers.IO)
-
-    suspend fun setProvider(providerId: String, baseUrl: String, modelId: String) {
-        context.settingsDataStore.edit { prefs ->
-            prefs[Keys.PROVIDER] = providerId
-            prefs[Keys.BASE_URL] = baseUrl
-            prefs[Keys.MODEL] = modelId
-        }
-    }
-
-    suspend fun setBaseUrl(baseUrl: String) {
-        context.settingsDataStore.edit { it[Keys.BASE_URL] = baseUrl.trim() }
-    }
-
-    suspend fun setModel(modelId: String) {
-        context.settingsDataStore.edit { it[Keys.MODEL] = modelId }
-    }
-
-    suspend fun setApiKey(apiKey: String) {
-        val trimmed = apiKey.trim()
-        context.settingsDataStore.edit { prefs ->
-            if (trimmed.isEmpty()) {
-                prefs.remove(Keys.API_KEY_ENC)
-            } else {
-                SecretBox.encrypt(trimmed)?.let { prefs[Keys.API_KEY_ENC] = it }
-            }
-            // 明文槽位彻底弃用，写入时顺手清掉历史遗留
-            prefs.remove(Keys.API_KEY)
-        }
-    }
-
-    /**
-     * 把 v1.7 之前留下的**明文** Key 就地加密（一次性）。
-     *
-     * 启动时调用一次即可。老版本直接把 Key 写在 `api_key` 里，
-     * 升级后那份明文必须尽快消失，否则"加密存储"只是新数据的待遇。
-     */
-    suspend fun migrateLegacyApiKey() {
-        context.settingsDataStore.edit { prefs ->
-            val legacy = prefs[Keys.API_KEY]
-            if (!legacy.isNullOrBlank() && prefs[Keys.API_KEY_ENC] == null) {
-                SecretBox.encrypt(legacy)?.let { prefs[Keys.API_KEY_ENC] = it }
-            }
-            prefs.remove(Keys.API_KEY)
-        }
-    }
-
-    suspend fun setReasoningLevel(levelId: String) {
-        context.settingsDataStore.edit { it[Keys.REASONING] = levelId }
-    }
-
-    suspend fun setTemperature(value: Float) {
-        context.settingsDataStore.edit { it[Keys.TEMPERATURE] = value }
-    }
-
-    suspend fun setTopP(value: Float) {
-        context.settingsDataStore.edit { it[Keys.TOP_P] = value }
-    }
-
-    suspend fun setMaxTokens(value: Int) {
-        context.settingsDataStore.edit { it[Keys.MAX_TOKENS] = value }
-    }
-
-    suspend fun setThemeMode(modeId: String) {
-        context.settingsDataStore.edit { it[Keys.THEME_MODE] = modeId }
-    }
-
-    suspend fun setAccentColor(colorId: String) {
-        context.settingsDataStore.edit { it[Keys.ACCENT_COLOR] = colorId }
-    }
-
-    suspend fun setFontScale(scale: Float) {
-        context.settingsDataStore.edit { it[Keys.FONT_SCALE] = scale }
-    }
-
-    suspend fun setFollowSystemFont(follow: Boolean) {
-        context.settingsDataStore.edit { it[Keys.FOLLOW_SYSTEM_FONT] = follow }
-    }
-
-    suspend fun setAutoCollapseThinking(enabled: Boolean) {
-        context.settingsDataStore.edit { it[Keys.AUTO_COLLAPSE_THINKING] = enabled }
-    }
-
-    suspend fun setDefaultMode(modeId: String) {
-        context.settingsDataStore.edit { it[Keys.DEFAULT_MODE] = modeId }
-    }
-
-    suspend fun setLanguage(languageId: String) {
-        context.settingsDataStore.edit { it[LANGUAGE_KEY] = languageId }
-    }
-
-    suspend fun setApiStyle(styleId: String) {
-        context.settingsDataStore.edit { it[Keys.API_STYLE] = styleId }
-    }
-
-    suspend fun setWebSearch(enabled: Boolean) {
-        context.settingsDataStore.edit { it[Keys.WEB_SEARCH] = enabled }
-    }
-
-    suspend fun setLocationRegion(region: String) {
-        // 存**洗过**的值：逗号会把时间地点提醒的五个字段挤成六段（见 normalizeRegion）
-        context.settingsDataStore.edit { it[Keys.LOCATION] = normalizeRegion(region) }
-    }
-
-    /** 朗读音色：名字用来精确选中，标签用来在设置页显示（见 [StoredSettings.ttsVoiceName]）。 */
-    suspend fun setTtsVoice(name: String, label: String) {
-        context.settingsDataStore.edit { prefs ->
-            if (name.isBlank()) {
-                prefs.remove(Keys.TTS_VOICE)
-                prefs.remove(Keys.TTS_VOICE_LABEL)
-            } else {
-                prefs[Keys.TTS_VOICE] = name
-                prefs[Keys.TTS_VOICE_LABEL] = label
-            }
-        }
-    }
-
 
     // ── WebDAV 同步 ──────────────────────────────────────
 
@@ -351,7 +286,7 @@ class SettingsStore(private val context: Context) {
         }
     }
 
-    /** 远程文件路径：归一成 `a/b.json`（无前导斜杠），空值回落到默认。 */
+    /** 远程目录：归一成 `a/b`（无前后斜杠），空值回落到默认。 */
     suspend fun setDavPath(path: String) {
         context.settingsDataStore.edit { it[Keys.DAV_PATH] = normalizeDavDir(path) }
     }
@@ -367,14 +302,292 @@ class SettingsStore(private val context: Context) {
     /** 读一次当前配置（同步入口用，不需要订阅）。 */
     suspend fun current(): StoredSettings = flow.first()
 
-    /** 清空全部配置（「删除所有数据」时一并调用）。 */
-    suspend fun clear() {
-        context.settingsDataStore.edit { it.clear() }
-    }
-
     /** 读 WebDAV 密码：只认密文，解不开就当没设置。 */
     private fun readDavPassword(prefs: Preferences): String =
-        prefs[Keys.DAV_PASSWORD_ENC]?.takeIf { it.isNotBlank() }?.let { SecretBox.decrypt(it) }.orEmpty()
+        prefs[Keys.DAV_PASSWORD_ENC]?.takeIf { it.isNotBlank() }
+            ?.let { SecretBox.decrypt(it) }.orEmpty()
+
+    suspend fun setProvider(providerId: String, baseUrl: String, modelId: String) {
+        editApi { prefs ->
+            // 换了端点，旧端点拉到的模型列表就不再成立
+            val endpointChanged = prefs[Keys.PROVIDER] != providerId ||
+                prefs[Keys.BASE_URL] != baseUrl.trim()
+            if (endpointChanged) prefs.remove(Keys.MODEL_IDS)
+            prefs[Keys.PROVIDER] = providerId
+            prefs[Keys.BASE_URL] = baseUrl.trim()
+            prefs[Keys.MODEL] = modelId
+        }
+    }
+
+    suspend fun setBaseUrl(baseUrl: String) {
+        val trimmed = baseUrl.trim()
+        editApi { prefs ->
+            // 只改大小写 / 前后空格不算换端点；真的改了才丢掉旧列表
+            if (prefs[Keys.BASE_URL].orEmpty().trim() != trimmed) prefs.remove(Keys.MODEL_IDS)
+            prefs[Keys.BASE_URL] = trimmed
+        }
+    }
+
+    suspend fun setModel(modelId: String, expectedProfileId: String? = null) {
+        editApi(expectedProfileId) { it[Keys.MODEL] = modelId }
+    }
+
+    /** 记下这个端点 `GET /models` 返回的 id（测试连接 / 对话面板刷新时调用）。 */
+    suspend fun setModelIds(ids: List<String>, expectedProfileId: String? = null, expectedBaseUrl: String? = null) {
+        editApi(expectedProfileId) { prefs ->
+            if (expectedBaseUrl != null && prefs[Keys.BASE_URL] != expectedBaseUrl) return@editApi
+            val encoded = ModelIdList.encode(ids)
+            if (encoded.isEmpty()) {
+                prefs.remove(Keys.MODEL_IDS)
+            } else {
+                prefs[Keys.MODEL_IDS] = encoded
+            }
+        }
+    }
+
+    suspend fun setApiKey(apiKey: String) {
+        // 清洗在**入口**做一次：粘贴带进来的换行/空格是 OkHttp 报
+        // `Unexpected char 0x0a in Authorization value` 的头号原因
+        // （见 ApiKey 的说明）。非 ASCII 不在这里静默丢弃，交给界面拦。
+        val trimmed = ApiKey.normalize(apiKey)
+        editApi { prefs ->
+            // Different credentials at the same URL can expose a different model catalog.
+            prefs.remove(Keys.MODEL_IDS)
+            if (trimmed.isEmpty()) {
+                prefs.remove(Keys.API_KEY_ENC)
+            } else {
+                prefs[Keys.API_KEY_ENC] = SecretBox.encrypt(trimmed)
+                    ?: throw AppTextException(com.simplechat.app.R.string.api_profile_save_failed)
+            }
+            // 明文槽位彻底弃用，写入时顺手清掉历史遗留
+            prefs.remove(Keys.API_KEY)
+        }
+    }
+
+    /**
+     * 把 v1.7 之前留下的**明文** Key 就地加密（一次性）。
+     *
+     * 启动时调用一次即可。老版本直接把 Key 写在 `api_key` 里，
+     * 升级后那份明文必须尽快消失，否则"加密存储"只是新数据的待遇。
+     */
+    suspend fun migrateLegacyApiKey() {
+        preferences.edit { prefs ->
+            val legacy = prefs[Keys.API_KEY]
+            if (!legacy.isNullOrBlank() && prefs[Keys.API_KEY_ENC] == null) {
+                prefs[Keys.API_KEY_ENC] = SecretBox.encrypt(legacy)
+                    ?: throw AppTextException(com.simplechat.app.R.string.api_profile_save_failed)
+            }
+            prefs.remove(Keys.API_KEY)
+        }
+    }
+
+    suspend fun setReasoningLevel(levelId: String, expectedProfileId: String? = null) {
+        editApi(expectedProfileId) { it[Keys.REASONING] = levelId }
+    }
+
+    suspend fun setTemperature(value: Float, expectedProfileId: String? = null) {
+        editApi(expectedProfileId) { it[Keys.TEMPERATURE] = value }
+    }
+
+    suspend fun setTopP(value: Float, expectedProfileId: String? = null) {
+        editApi(expectedProfileId) { it[Keys.TOP_P] = value }
+    }
+
+    suspend fun setMaxTokens(value: Int, expectedProfileId: String? = null) {
+        editApi(expectedProfileId) { it[Keys.MAX_TOKENS] = value }
+    }
+
+    suspend fun setThemeMode(modeId: String) {
+        preferences.edit { it[Keys.THEME_MODE] = modeId }
+    }
+
+    suspend fun setAccentColor(colorId: String) {
+        preferences.edit { it[Keys.ACCENT_COLOR] = colorId }
+    }
+
+    suspend fun setFontScale(scale: Float) {
+        preferences.edit { it[Keys.FONT_SCALE] = scale }
+    }
+
+    suspend fun setFollowSystemFont(follow: Boolean) {
+        preferences.edit { it[Keys.FOLLOW_SYSTEM_FONT] = follow }
+    }
+
+    suspend fun setAutoCollapseThinking(enabled: Boolean) {
+        preferences.edit { it[Keys.AUTO_COLLAPSE_THINKING] = enabled }
+    }
+
+    suspend fun setDefaultMode(modeId: String) {
+        preferences.edit { it[Keys.DEFAULT_MODE] = modeId }
+    }
+
+    suspend fun setLanguage(languageId: String) {
+        preferences.edit { it[LANGUAGE_KEY] = languageId }
+    }
+
+    suspend fun setApiStyle(styleId: String) {
+        editApi { it[Keys.API_STYLE] = styleId }
+    }
+
+    suspend fun setWebSearch(enabled: Boolean) {
+        editApi { it[Keys.WEB_SEARCH] = enabled }
+    }
+
+    suspend fun setLocationRegion(region: String) {
+        // 存**洗过**的值：逗号会把时间地点提醒的五个字段挤成六段（见 normalizeRegion）
+        preferences.edit { it[Keys.LOCATION] = normalizeRegion(region) }
+    }
+
+    /** 朗读音色：名字用来精确选中，标签用来在设置页显示（见 [StoredSettings.ttsVoiceName]）。 */
+    suspend fun setTtsVoice(name: String, label: String) {
+        preferences.edit { prefs ->
+            if (name.isBlank()) {
+                prefs.remove(Keys.TTS_VOICE)
+                prefs.remove(Keys.TTS_VOICE_LABEL)
+            } else {
+                prefs[Keys.TTS_VOICE] = name
+                prefs[Keys.TTS_VOICE_LABEL] = label
+            }
+        }
+    }
+
+
+
+    /** Seed the registry in one edit, preserving the existing active configuration and encrypted key. */
+    suspend fun migrateApiProfiles() { preferences.edit { ensureProfiles(it) } }
+
+    suspend fun setShowImageSkipNotice(enabled: Boolean) {
+        preferences.edit { it[Keys.IMAGE_SKIP_NOTICE] = enabled }
+    }
+
+    suspend fun setAutoReadAloud(enabled: Boolean) {
+        preferences.edit { it[Keys.AUTO_READ_ALOUD] = enabled }
+    }
+
+    private fun profileRows(prefs: Preferences): List<ApiProfile> =
+        prefs[Keys.PROFILES]?.let(::decodeApiProfiles)
+            ?: listOf(snapshotProfile(prefs, "legacy", com.simplechat.app.net.ProviderKind.entries
+                .firstOrNull { it.name == prefs[Keys.PROVIDER] }?.displayName
+                ?: com.simplechat.app.net.ProviderKind.DEEPSEEK.displayName))
+
+    private fun snapshotProfile(prefs: Preferences, id: String, name: String, lastUsedAt: Long = 0): ApiProfile = ApiProfile(
+        id = id, name = name,
+        providerId = prefs[Keys.PROVIDER] ?: "DEEPSEEK",
+        baseUrl = prefs[Keys.BASE_URL] ?: "https://api.deepseek.com",
+        modelId = prefs[Keys.MODEL] ?: "deepseek-flash",
+        apiKeyEncrypted = prefs[Keys.API_KEY_ENC].orEmpty(),
+        apiStyleId = prefs[Keys.API_STYLE] ?: "AUTO",
+        modelIds = ModelIdList.decode(prefs[Keys.MODEL_IDS]),
+        reasoningLevelId = prefs[Keys.REASONING] ?: "OFF",
+        temperature = prefs[Keys.TEMPERATURE] ?: 1f, topP = prefs[Keys.TOP_P] ?: 1f,
+        maxTokens = prefs[Keys.MAX_TOKENS] ?: 0, webSearch = prefs[Keys.WEB_SEARCH] ?: false,
+        lastUsedAt = lastUsedAt,
+    )
+
+    private fun ensureProfiles(prefs: MutablePreferences): List<ApiProfile> {
+        prefs[Keys.PROFILES]?.let { return decodeApiProfiles(it) }
+        val legacy = prefs[Keys.API_KEY]
+        if (!legacy.isNullOrBlank() && prefs[Keys.API_KEY_ENC] == null) {
+            prefs[Keys.API_KEY_ENC] = SecretBox.encrypt(legacy)
+                ?: throw AppTextException(com.simplechat.app.R.string.api_profile_save_failed)
+        }
+        prefs.remove(Keys.API_KEY)
+        val profiles = profileRows(prefs)
+        prefs[Keys.PROFILES] = apiProfileJson.encodeToString(profiles)
+        prefs[Keys.ACTIVE_PROFILE] = profiles.first().id
+        return profiles
+    }
+
+    private suspend fun editApi(expectedProfileId: String? = null, block: (MutablePreferences) -> Unit) {
+        preferences.edit { prefs ->
+            val profiles = ensureProfiles(prefs)
+            val activeId = checkNotNull(prefs[Keys.ACTIVE_PROFILE])
+            if (expectedProfileId != null && expectedProfileId != activeId) return@edit
+            block(prefs)
+            prefs[Keys.PROFILES] = apiProfileJson.encodeToString(profiles.map {
+                if (it.id == activeId) snapshotProfile(prefs, it.id, it.name, it.lastUsedAt) else it
+            })
+        }
+    }
+
+    private fun activate(prefs: MutablePreferences, profile: ApiProfile) {
+        prefs[Keys.ACTIVE_PROFILE] = profile.id
+        prefs[Keys.PROVIDER] = profile.providerId
+        prefs[Keys.BASE_URL] = profile.baseUrl
+        prefs[Keys.MODEL] = profile.modelId
+        if (profile.apiKeyEncrypted.isEmpty()) prefs.remove(Keys.API_KEY_ENC)
+        else prefs[Keys.API_KEY_ENC] = profile.apiKeyEncrypted
+        prefs.remove(Keys.API_KEY)
+        prefs[Keys.API_STYLE] = profile.apiStyleId
+        prefs[Keys.MODEL_IDS] = ModelIdList.encode(profile.modelIds)
+        prefs[Keys.REASONING] = profile.reasoningLevelId
+        prefs[Keys.TEMPERATURE] = profile.temperature
+        prefs[Keys.TOP_P] = profile.topP
+        prefs[Keys.MAX_TOKENS] = profile.maxTokens
+        prefs[Keys.WEB_SEARCH] = profile.webSearch
+    }
+
+    suspend fun selectApiProfile(id: String) {
+        preferences.edit { prefs ->
+            val profiles = ensureProfiles(prefs)
+            val selected = profiles.firstOrNull { it.id == id } ?: return@edit
+            val current = selected.copy(lastUsedAt = System.currentTimeMillis())
+            activate(prefs, current)
+            prefs[Keys.PROFILES] = apiProfileJson.encodeToString(profiles.map { if (it.id == id) current else it })
+        }
+    }
+
+    /** Provider picker recalls the last used profile for that provider, including its own key. */
+    suspend fun selectProvider(provider: ProviderKind) {
+        preferences.edit { prefs ->
+            val profiles = ensureProfiles(prefs)
+            if (prefs[Keys.PROVIDER] == provider.name) return@edit
+            val selected = profiles.filter { it.providerId == provider.name }.maxByOrNull { it.lastUsedAt }
+                ?: ApiProfile(java.util.UUID.randomUUID().toString(), provider.displayName,
+                    provider.name, provider.defaultBaseUrl, provider.defaultModel)
+            val current = selected.copy(lastUsedAt = System.currentTimeMillis())
+            activate(prefs, current)
+            prefs[Keys.PROFILES] = apiProfileJson.encodeToString(profiles.filterNot { it.id == current.id } + current)
+        }
+    }
+
+    suspend fun createApiProfile(name: String, copyCurrent: Boolean = false) {
+        val title = name.trim().take(80)
+        require(title.isNotEmpty())
+        preferences.edit { prefs ->
+            val profiles = ensureProfiles(prefs)
+            val id = java.util.UUID.randomUUID().toString()
+            val profile = if (copyCurrent) snapshotProfile(prefs, id, title, System.currentTimeMillis())
+                else ApiProfile(id, title, "CUSTOM", "", "", lastUsedAt = System.currentTimeMillis())
+            prefs[Keys.PROFILES] = apiProfileJson.encodeToString(profiles + profile)
+            activate(prefs, profile)
+        }
+    }
+
+    suspend fun renameApiProfile(id: String, name: String) {
+        val title = name.trim().take(80)
+        require(title.isNotEmpty())
+        preferences.edit { prefs ->
+            prefs[Keys.PROFILES] = apiProfileJson.encodeToString(ensureProfiles(prefs).map {
+                if (it.id == id) it.copy(name = title) else it
+            })
+        }
+    }
+
+    suspend fun deleteApiProfile(id: String) {
+        preferences.edit { prefs ->
+            val profiles = ensureProfiles(prefs)
+            require(profiles.size > 1)
+            val remaining = profiles.filterNot { it.id == id }
+            if (prefs[Keys.ACTIVE_PROFILE] == id) activate(prefs, remaining.maxBy { it.lastUsedAt })
+            prefs[Keys.PROFILES] = apiProfileJson.encodeToString(remaining)
+        }
+    }
+
+    /** 清空全部配置（「删除所有数据」时一并调用）。 */
+    suspend fun clear() {
+        preferences.edit { it.clear() }
+    }
 
     /** 读 API Key：优先密文，其次兼容老版本的明文。 */
     private fun readApiKey(prefs: Preferences): String {
@@ -383,6 +596,10 @@ class SettingsStore(private val context: Context) {
     }
 
     private object Keys {
+        val PROFILES = stringPreferencesKey("api_profiles_v1")
+        val ACTIVE_PROFILE = stringPreferencesKey("active_api_profile")
+        val IMAGE_SKIP_NOTICE = booleanPreferencesKey("show_image_skip_notice")
+        val AUTO_READ_ALOUD = booleanPreferencesKey("auto_read_aloud")
         val PROVIDER = stringPreferencesKey("provider_id")
         val BASE_URL = stringPreferencesKey("base_url")
         val MODEL = stringPreferencesKey("model_id")
@@ -421,6 +638,9 @@ class SettingsStore(private val context: Context) {
         val DAV_PATH = stringPreferencesKey("dav_path")
         val DAV_AUTO_SYNC = booleanPreferencesKey("dav_auto_sync")
         val DAV_LAST_SYNC = longPreferencesKey("dav_last_sync_at")
+
+        /** 当前端点 `/models` 拉回来的 id，换行分隔（[ModelIdList]）。 */
+        val MODEL_IDS = stringPreferencesKey("model_ids")
 
     }
 }

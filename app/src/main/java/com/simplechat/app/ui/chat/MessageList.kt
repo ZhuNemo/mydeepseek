@@ -1,5 +1,22 @@
 package com.simplechat.app.ui.chat
 
+import android.os.SystemClock
+import android.view.MotionEvent
+import android.view.View
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.text.selection.SelectionState
+import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.unit.IntOffset
+import kotlinx.coroutines.delay
+import com.simplechat.app.ui.common.rememberPressWindowPosition
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.geometry.Rect
+import com.simplechat.app.ui.markdown.LocalSearchViewport
+import com.simplechat.app.ui.markdown.SearchViewport
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
@@ -26,9 +43,11 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -64,6 +83,9 @@ import com.simplechat.app.ui.common.SoftShape
 import com.simplechat.app.ui.common.rememberPressPosition
 import com.simplechat.app.ui.markdown.MarkdownText
 import com.simplechat.app.ui.markdown.MarkdownWithMath
+import com.simplechat.app.ui.markdown.SearchHighlightHost
+import com.simplechat.app.ui.markdown.LocalSearchHighlight
+import com.simplechat.app.ui.markdown.rememberSearchTextDecoration
 import com.simplechat.app.ui.theme.ChatColors
 import com.simplechat.app.ui.theme.LocalChatColors
 import com.simplechat.app.ui.common.PillShape
@@ -99,8 +121,15 @@ fun MessageList(
     onRegenerate: (UiMessage) -> Unit = {},
     /** 继续生成：接着这条回复往下写（只有扩展通道能续，见 `ContinuePolicy`）。 */
     onContinue: (UiMessage) -> Unit = {},
-    /** 朗读这条回复（系统 TTS）。 */
+    /** 朗读这条回复（系统 / DeepSeek 官方 TTS）。 */
     onSpeak: (UiMessage) -> Unit = {},
+    /**
+     * 当前音色**能不能出声**。
+     *
+     * 官方音色只在「服务商 = DeepSeek 官方 + Key 已填」时可用；不可用时
+     * 整颗朗读按钮不显示 —— 点下去再弹一句"不支持"是最差的两种体验的组合。
+     */
+    readAloudAvailable: Boolean = true,
     /** 正在朗读的那条消息 id。 */
     speakingId: String? = null,
     onEdit: (UiMessage) -> Unit = {},
@@ -126,6 +155,10 @@ fun MessageList(
      * 连历史消息的初态也跟着变（用户在设置里刚改完，回头看旧会话该是新行为）。
      */
     autoCollapseThinking: Boolean = true,
+    searchTarget: SearchTarget? = null,
+    onDismissSearch: () -> Unit = {},
+    searchBottomObstructionPx: Int = 0,
+    searchPlacementReset: Long = 0,
 ) {
     /*
      * 「谁被碰过」。
@@ -141,15 +174,64 @@ fun MessageList(
      */
     var peekedId by remember { mutableStateOf<String?>(null) }
 
+    /**
+     * 正在「选择文本」的那一条（null = 没在选）。
+     *
+     * 抬到列表这一层，才接得住**点空白处退出** —— 只挂在单条消息上时，
+     * 点在别处（另一条消息、列表留白）就退不出来。
+     */
+    var selectingId by remember { mutableStateOf<String?>(null) }
+
     LaunchedEffect(listState) {
         snapshotFlow { listState.isScrollInProgress }
-            .collect { scrolling -> if (scrolling) peekedId = null }
+            .collect { scrolling ->
+                // 只有"碰一下看元信息"是即时的：手指一动就收起。
+                // ⚠️ **选择文本不能跟着滚动静默退出**：选到一半往上翻一屏看上文是常规操作，
+                // 一滚就丢选区等于把"选完再复制"这条路堵死。
+                if (scrolling) peekedId = null
+            }
     }
 
+    /*
+     * 选择态下**点一下就退出**。
+     *
+     * 必须带 `onLongPress`（哪怕是空的）：长按正是"起选"的手势，
+     * 不给它一个消费者，一次长按会被当成"点了一下"而立刻把选择态关掉。
+     */
+    val dismissSelectionOnTap = Modifier.pointerInput(selectingId) {
+        if (selectingId == null) return@pointerInput
+        detectTapGestures(
+            onLongPress = { },
+            onTap = { selectingId = null },
+        )
+    }
+
+    var viewport by remember { mutableStateOf(Rect.Zero) }
+    val visibleBounds = Rect(viewport.left, viewport.top, viewport.right,
+        (viewport.bottom - searchBottomObstructionPx).coerceAtLeast(viewport.top))
+    val searchViewport = remember(visibleBounds, listState) {
+        SearchViewport(visibleBounds) { listState.scrollBy(it) }
+    }
+    // Allow first/last hits to reach the upper center. Keep room after fading until a new message/branch arrives.
+    var searchSpacePx by remember(messages.lastOrNull()?.id, searchPlacementReset) { mutableStateOf(0f) }
+    androidx.compose.runtime.SideEffect {
+        if (searchTarget != null) searchSpacePx = visibleBounds.height
+    }
+    val searchSpace = with(LocalDensity.current) { searchSpacePx.toDp() }
+    val searchContentPadding = PaddingValues(
+        start = contentPadding.calculateLeftPadding(androidx.compose.ui.platform.LocalLayoutDirection.current),
+        end = contentPadding.calculateRightPadding(androidx.compose.ui.platform.LocalLayoutDirection.current),
+        top = contentPadding.calculateTopPadding() + searchSpace * 0.38f,
+        bottom = contentPadding.calculateBottomPadding() + searchSpace * 0.62f,
+    )
+    CompositionLocalProvider(LocalSearchViewport provides searchViewport) {
     LazyColumn(
         state = listState,
-        modifier = modifier.fillMaxWidth(),
-        contentPadding = contentPadding,
+        modifier = modifier
+            .fillMaxWidth()
+            .onGloballyPositioned { viewport = it.boundsInWindow() }
+            .then(dismissSelectionOnTap),
+        contentPadding = searchContentPadding,
         verticalArrangement = Arrangement.spacedBy(18.dp),
         /*
          * ⚠️ **顶部为原点（对齐官方）。这一行是流式不滑动的根。**
@@ -179,13 +261,20 @@ fun MessageList(
         ) { index, message ->
             MessageRow(
                 message = message,
+                search = searchTarget?.takeIf { it.messageId == message.id },
+                onDismissSearch = onDismissSearch,
                 peeked = peekedId == message.id,
+                selecting = selectingId == message.id,
+                onSelectingChange = { active ->
+                    selectingId = if (active) message.id else selectingId?.takeUnless { it == message.id }
+                },
                 /*
                  * 能不能续写由**位置 + 状态**共同决定（见 `ContinuePolicy`）。
                  * 「最后一条」在这里判最准：列表本身就是活跃路径。
                  */
                 canContinue = canContinueReply(message, isLastOnPath = index == messages.lastIndex),
                 speakingId = speakingId,
+                readAloudAvailable = readAloudAvailable,
                 autoCollapseThinking = autoCollapseThinking,
                 /*
                  * 折叠/展开**不需要任何视口补偿**（顶部为原点）。
@@ -215,6 +304,7 @@ fun MessageList(
             )
         }
     }
+    }
 }
 
 /**
@@ -227,9 +317,15 @@ fun MessageList(
 @Composable
 private fun MessageRow(
     message: UiMessage,
+    search: SearchTarget?,
+    onDismissSearch: () -> Unit,
     peeked: Boolean,
+    /** 这条是否处于「选择文本」态（由列表统一持有，见 `MessageList`）。 */
+    selecting: Boolean,
+    onSelectingChange: (Boolean) -> Unit,
     canContinue: Boolean,
     speakingId: String?,
+    readAloudAvailable: Boolean,
     autoCollapseThinking: Boolean,
     onTogglePeek: () -> Unit,
     onCopy: () -> Unit,
@@ -245,6 +341,30 @@ private fun MessageRow(
     onFoldToggle: () -> Unit,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
+    /*
+     * 「选择文本」= 让这一条的正文变成可选，**不留任何界面痕迹**：
+     * 没有提示条、没有「完成」按钮，点空白处就退出（见 `MessageList` 的
+     * `dismissSelectionOnTap`）。为什么不能常驻：`SelectionContainer` 自己也要用
+     * **长按**起选，而长按是这一条的菜单入口，两者会抢同一个手势。
+     */
+    val selectionState = remember(message.id) { SelectionState() }
+    val view = LocalView.current
+    // 长按落点（窗口坐标）：进入选择态后要在这同一个点上合成一次长按，
+    // 让选区**从用户按下去的地方**开始，而不是"先进入模式，再自己长按一次"。
+    val (windowPressPosition, windowPressListener) = rememberPressWindowPosition()
+
+    LaunchedEffect(selecting) {
+        if (!selecting) {
+            selectionState.clear()
+            return@LaunchedEffect
+        }
+        val point = windowPressPosition() ?: return@LaunchedEffect
+        // 等这一帧把 SelectionContainer 真正挂上（菜单的关闭动画也在同一帧里），再注入
+        withFrameNanos { }
+        withFrameNanos { }
+        delay(SelectionStartDelayMs)
+        startSelectionAt(view, point)
+    }
     val isUser = message.role == MessageRole.USER
     // 流式未结束时不对这条给出编辑/删除入口，避免和落库打架
     val actionable = !message.streaming
@@ -263,6 +383,10 @@ private fun MessageRow(
             AppMenuItem(stringResource(R.string.action_copy), AppIcons.Copy) {
                 menuOpen = false
                 onCopy()
+            }
+            AppMenuItem(stringResource(R.string.action_select_text), AppIcons.TextSelect) {
+                menuOpen = false
+                onSelectingChange(true)
             }
             if (!isUser) {
                 AppMenuItem(stringResource(R.string.msg_regenerate), AppIcons.Refresh) {
@@ -295,11 +419,31 @@ private fun MessageRow(
         }
     }
 
-    Column(modifier = Modifier.fillMaxWidth()) {
-        when (message.role) {
+    SearchHighlightHost(search, onDismissSearch) {
+    Column(modifier = Modifier.fillMaxWidth().then(windowPressListener)) {
+        if (message.content.length > LARGE_MESSAGE_CHARS || (message.reasoning?.length ?: 0) > LARGE_MESSAGE_CHARS) {
+            Column(Modifier.then(pressListener).combinedClickable(
+                enabled = actionable && !selecting,
+                onClick = if (isUser) onEdit else onTogglePeek,
+                onLongClick = { menuOpen = true },
+            )) {
+            if (message.attachments.isNotEmpty()) MessageAttachments(message.attachments, onOpenImage)
+            message.reasoning?.takeIf { it.isNotEmpty() }?.let {
+                Text(stringResource(R.string.large_message_reasoning), style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                CompositionLocalProvider(LocalSearchHighlight provides null) { PagedMessageBody(it) }
+            }
+            SelectableText(selecting, selectionState) { PagedMessageBody(message.content, markdown = !isUser) }
+            message.errorMessage?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            menu()
+            }
+        }
+        else when (message.role) {
             MessageRole.USER -> UserBubble(
                 message = message,
-                interactive = actionable,
+                interactive = actionable && !selecting,
+                selecting = selecting,
+                selectionState = selectionState,
                 // 点一下就进「修改输入」（对齐官方入口习惯）
                 onClick = onEdit,
                 onLongClick = { menuOpen = true },
@@ -311,7 +455,9 @@ private fun MessageRow(
 
             MessageRole.ASSISTANT -> AssistantBlock(
                 message = message,
-                interactive = actionable,
+                interactive = actionable && !selecting,
+                selecting = selecting,
+                selectionState = selectionState,
                 autoCollapseThinking = autoCollapseThinking,
                 // 点一下 = 看这条是谁写的、占多少 token（再点收起）
                 onClick = onTogglePeek,
@@ -351,6 +497,7 @@ private fun MessageRow(
                 peeked = peeked,
                 canContinue = canContinue,
                 speaking = speakingId == message.id,
+                readAloudAvailable = readAloudAvailable,
                 onCopy = onCopy,
                 onRegenerate = onRegenerate,
                 onContinue = onContinue,
@@ -360,6 +507,7 @@ private fun MessageRow(
                 onVariantChange = onVariantChange,
             )
         }
+    }
     }
 }
 
@@ -377,6 +525,9 @@ fun UserBubble(
     message: UiMessage,
     modifier: Modifier = Modifier,
     interactive: Boolean = true,
+    /** 「选择文本」态：正文外包一层 `SelectionContainer`（见 `MessageRow`）。 */
+    selecting: Boolean = false,
+    selectionState: SelectionState = remember { SelectionState() },
     onClick: () -> Unit = {},
     onLongClick: () -> Unit = {},
     onOpenImage: (Attachment) -> Unit = {},
@@ -393,10 +544,9 @@ fun UserBubble(
         val images = message.attachments.filter { it.isImage }
         val files = message.attachments.filter { !it.isImage }
         val hasText = message.content.isNotBlank()
-
-        Column(
+        Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalAlignment = Alignment.End,
+            horizontalArrangement = Arrangement.End,
         ) {
             /*
              * ⚠️ 这里**不能用 `clip`** —— 见设计文档 §31。
@@ -423,69 +573,67 @@ fun UserBubble(
              */
             var expanded by remember(message.id) { mutableStateOf(false) }
             var folded by remember(message.id) { mutableStateOf(false) }
+            val search = LocalSearchHighlight.current
+            LaunchedEffect(search?.request) {
+                if (search != null && message.content.contains(search.query, ignoreCase = true)) expanded = true
+            }
 
             /*
-             * 点击（编辑）/ 长按（菜单）挂在**内容簇**这一层，而不是气泡本身。
-             *
-             * 图片现在住在气泡外面（见 [UserImagePreviews]）：如果交互还挂在气泡上，
-             * "只发了图、没写字"的消息就既没有气泡、也没有任何入口 ——
-             * 用户删不掉它。挂在内容簇上以后，气泡、图片、两者之间的空隙
-             * 用的是同一套手势，行为一致。
-             *
-             * 宽度只到内容为止（`widthIn` + 右对齐），不会出现"点左边空白也进编辑"。
+             * 图片排在气泡**上方**：它是"我给它看的东西"，文字是"我要说的话"，
+             * 从上往下读正好是这个顺序。图片固定成正方形，不再和正文挤在一个气泡里。
              */
             Column(
-                modifier = Modifier
-                    .widthIn(max = maxBubbleWidth)
-                    .then(pressListener)
-                    .combinedClickable(
-                        interactionSource = interaction,
-                        indication = null,
-                        enabled = interactive,
-                        onClick = onClick,
-                        onLongClick = onLongClick,
-                    ),
+                modifier = Modifier.widthIn(max = maxBubbleWidth),
                 horizontalAlignment = Alignment.End,
             ) {
-                /*
-                 * 图片排在气泡**上方**：它是"我给它看的东西"，文字是"我要说的话"，
-                 * 从上往下读正好是这个顺序；尺寸固定成正方形，不随原图比例变形。
-                 *
-                 * 图片自己带点击（放大查看），会吃掉这一下 ——
-                 * 不会顺手把整条消息带进编辑态。长按则显式转给消息菜单。
-                 */
                 if (images.isNotEmpty()) {
                     UserImagePreviews(
                         images = images,
                         onOpenImage = onOpenImage,
-                        // 按**气泡宽度**算而不是屏宽：图片与气泡同宽，屏宽三张放得下、
-                        // 气泡宽度放不下，结果就是第三张被裁掉半个
+                        // 按**气泡宽度**算而不是屏宽：图片与气泡同宽，
+                        // 屏宽三张放得下、气泡宽度放不下，第三张就会被裁掉半个
                         perRow = if (maxBubbleWidth < ImagesThreePerRowWidth) 2 else 3,
                         onLongClick = onLongClick,
                     )
                     if (hasText || files.isNotEmpty()) Spacer(Modifier.size(8.dp))
                 }
 
-                // 没有文字也没有文件 → **不画气泡**。只发图片的消息不该多出一块空圆角
+                // 没有文字也没有文件 → **不画气泡**：只发图片的消息不该多出一块空圆角
                 if (hasText || files.isNotEmpty()) {
-                    Box(
-                        modifier = Modifier
-                            // 右下角收紧，给"从右发出"一个方向感
-                            .background(colors.userBubble, BubbleShapeOut)
-                            .padding(horizontal = 14.dp, vertical = 11.dp),
-                    ) {
-                        // 按下时的浅色层：垫在正文**下面**，正文颜色不受影响
-                        if (pressed) {
-                            Box(
-                                modifier = Modifier
-                                    .matchParentSize()
-                                    .background(colors.onUserBubble.copy(alpha = 0.07f), BubbleShapeOut),
-                            )
-                        }
-                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            // 气泡里只剩文件卡片（图片已经在上面了）
-                            MessageFiles(files = files, inUserBubble = true)
-                            if (hasText) {
+                Box(
+                    modifier = Modifier
+                        .widthIn(max = maxBubbleWidth)
+                        // 右下角收紧，给"从右发出"一个方向感
+                        .background(colors.userBubble, BubbleShapeOut)
+                        .then(pressListener)
+                        .combinedClickable(
+                            interactionSource = interaction,
+                            indication = null,
+                            enabled = interactive,
+                            onClick = onClick,
+                            onLongClick = onLongClick,
+                        )
+                        .padding(horizontal = 14.dp, vertical = 11.dp),
+                ) {
+                    // 按下时的浅色层：垫在正文**下面**，正文颜色不受影响
+                    if (pressed) {
+                        Box(
+                            modifier = Modifier
+                                .matchParentSize()
+                                .background(colors.onUserBubble.copy(alpha = 0.07f), BubbleShapeOut),
+                        )
+                    }
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        /*
+                         * 附件排在文字**上面**：图片是"我给它看的东西"，
+                         * 文字是"我要说的话"，从上往下读正好是这个顺序。
+                         *
+                         * 图片自己带点击（放大查看），会吃掉这一下 ——
+                         * 不会顺手把整条消息带进编辑态。
+                         */
+                        // 图片已经在气泡上方了，这里只剩文件卡片
+                        MessageFiles(files = files, inUserBubble = true)
+                        if (message.content.isNotBlank()) {
                             /*
                              * 超长正文的**两态渲染**（根因与实测见设计文档 §31）：
                              *
@@ -496,68 +644,75 @@ fun UserBubble(
                              * ⚠️ 顺带记住那条判据：**别给高度无界的节点挂 `clip` / `graphicsLayer`** ——
                              * 超长气泡上那层图形层会失效，命中测试只认到某个高度为止。
                              */
-                                val chunks = remember(message.content) { textChunks(message.content) }
+                            val chunks = remember(message.content) { textChunks(message.content) }
 
-                                Box {
-                                    /*
-                                     * 收起态：正文往**右下角**化开。
-                                     *
-                                     * 正文是按 `maxLines` **硬裁**的，不加这层就能看到一条齐刷刷的断口；
-                                     * 以右下角为圆心做径向渐变，正好把断口那一段"吃掉"，
-                                     * 同时让视线顺着往右读，暗示"还有下文"。
-                                     *
-                                     * ⚠️ **层级是这里唯一要紧的事。** 渐隐必须画在
-                                     * **只包正文的这个 Column** 上 —— 它的下一个兄弟才是右下角那个箭头，
-                                     * 于是箭头天然压在遮罩上方。
-                                     *
-                                     * 早先把它画到外面那层 Column（同时装着正文和箭头）上，就错了：
-                                     * `drawWithContent` 在**所有后代之后**绘制，箭头也被一起盖住。
-                                     * 兄弟先后顺序只在**同一层**里作数，跨层不成立 —— 这正是踩的那一脚。
-                                     */
-                                    Column(
-                                        modifier = Modifier
-                                            /*
-                                             * 展开 / 缩回的动画。
-                                             *
-                                             * 挂在这一层（正文容器）上：外层气泡尺寸跟着它走，
-                                             * 于是整条气泡平滑地长高 / 收回。
-                                             *
-                                             * `animateContentSize` 只是把**量出来的尺寸**做插值并裁剪，
-                                             * 文字本身不重排 —— 所以 20 万字也是一次"掀开"，
-                                             * 而不是让眼睛去追一段疯狂滚动的文字。
-                                             *
-                                             * ⚠️ **只在可折叠的长消息上挂**：普通消息的高度不需要插值，
-                                             * 而高度被插值意味着列表在动画期间反复重锚 —— 那是另一种"跳"。
-                                             */
-                                            .then(
-                                                if (folded) {
-                                                    Modifier.animateContentSize(
-                                                        animationSpec = tween(
-                                                            durationMillis = FoldAnimMs,
-                                                            easing = MotionEasing,
-                                                        ),
-                                                    )
-                                                } else {
-                                                    Modifier
-                                                },
-                                            )
-                                            .then(
-                                            if (folded && !expanded) {
-                                                Modifier.drawWithContent {
-                                                    drawContent()
-                                                    drawRect(
-                                                        brush = Brush.radialGradient(
-                                                            colors = listOf(colors.userBubble, Color.Transparent),
-                                                            center = Offset(size.width, size.height),
-                                                            radius = fadePx,
-                                                        ),
-                                                    )
-                                                }
+                            Box {
+                                /*
+                                 * 收起态：正文往**右下角**化开。
+                                 *
+                                 * 正文是按 `maxLines` **硬裁**的，不加这层就能看到一条齐刷刷的断口；
+                                 * 以右下角为圆心做径向渐变，正好把断口那一段"吃掉"，
+                                 * 同时让视线顺着往右读，暗示"还有下文"。
+                                 *
+                                 * ⚠️ **层级是这里唯一要紧的事。** 渐隐必须画在
+                                 * **只包正文的这个 Column** 上 —— 它的下一个兄弟才是右下角那个箭头，
+                                 * 于是箭头天然压在遮罩上方。
+                                 *
+                                 * 早先把它画到外面那层 Column（同时装着正文和箭头）上，就错了：
+                                 * `drawWithContent` 在**所有后代之后**绘制，箭头也被一起盖住。
+                                 * 兄弟先后顺序只在**同一层**里作数，跨层不成立 —— 这正是踩的那一脚。
+                                 */
+                                Column(
+                                    modifier = Modifier
+                                        /*
+                                         * 展开 / 缩回的动画。
+                                         *
+                                         * 挂在这一层（正文容器）上：外层气泡尺寸跟着它走，
+                                         * 于是整条气泡平滑地长高 / 收回。
+                                         *
+                                         * `animateContentSize` 只是把**量出来的尺寸**做插值并裁剪，
+                                         * 文字本身不重排 —— 所以 20 万字也是一次"掀开"，
+                                         * 而不是让眼睛去追一段疯狂滚动的文字。
+                                         *
+                                         * ⚠️ **只在可折叠的长消息上挂**：普通消息的高度不需要插值，
+                                         * 而高度被插值意味着列表在动画期间反复重锚 —— 那是另一种"跳"。
+                                         */
+                                        .then(
+                                            if (folded) {
+                                                Modifier.animateContentSize(
+                                                    animationSpec = tween(
+                                                        durationMillis = FoldAnimMs,
+                                                        easing = MotionEasing,
+                                                    ),
+                                                )
                                             } else {
                                                 Modifier
                                             },
-                                        ),
-                                    ) {
+                                        )
+                                        .then(
+                                        if (folded && !expanded) {
+                                            Modifier.drawWithContent {
+                                                drawContent()
+                                                drawRect(
+                                                    brush = Brush.radialGradient(
+                                                        colors = listOf(colors.userBubble, Color.Transparent),
+                                                        center = Offset(size.width, size.height),
+                                                        radius = fadePx,
+                                                    ),
+                                                )
+                                            }
+                                        } else {
+                                            Modifier
+                                        },
+                                    ),
+                                ) {
+                                    /*
+                                     * 选择态：正文外面套一层 `SelectionContainer`，长按即可起选、
+                                     * 拖动拉选区，系统工具栏自带复制 / 全选。
+                                     *
+                                     * 平时不套：那样长按会被选区抢走，而本行的长按是**菜单**。
+                                     */
+                                    SelectableText(selecting, selectionState) {
                                         if (expanded) {
                                             /*
                                              * 展开态：切成多块。
@@ -566,8 +721,11 @@ fun UserBubble(
                                              * 块之间加间距会凭空多出一堆空行。
                                              */
                                             chunks.forEach { chunk ->
+                                                val (searchModifier, onSearchLayout) = rememberSearchTextDecoration(chunk)
                                                 Text(
                                                     text = chunk,
+                                                    modifier = searchModifier,
+                                                    onTextLayout = onSearchLayout,
                                                     style = MaterialTheme.typography.bodyLarge,
                                                     color = colors.onUserBubble,
                                                 )
@@ -592,43 +750,43 @@ fun UserBubble(
                                             )
                                         }
                                     }
+                                }
 
-                                    if (folded) {
-                                        /*
-                                         * 右下角折叠按钮：**半透明胶囊**。
-                                         *
-                                         * 用半透明而不是实心底 —— 实心圆贴在气泡角上像一块硬片，太丑；
-                                         * 半透明让下面的气泡与淡出的正文透出来，边缘自然化开。
-                                         *
-                                         * ⚠️ 但它必须有底色（哪怕半透明）：右下角正是渐隐最深的地方，
-                                         * 只剩一根线的话会糊在淡出的文字里，看着像被盖住。
-                                         * 它在渐隐**之后**绘制（是渐隐那一层的下一个兄弟），所以压在遮罩上方。
-                                         */
-                                        Box(modifier = Modifier.align(Alignment.BottomEnd)) {
-                                            IconCircleButton(
-                                                icon = if (expanded) AppIcons.ChevronUp else AppIcons.ChevronDown,
-                                                contentDescription = if (expanded) stringResource(R.string.md_collapse) else stringResource(R.string.msg_expand_all),
-                                                onClick = {
-                                                    expanded = !expanded
-                                                    // 先通知外层别跟底，否则展开的高度立刻被吃掉、按钮跑掉
-                                                    onFoldToggle()
-                                                },
-                                                size = UserBubbleFoldButtonSize,
-                                                width = UserBubbleFoldButtonWidth,
-                                                shape = PillShape,
-                                                iconSize = 14.dp,
-                                                background = colors.card.copy(alpha = 0.72f),
-                                                tint = colors.processText,
-                                            )
-                                        }
+                                if (folded) {
+                                    /*
+                                     * 右下角折叠按钮：**半透明胶囊**。
+                                     *
+                                     * 用半透明而不是实心底 —— 实心圆贴在气泡角上像一块硬片，太丑；
+                                     * 半透明让下面的气泡与淡出的正文透出来，边缘自然化开。
+                                     *
+                                     * ⚠️ 但它必须有底色（哪怕半透明）：右下角正是渐隐最深的地方，
+                                     * 只剩一根线的话会糊在淡出的文字里，看着像被盖住。
+                                     * 它在渐隐**之后**绘制（是渐隐那一层的下一个兄弟），所以压在遮罩上方。
+                                     */
+                                    Box(modifier = Modifier.align(Alignment.BottomEnd)) {
+                                        IconCircleButton(
+                                            icon = if (expanded) AppIcons.ChevronUp else AppIcons.ChevronDown,
+                                            contentDescription = if (expanded) stringResource(R.string.md_collapse) else stringResource(R.string.msg_expand_all),
+                                            onClick = {
+                                                expanded = !expanded
+                                                // 先通知外层别跟底，否则展开的高度立刻被吃掉、按钮跑掉
+                                                onFoldToggle()
+                                            },
+                                            size = UserBubbleFoldButtonSize,
+                                            width = UserBubbleFoldButtonWidth,
+                                            shape = PillShape,
+                                            iconSize = 14.dp,
+                                            background = colors.card.copy(alpha = 0.72f),
+                                            tint = colors.processText,
+                                        )
                                     }
                                 }
                             }
                         }
-                    }               // Box(气泡) —— 只在有文字 / 文件时才存在
-                }               // if (hasText || files.isNotEmpty())
-
-                menu()
+                    }
+                    menu()
+                }
+                }
             }
         }
     }
@@ -645,6 +803,9 @@ fun AssistantBlock(
     message: UiMessage,
     modifier: Modifier = Modifier,
     interactive: Boolean = true,
+    /** 「选择文本」态：正文外包一层 `SelectionContainer`（见 `MessageRow`）。 */
+    selecting: Boolean = false,
+    selectionState: SelectionState = remember { SelectionState() },
     onClick: () -> Unit = {},
     onLongClick: () -> Unit = {},
     onOpenImage: (Attachment) -> Unit = {},
@@ -723,6 +884,18 @@ fun AssistantBlock(
             )
             .padding(2.dp),
     ) {
+        /*
+         * 首 token 还没到：正文、思考、时间线**全空**。
+         *
+         * 这一段在长上下文 + 思考型模型上能走十几秒，原先界面上什么都没有 ——
+         * 用户看到的只是"消息发出去后一片空白"。给一个和思考栏同形状的
+         * 「加载中…」过渡，第一段内容一出现就自动让位。
+         */
+        if (message.streaming && answer.isBlank() && !hasReasoning && timeline == null) {
+            WaitingIndicator()
+            Spacer(Modifier.size(MessageGap))
+        }
+
         if (timeline != null) {
             if (timeline.hasSteps) {
                 TimelinePanel(
@@ -766,10 +939,12 @@ fun AssistantBlock(
          * 流式的开销靠两道闸压住：上游按固定节奏采样（见 `MarkdownText`），
          * 下游逐块渲染、只有尾块重解析（见 `MarkdownTextBlocks`）。
          */
-        MarkdownWithMath(
-            content = answer,
-            streaming = message.streaming,
-        )
+        SelectableText(selecting, selectionState) {
+            MarkdownWithMath(
+                content = answer,
+                streaming = message.streaming,
+            )
+        }
 
         // 正文下方的来源条：与正文角标同一套编号，两条路都能点开
         if (timeline != null && timeline.sources.isNotEmpty()) {
@@ -817,13 +992,14 @@ fun AssistantBlock(
     }
 }
 
-/** 消息下方操作栏：复制 / 重新生成 / 编辑 / 删除，以及版本切换器。 */
+/** 消息下方操作栏：复制 / 续写 / 朗读 / 编辑 / 删除，以及版本切换器。 */
 @Composable
 private fun MessageActions(
     message: UiMessage,
     peeked: Boolean,
     canContinue: Boolean,
     speaking: Boolean,
+    readAloudAvailable: Boolean,
     onCopy: () -> Unit,
     onRegenerate: () -> Unit,
     onContinue: () -> Unit,
@@ -839,6 +1015,9 @@ private fun MessageActions(
      *
      * 先前的毛病是版本切换器用 26dp/14dp、操作图标用 30dp/16dp，
      * 同一行里两种大小并排，chevron 明显小一圈、还挤在一起。
+     *
+     * ★ 「重新生成」放在**行尾最右**（对齐官方：其余操作靠左，刷新单独压右边）。
+     * 位置本身就是语义：它是对整条回复的动作，不是"又一个编辑按钮"。
      */
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -857,14 +1036,14 @@ private fun MessageActions(
 
         ActionIcon(AppIcons.Copy, stringResource(R.string.action_copy), onCopy, colors)
         if (message.role == MessageRole.ASSISTANT) {
-            ActionIcon(AppIcons.Refresh, stringResource(R.string.msg_regenerate), onRegenerate, colors)
-            // 续写紧挨着「重新生成」：两者是同一件事的两个方向（重来 / 接着写）
+            // 续写紧挨着「重新生成」原本的位置，两者是同一件事的两个方向（重来 / 接着写）
             if (canContinue) {
                 ActionIcon(AppIcons.Play, stringResource(R.string.msg_continue), onContinue, colors)
             }
             // 朗读：进行中换成停止图标，按同一下即停。
-            // 暂时下线时整颗按钮不出现（见 ReadAloudEnabled）—— 留着但点了没反应更糟。
-            if (ReadAloudEnabled) {
+            // 不可用时整颗按钮不出现（见 ReadAloudEnabled / readAloudAvailable）——
+            // 留着但点了没反应更糟；弹一句"不支持"也一样糟。
+            if (ReadAloudEnabled && readAloudAvailable) {
                 ActionIcon(
                     if (speaking) AppIcons.Stop else AppIcons.Volume,
                     stringResource(if (speaking) R.string.tts_stop else R.string.tts_speak),
@@ -877,25 +1056,100 @@ private fun MessageActions(
         ActionIcon(AppIcons.Trash, stringResource(R.string.action_delete), onDelete, colors)
 
         /*
-         * 模型名 · token 数 —— **碰一下才出现，就在按钮旁边**。
+         * 中间这块是**弹性空白**：碰一下消息时模型名 · token 数出现在这，
+         * 不碰就留空 —— 而右边的刷新按钮因此永远钉在同一处。
          *
-         * 用 `weight(1f, fill = false)` 而不是加一个 Spacer：
-         * 让它在按钮之后的**剩余宽度**里取，长模型名会自动省略号，
-         * 而不是把按钮挤出屏幕。
+         * ⚠️ 权重必须挂在**普通 Box** 上，不能挂在 `AnimatedVisibility` 上：
+         * 后者在没有内容时（peeked = false）不占位，刷新按钮就会滑到按钮旁边，
+         * 表现是"只有显示模型信息时才居右"。
          */
-        AnimatedVisibility(
-            visible = peeked,
-            enter = fadeIn(tween(160)),
-            exit = fadeOut(tween(120)),
-            modifier = Modifier.weight(1f, fill = false),
-        ) {
-            MessageMeta(
-                message = message,
-                modifier = Modifier.padding(start = ActionGap + 8.dp),
-            )
+        Box(modifier = Modifier.weight(1f)) {
+            MessageMetaSlot(peeked = peeked, message = message)
+        }
+
+        if (message.role == MessageRole.ASSISTANT) {
+            ActionIcon(AppIcons.Refresh, stringResource(R.string.msg_regenerate), onRegenerate, colors)
         }
     }
 }
+
+/**
+ * 弹性空白里的元信息（模型名 · token 数）。
+ *
+ * 单独抽成 Composable 而不是内联：内联时它处在 `RowScope` 里，
+ * `AnimatedVisibility` 会解析成 **`RowScope` 的扩展**（要求有剩余宽度才看得见），
+ * 而这里要的是顶层版本 —— 放进自己的作用域，解析结果就确定了。
+ */
+@Composable
+private fun MessageMetaSlot(peeked: Boolean, message: UiMessage) {
+    AnimatedVisibility(
+        visible = peeked,
+        enter = fadeIn(tween(160)),
+        exit = fadeOut(tween(120)),
+    ) {
+        MessageMeta(
+            message = message,
+            modifier = Modifier.padding(start = ActionGap + 8.dp),
+        )
+    }
+}
+
+/**
+ * 「选择文本」态的内容包装。
+ *
+ * 只在用户从长按菜单里**明确进入**选择态时才套 `SelectionContainer`：
+ * 平时套着的话，长按会被选区抢走，而长按是这条消息的菜单入口。
+ *
+ * [state] 由外层持有 —— 进入选择态时要用它做一次 `clear()`，
+ * 这样点空白处退出时选区不会残留在下一次。
+ */
+@Composable
+private fun SelectableText(
+    selecting: Boolean,
+    state: SelectionState,
+    content: @Composable () -> Unit,
+) {
+    if (selecting) SelectionContainer(state = state) { content() } else content()
+}
+
+/**
+ * 在 [windowPoint] 处**合成一次长按**，让选区从用户按下去的地方开始。
+ *
+ * 为什么要合成：Compose 没有"按坐标设置选区"的公开接口 —— `SelectionState`
+ * 只接受**全局字符偏移**（多段文本还要自己算累计长度），而这里只知道手指落在
+ * 屏幕上的哪个点。与其把一套排版几何抄一遍，不如把同一个点上的长按重放一次：
+ * 命中测试、行内定位、选区手柄全都走系统原本那条路。
+ *
+ * 时长 ≥ 系统的长按阈值，否则会被判成"点了一下"（那会把选择态立刻关掉）。
+ * 注入的事件只发给本进程的 Compose 视图，不经过窗口路由，也不影响其他 App。
+ */
+private fun startSelectionAt(view: View, windowPoint: IntOffset) {
+    if (!view.isShown) return
+    val origin = IntArray(2)
+    view.getLocationInWindow(origin)
+    val x = (windowPoint.x - origin[0]).toFloat()
+    val y = (windowPoint.y - origin[1]).toFloat()
+    val downTime = SystemClock.uptimeMillis()
+    val down = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, x, y, 0)
+    view.dispatchTouchEvent(down)
+    down.recycle()
+    view.postDelayed({
+        val up = MotionEvent.obtain(downTime, SystemClock.uptimeMillis(), MotionEvent.ACTION_UP, x, y, 0)
+        view.dispatchTouchEvent(up)
+        up.recycle()
+    }, SyntheticHoldMs)
+}
+
+/** 合成长按的按住时长：系统长按阈值约 500ms，留一点余量。 */
+private const val SyntheticHoldMs = 560L
+
+/**
+ * 进入选择态后、注入长按前的等待。
+ *
+ * 要盖住两件事：`SelectionContainer` 得先挂上，菜单的**关闭动画**（140ms）也得走完 ——
+ * 菜单还是个 focusable 的独立窗口，没关干净时注入的按下有可能被它吃掉。
+ */
+private const val SelectionStartDelayMs = 220L
 
 /**
  * 「这条是谁写的、占多少 token」。
@@ -939,9 +1193,6 @@ private val ActionGap = 2.dp
  */
 private val MessageGap = 12.dp
 
-/** 用户消息收起时显示几行。超过就折叠 —— 参照官方。 */
-private val UserBubbleCollapsedLines = 10
-
 /**
  * 三张图片一排所需的宽度：3 × 104dp + 2 × 6dp 间隙 ≈ 324dp，留一点余量。
  *
@@ -950,6 +1201,9 @@ private val UserBubbleCollapsedLines = 10
  * 手机上这个值通常是 2 张一排，平板 / 横屏才会是 3 张。
  */
 private val ImagesThreePerRowWidth = 330.dp
+
+/** 用户消息收起时显示几行。超过就折叠 —— 参照官方。 */
+private val UserBubbleCollapsedLines = 10
 
 /** 折叠时右下角渐隐的半径。要够大才有"化开"的感觉，太小就成了一条硬边。 */
 private val UserBubbleFadeRadius = 140.dp

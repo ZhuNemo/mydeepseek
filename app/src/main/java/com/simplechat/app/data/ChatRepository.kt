@@ -18,11 +18,16 @@ import com.simplechat.app.db.MessageTree
 import com.simplechat.app.db.PresetEntity
 import com.simplechat.app.data.import.DeepSeekHistory
 import com.simplechat.app.data.import.ExternalBackup
+import com.simplechat.app.data.import.ImportSession
+import com.simplechat.app.data.import.ImportSessionSource
+import com.simplechat.app.data.import.OwnBackupStream
 import com.simplechat.app.data.archive.ChatArchive
 import com.simplechat.app.net.ReplyBlock
 import com.simplechat.app.net.ReplyBlocks
 import com.simplechat.app.ui.chat.ConversationMode
 import java.io.File
+import java.io.Writer
+import java.io.StringWriter
 import java.util.zip.ZipFile
 import com.simplechat.app.ui.chat.MessageRole
 import com.simplechat.app.ui.chat.MessageStatus
@@ -32,6 +37,9 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
@@ -82,8 +90,8 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
     fun observeConversation(id: String): Flow<ConversationEntity?> = conversations.observeById(id)
 
     /** 全文搜索：标题或**消息正文**命中。 */
-    fun searchConversations(query: String): Flow<List<ConversationSearchHit>> =
-        conversations.search(query.trim())
+    fun searchConversations(query: String, limit: Int = Int.MAX_VALUE): Flow<List<ConversationSearchHit>> =
+        conversations.search(query.trim(), limit)
 
     fun observePresets(): Flow<List<Preset>> = presets.observeAll().map { list -> list.map { it.toUi() } }
 
@@ -156,6 +164,12 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
 
     suspend fun findConversation(id: String): ConversationEntity? = conversations.findById(id)
 
+    suspend fun revealSearchMessage(conversationId: String, messageId: String) = db.withTransaction {
+        val path = MessageTree.ancestry(messages.getLightFor(conversationId), messageId)
+        check(path.isNotEmpty()) { "Search message is no longer available" }
+        path.forEach { messages.activate(it.id, conversationId, it.parentId) }
+    }
+
     suspend fun renameConversation(id: String, title: String) =
         conversations.rename(
             id,
@@ -180,7 +194,9 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
             drafts.clearAll(ids)
             attachmentRefs.clearAll(ids)
         }
-        files.forEach { AttachmentFiles.delete(context, it) }
+        files.distinct().forEach { path ->
+            if (!attachmentRefs.containsPath(path) && !messages.referencesAttachment(path)) AttachmentFiles.delete(context, path)
+        }
     }
 
     /**
@@ -188,17 +204,17 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
      *
      * 备份里图片是 base64 内联的（格式不变），直接写进库又会回到"一行几兆、
      * 读不出来"的老问题。所有导入路径（自家备份 / Chatbox / DeepSeek）都经过
-     * [writeConversation]，所以在这里统一落盘，等于给整条链路上了保险。
+     * [writeStreamedSession]，所以在这里统一落盘，等于给整条链路上了保险。
      */
-    private fun MessageEntity.withOffloadedImages(): MessageEntity {
+    private fun MessageEntity.withOffloadedImages(createdPaths: MutableSet<String>? = null): MessageEntity {
         val decoded = Attachments.decode(attachments)
         if (decoded.none { it.isImage && !it.isStored }) return this
         val offloaded = decoded.map { attachment ->
             if (!attachment.isImage || attachment.isStored) return@map attachment
             val bytes = runCatching { Base64.decode(attachment.data, Base64.NO_WRAP) }.getOrNull()
                 ?: return@map attachment
-            val stored = AttachmentFiles.save(context, bytes, attachment.mime)
-                ?: return@map attachment
+            val stored = AttachmentFiles.save(context, bytes.inputStream(), attachment.mime)
+            createdPaths?.add(stored)
             attachment.copy(data = "", path = stored)
         }
         return copy(attachments = Attachments.encode(offloaded))
@@ -225,10 +241,10 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
      * @return 新会话 id；目标不在活跃路径上时返回 null
      */
     suspend fun forkConversation(fromMessageId: String): String? = db.withTransaction {
-        val source = messages.findById(fromMessageId) ?: return@withTransaction null
+        val source = messages.exportHeader(fromMessageId) ?: return@withTransaction null
         val origin = conversations.findById(source.conversationId) ?: return@withTransaction null
 
-        val path = MessageTree.pathTo(messages.getAllFor(source.conversationId), fromMessageId)
+        val path = MessageTree.pathTo(loadMessagesSafely(source.conversationId), fromMessageId)
         if (path.isEmpty()) return@withTransaction null
 
         val now = System.currentTimeMillis()
@@ -253,6 +269,8 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
                 UUID.randomUUID().toString()
             },
         )
+        val sharedPaths = path.flatMap { Attachments.decode(it.attachments).mapNotNull { attachment -> attachment.path } }.distinct()
+        attachmentRefs.upsertAll(sharedPaths.map { AttachmentRefEntity(it, newId) })
         writePresetLinks(newId, getEnabledPresetIds(origin.id))
 
         newId
@@ -286,9 +304,31 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
     // 一切以 `parentId` 为准，不再有"第几位"。当前对话 =
     // `MessageTree.activePath(all)` 走出来的那条路径。
 
-    /** 当前对话：从根沿 active 走到底。 */
+    /**
+     * 当前对话：从根沿 active 走到底。
+     *
+     * ### 为什么要先读"骨架"
+     *
+     * 打开长会话最贵的不是"走树"，而是**把用不到的消息正文读出来**：
+     * 每「重新生成」一次，树上就多一条被放弃的回复，而界面只显示其中一条；
+     * `SELECT *` 会把这些分支的正文（还带 `attachments` / `timeline` 两段 JSON）
+     * 全部读进内存。几十条消息看不出差别，几千条的会话就是几十兆 ——
+     * 真机上就是"点进去转很久，甚至闪退"。
+     *
+     * 现在分两步：先只读骨架（每行几十字节）走出活跃路径，再按 id 只取这条路径的正文。
+     * 被放弃的分支因此**一次都不会被读出来**，内存与 IO 都只与"当前分支有多大"成正比。
+     */
     suspend fun loadActivePath(conversationId: String): List<UiMessage> {
-        val all = loadMessagesSafely(conversationId)
+        val light = runCatching { messages.getLightFor(conversationId) }
+            .getOrElse { error ->
+                // 骨架查询只读几列、不可能撞 CursorWindow；真出别的错就退回整读
+                if (error is SQLiteBlobTooBigException) return loadActivePathFull(conversationId)
+                throw error
+            }
+        if (light.isEmpty()) return emptyList()
+        val pathIds = MessageTree.activePathIds(light)
+        if (pathIds.isEmpty()) return emptyList()
+        val counts = MessageTree.siblingCountsOf(light.map { it.parentId })
         /*
          * 映射放到后台线程。
          *
@@ -297,6 +337,26 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
          * 那段动画里，看起来就是动画一卡、然后内容才出现。
          */
         return withContext(Dispatchers.Default) {
+            val byId = loadMessagesByIds(pathIds).associateBy { it.id }
+            pathIds.mapNotNull { id ->
+                val entity = byId[id] ?: return@mapNotNull null
+                entity.toUi().copy(variantCount = counts[entity.parentId] ?: 1)
+            }
+        }
+    }
+
+    /** 活跃路径的正文：按 id 分批取（SQLite 的绑定变量数有上限）。 */
+    private suspend fun loadMessagesByIds(ids: List<String>): List<MessageEntity> = try {
+        ids.chunked(MessageQueryChunk).flatMap { chunk -> messages.getByIds(chunk) }
+    } catch (error: SQLiteBlobTooBigException) {
+        // Oversized text and legacy inline images are restored in byte slices, without truncation.
+        ids.map { id -> readMessageForExport(id) }
+    }
+
+    /** 老路径：一次读全部消息再走树（骨架读取失败时的兜底）。 */
+    private suspend fun loadActivePathFull(conversationId: String): List<UiMessage> {
+        val all = loadMessagesSafely(conversationId)
+        return withContext(Dispatchers.Default) {
             val counts = MessageTree.siblingCounts(all)
             MessageTree.activePath(all).map { entity ->
                 entity.toUi().copy(variantCount = counts[entity.parentId] ?: 1)
@@ -304,7 +364,6 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
         }
     }
 
-    /** 路径末尾节点 id；空会话返回 [MessageEntity.ROOT_PARENT]。 */
     /**
      * 读一个会话的全部消息，**带超大行的兜底**。
      *
@@ -312,19 +371,22 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
      * 整条 SQL 就抛 `SQLiteBlobTooBigException`，那个会话从列表点进去直接闪退 ——
      * 一次导入几万条历史之后，这种行必然存在。
      *
-     * 兜底策略：整行读不了就退到"截断附件"的查询。牺牲的只是那一条消息的图片，
-     * 正文、思考、时间线都还在，而且会话能打开。
+     * 整行读不了时按字节切片恢复全部字段；不截断正文或附件。
      */
     private suspend fun loadMessagesSafely(conversationId: String): List<MessageEntity> =
         runCatching { messages.getAllFor(conversationId) }
             .getOrElse { error ->
                 if (error !is SQLiteBlobTooBigException) throw error
-                messages.getAllForCapped(conversationId, CappedAttachmentsChars)
+                messages.idsFor(conversationId).map { readMessageForExport(it) }
             }
 
+    /**
+     * 路径末尾节点 id；空会话返回 [MessageEntity.ROOT_PARENT]。
+     *
+     * 只读骨架：每次追加消息都会调用它，而它要的只是"最后一条是谁"。
+     */
     suspend fun tailId(conversationId: String): String =
-        messages.getAllFor(conversationId)
-            .let { MessageTree.activePath(it).lastOrNull()?.id }
+        MessageTree.activePathIds(messages.getLightFor(conversationId)).lastOrNull()
             ?: MessageEntity.ROOT_PARENT
 
     /**
@@ -347,17 +409,6 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
         model: String? = null,
     ): MessageEntity {
         val id = UUID.randomUUID().toString()
-        /*
-         * ⚠️ 附件必须**落盘**再写库 —— 导入路径早就这么做，发送路径原先漏了。
-         *
-         * 拍照 / 相册来的图片是内联 base64 的：一张 3MB 的照片 ≈ 4MB 的 TEXT，
-         * 而 Android 的 `CursorWindow` 只有 2MB。写进去不会立刻报错，
-         * 但**这条会话从此读不出来**（`SQLiteBlobTooBigException`），
-         * 兜底路径会把附件截断 → 图片整张消失。
-         *
-         * 落盘之后行里只留文件名，顺带登记到 `attachment_refs`：
-         * 删会话时据此把字节一起清掉（那张表就是为了避开这一列的大 JSON）。
-         */
         val entity = newMessageEntity(
             id = id,
             conversationId = conversationId,
@@ -370,18 +421,14 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
             status = status,
             model = model,
         ).withOffloadedImages()
-
         messages.upsert(entity)
-
-        val storedPaths = Attachments.decode(entity.attachments).mapNotNull { it.path }
-        if (storedPaths.isNotEmpty()) {
-            attachmentRefs.upsertAll(
-                storedPaths.map { path -> AttachmentRefEntity(path = path, conversationId = conversationId) },
-            )
-        }
-
         messages.activate(id, conversationId, parentId)
-        return messages.findById(id)!!
+        val refs = Attachments.decode(entity.attachments).mapNotNull { it.path }.distinct()
+            .map { AttachmentRefEntity(path = it, conversationId = conversationId) }
+        if (refs.isNotEmpty()) attachmentRefs.upsertAll(refs)
+        // The inserted entity is already available. Reading it back can exceed CursorWindow
+        // for a large prompt or several attachments, before the network request even starts.
+        return entity
     }
 
     /** 把实体包成 UI 模型，δ 补上兄弟数。 */
@@ -519,17 +566,16 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
      * 免得路径断在半途、后面全部不显示。
      */
     suspend fun deleteMessage(messageId: String) {
-        val node = messages.findById(messageId) ?: return
-        val all = messages.getAllFor(node.conversationId)
+        val node = messages.exportHeader(messageId) ?: return
+        val all = loadMessagesSafely(node.conversationId)
         val doomed = MessageTree.subtreeIds(all, messageId)
 
         /*
          * 删消息也要收走它独占的图片文件。
          *
-         * 原先只删行：字节留在 `filesDir/attachments/` 里再没人引用，
-         * 删得越多占得越多，而用户完全看不到这部分占用（它不在"对话"里）。
-         * 判据用**引用表**而不是"这条消息用过"—— 同一张图可能被编辑重发
-         * 复制进另一条消息，只要还有登记就不能删文件。
+         * 判据用**引用表 + 正文里还有没有这个文件名**，而不是"这条消息用过"：
+         * 同一张图可能被编辑重发复制进另一条消息，只要还有一处引用就不能删文件。
+         * 不清登记的话 `containsPath` 会永远为真，那些文件就再也回收不掉。
          */
         val paths = all.filter { it.id in doomed }
             .flatMap { Attachments.decode(it.attachments) }
@@ -539,11 +585,12 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
         messages.deleteByIds(doomed)
         if (paths.isNotEmpty()) {
             attachmentRefs.clearPaths(paths)
-            val stillReferenced = attachmentRefs.allPaths().toSet()
-            paths.filterNot { it in stillReferenced }.forEach { AttachmentFiles.delete(context, it) }
+            paths.filterNot { path ->
+                attachmentRefs.containsPath(path) || messages.referencesAttachment(path)
+            }.forEach { AttachmentFiles.delete(context, it) }
         }
 
-        val remaining = messages.getAllFor(node.conversationId)
+        val remaining = loadMessagesSafely(node.conversationId)
         val siblings = remaining.filter { it.parentId == node.parentId }
         if (siblings.isNotEmpty() && siblings.none { it.active }) {
             MessageTree.lastSibling(remaining, node.parentId)?.let {
@@ -559,8 +606,11 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
     /**
      * 在 [parentId] 下追加一个新版本并立即激活它。
      *
-     * 「重新生成」与「编辑」都走这里。旧版本**连同它的子树**原样留着 ——
+     * 「重新生成」与「编辑后重发」都走这里。旧版本**连同它的子树**原样留着 ——
      * 这就是"分支"：切回去的时候，旧分支的下游也一起回来。
+     *
+     * ⚠️ 单纯的「保存」**不走这里**（那是原地改文字，见 [editMessageInPlace]）：
+     * 只改个错别字不该长出一条新分支，更不该让会话下半段当场消失。
      */
     suspend fun addActiveVariant(
         conversationId: String,
@@ -593,7 +643,38 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
             timeline = null,
             stopReason = null,
         )
-        toUiWithCounts(conversationId, messages.findById(entity.id)!!)
+        toUiWithCounts(conversationId, entity.copy(ttftMs = ttftMs, tps = tps, thinkingMs = thinkingMs))
+    }
+
+    /**
+     * 「保存」编辑后的回复：**原地**改文字，不新增版本。
+     *
+     * 与 [addActiveVariant] 是两种语义，不能混：
+     * - 这里 = 用户只是在改这条（错别字、语气、删掉一段），旧文本不需要留着；
+     * - 那边 = 换一份新的回答（重新生成 / 编辑后继续生成），旧的那份要能切回去。
+     *
+     * 原地改还有一个必须做对的副作用：`timeline` 里的正文块要一起换，否则
+     * 扩展通道的界面与请求都还在用旧文本（见 `rewriteTimelineText`）。
+     * 传 `timeline = null` 表示这条本来就没有内容块（OpenAI 通道 / 老数据）。
+     */
+    suspend fun editMessageInPlace(
+        id: String,
+        content: String,
+        attachments: List<Attachment> = emptyList(),
+        timeline: List<ReplyBlock> = emptyList(),
+    ) = db.withTransaction {
+        messages.editContent(
+            id = id,
+            content = content,
+            attachments = Attachments.encode(attachments),
+            timeline = ReplyBlocks.encode(timeline),
+        )
+        // 落盘附件的引用登记：改了附件也要保证删会话时能一起清干净
+        val conversationId = messages.exportHeader(id)?.conversationId
+        val refs = attachments.mapNotNull { it.path }.distinct()
+        if (conversationId != null && refs.isNotEmpty()) {
+            attachmentRefs.upsertAll(refs.map { AttachmentRefEntity(path = it, conversationId = conversationId) })
+        }
     }
 
     /** 某个父亲下、指定版本号对应的消息 id（切版本时用）。 */
@@ -601,7 +682,7 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
         conversationId: String,
         parentId: String,
         variantIndex: Int,
-    ): String? = messages.getAllFor(conversationId)
+    ): String? = messages.getLightFor(conversationId)
         .firstOrNull { it.parentId == parentId && it.variantIndex == variantIndex }
         ?.id
 
@@ -750,6 +831,43 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
     /** 导出为可读的 JSON 文本。含**所有版本**，不只当前激活的。 */
     suspend fun exportBackup(): String = backupJson.encodeToString(fullBackup())
 
+    /** File-backed JSON export uses the same bounded message pipeline as ZIP. */
+    suspend fun exportBackup(file: File, onProgress: (Float) -> Unit = {}, onlyConversation: String? = null) = withContext(Dispatchers.IO) {
+        db.withTransaction {
+            onProgress(0f)
+            val rows = if (onlyConversation == null) conversations.getAllRaw()
+                else listOfNotNull(conversations.findById(onlyConversation))
+            check(onlyConversation == null || rows.isNotEmpty()) { "Conversation no longer exists" }
+            val total = rows.sumOf { messages.countFor(it.id) }
+            val headers = rows.map { it.toBackup(emptyList(), getEnabledPresetIds(it.id)) }
+            val linkedPresetIds = headers.flatMap { it.enabledPresetIds }.toSet()
+            val presetRows = presets.getAll().filter { onlyConversation == null || it.id in linkedPresetIds }.map { it.toBackup() }
+            var written = 0
+            file.outputStream().buffered().writer(Charsets.UTF_8).use { writer ->
+                writeBackupStream(writer, System.currentTimeMillis(), headers, presetRows,
+                    attachmentSource = { AttachmentFiles.open(context, it) }) { id, sink ->
+                    for (messageId in messages.idsFor(id)) {
+                        currentCoroutineContext().ensureActive()
+                        val message = readMessageForExport(messageId).toBackup()
+                        sink(message)
+                        written++
+                        onProgress(0.99f * written / total.coerceAtLeast(1))
+                    }
+                }
+            }
+            check(written == total) { "Export count mismatch" }
+            onProgress(1f)
+        }
+    }
+
+    suspend fun exportMarkdown(file: File, conversationId: String) = withContext(Dispatchers.IO) {
+        db.withTransaction {
+            val row = checkNotNull(conversations.findById(conversationId)) { "Conversation no longer exists" }
+            val ids = MessageTree.activePathIds(messages.getLightFor(conversationId))
+            file.writer(Charsets.UTF_8).buffered().use { writeConversationMarkdown(row, ids, it) }
+        }
+    }
+
     /**
      * 导出为 **ZIP 归档**：`manifest.json` + `backup.json` + 每个会话的 Markdown 文稿。
      *
@@ -757,15 +875,57 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
      * 只是多了压缩外壳与可读文稿。图省事少写一套模型的收益在于：
      * 以后加字段只改一处，不会出现"JSON 备份有、ZIP 备份没有"这种分叉。
      */
-    suspend fun exportArchive(): ByteArray {
-        val backup = fullBackup()
-        val documents = conversations.getAllRaw().mapIndexed { index, row ->
-            ChatArchive.Document(
-                fileName = ChatArchive.documentName(index + 1, row.title),
-                markdown = exportConversationMarkdown(row.id).orEmpty(),
-            )
-        }.filter { it.markdown.isNotBlank() }
-        return ChatArchive.write(backup, documents)
+    suspend fun exportArchive(file: File, onProgress: (Float) -> Unit = {}) = withContext(Dispatchers.IO) {
+        // One database snapshot: concurrent sends cannot move the export's count or branch halfway through.
+        db.withTransaction {
+            onProgress(0f)
+            val rows = conversations.getAllRaw()
+            val exportedAt = System.currentTimeMillis()
+            val presetRows = presets.getAll().map { it.toBackup() }
+            val headers = rows.map { row -> row.toBackup(emptyList(), getEnabledPresetIds(row.id)) }
+            val totalMessages = rows.sumOf { messages.countFor(it.id) }
+            var written = 0
+            var documentsWritten = 0
+            val documents = rows.mapIndexed { index, row ->
+                ChatArchive.StreamDocument(ChatArchive.documentName(index + 1, row.title)) { output ->
+                    val ids = MessageTree.activePathIds(messages.getLightFor(row.id))
+                    writeConversationMarkdown(row, ids, output.writer(Charsets.UTF_8).buffered())
+                    documentsWritten++
+                    onProgress(0.8f + 0.2f * documentsWritten / rows.size.coerceAtLeast(1))
+                }
+            }
+            file.outputStream().buffered().use { output ->
+                ChatArchive.writeTo(
+                    output = output,
+                    exportedAt = exportedAt,
+                    conversationCount = rows.size,
+                    messageCount = totalMessages,
+                    presetCount = presetRows.size,
+                    documents = documents,
+                ) { backupOutput ->
+                    writeBackupStream(backupOutput.writer(Charsets.UTF_8).buffered(), exportedAt, headers, presetRows,
+                        attachmentSource = { AttachmentFiles.open(context, it) }) { id, sink ->
+                        for (messageId in messages.idsFor(id)) {
+                            currentCoroutineContext().ensureActive()
+                            val message = readMessageForExport(messageId).toBackup()
+                            // Materialize only this message's images; never retain all images in the archive.
+                            sink(message)
+                            written++
+                            onProgress(0.8f * written / totalMessages.coerceAtLeast(1))
+                        }
+                    }
+                }
+            }
+            check(written == totalMessages) { "Export message count changed: $written/$totalMessages" }
+            onProgress(1f)
+        }
+    }
+
+    private suspend fun readMessageForExport(id: String): MessageEntity {
+        val header = checkNotNull(messages.exportHeader(id)) { "Missing export message: $id" }
+        return restoreExportMessage(header, ExportTextChunkBytes) { start ->
+            checkNotNull(messages.exportTextChunk(id, start, ExportTextChunkBytes)) { "Missing export message: $id" }
+        }
     }
 
     /** 完整的备份模型（JSON 导出与 ZIP 归档共用）。 */
@@ -801,7 +961,7 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
             exportedAt = System.currentTimeMillis(),
             conversations = listOf(
                 row.toBackup(
-                    messages = messages.getAllFor(conversationId).withInlineAttachments(),
+                    messages = loadMessagesSafely(conversationId).withInlineAttachments(),
                     presetIds = conversationPresets.getFor(conversationId)
                         .sortedBy { it.sortOrder }
                         .map { it.presetId },
@@ -830,22 +990,28 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
      */
     suspend fun exportConversationMarkdown(conversationId: String): String? {
         val conversation = conversations.findById(conversationId) ?: return null
-        val path = loadActivePath(conversationId)
-        if (path.isEmpty()) return null
+        val ids = MessageTree.activePathIds(messages.getLightFor(conversationId))
+        if (ids.isEmpty()) return null
+        val writer = StringWriter()
+        writeConversationMarkdown(conversation, ids, writer)
+        return writer.toString()
+    }
 
+    private suspend fun writeConversationMarkdown(conversation: ConversationEntity, ids: List<String>, writer: Writer) {
         val exportedAt = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
             .format(Date(System.currentTimeMillis()))
-
-        return buildString {
+        with(writer) {
             appendLine("# ${conversation.title}")
             appendLine()
             // 头部两行的文案随界面语言（`export_meta` / `export_scope_note`）
             appendLine(
                 "> ${conversation.model.ifBlank { Res.get(R.string.export_unknown_model) }} · " +
-                    Res.get(R.string.export_meta, path.size, exportedAt),
+                    Res.get(R.string.export_meta, ids.size, exportedAt),
             )
             appendLine("> ${Res.get(R.string.export_scope_note)}")
-            path.forEach { message ->
+            ids.forEach { id ->
+                currentCoroutineContext().ensureActive()
+                val message = readMessageForExport(id).toUi()
                 appendLine()
                 appendLine("---")
                 appendLine()
@@ -883,6 +1049,7 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
             }
             appendLine()
             appendLine("---")
+            flush()
         }
     }
 
@@ -946,6 +1113,19 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
         mode: ImportMode,
         onProgress: (Float) -> Unit,
     ): Pair<ImportReport, String> {
+        val isZip = file.inputStream().use { it.read() == 0x50 && it.read() == 0x4b }
+        if (!isZip && runCatching { OwnBackupStream.format { file.reader(Charsets.UTF_8) } }.getOrNull() == BackupFile.FORMAT) {
+            return importOwnStream({ file.reader(Charsets.UTF_8) }, scratchDir, mode, onProgress)
+        }
+        if (isZip) ZipFile(file).use { zip ->
+            val manifest = zip.getEntry(ChatArchive.MANIFEST)
+            val own = manifest != null && manifest.size in 1..65_536 &&
+                runCatching { OwnBackupStream.format { zip.getInputStream(manifest).reader(Charsets.UTF_8) } }.getOrNull() == ChatArchive.FORMAT
+            if (own) {
+                val backup = zip.getEntry(ChatArchive.BACKUP) ?: throw AppTextException(R.string.err_archive_damaged)
+                return importOwnStream({ zip.getInputStream(backup).reader(Charsets.UTF_8) }, scratchDir, mode, onProgress)
+            }
+        }
         /*
          * DeepSeek 导出先走**流式**导入：它的会话数量级最大（一份归档几千个会话、
          * 两万多条消息），整包建对象会 OOM。判定只看 `manifest.json` 一个字段，
@@ -969,28 +1149,21 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
                     },
                     onImageDropped = { droppedImages++ },
                 ) ?: throw AppTextException(R.string.err_unrecognised_file)
-                // 序列必须在 ZIP 关掉之前消费完，所以写库也在 use 里执行
-                importStream(
-                    conversationsSeq = opened,
-                    presetsToWrite = emptyList(),
-                    mode = mode,
-                    expected = opened.expected,
-                    failures = failures.toList(),
-                    droppedImages = droppedImages,
-                )
-            }
-            if (report.conversations == 0 && report.alreadyPresent == 0) {
-                // 一条都没进来、但有会话被记了失败 → 不是"文件认不出来"，是"文件读不出来"
-                throw if (report.failed > 0) {
-                    AppTextException(R.string.err_archive_damaged)
-                } else {
-                    AppTextException(R.string.err_no_sessions)
-                }
-            }
+                /*
+                 * ⚠️ 会话是**逐条产出、逐条写库**的（见 `ImportSession`）：
+                 * 写库必须在 ZIP 关掉之前跑完，否则第二遍读正文就没有源了。
+                 */
+                importSessions(opened, mode, failures)
+            }.copy(droppedImages = droppedImages)
+            val reportSaved = saveImportReport(report)
+            if (report.expected == 0) throw AppTextException(R.string.err_no_sessions)
             return report to importSummary(
                 sourceName = Res.get(R.string.backup_source_deepseek),
                 report = report,
-                warnings = listOf(AppText.of(R.string.warn_deepseek_limited)),
+                warnings = buildList {
+                    add(AppText.of(R.string.warn_deepseek_limited))
+                    if (!reportSaved) add(AppText.of(R.string.import_report_not_saved))
+                },
             )
         }
 
@@ -998,6 +1171,19 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
             ExternalBackup.parse(file, scratchDir, naming = importNaming(), onProgress = onProgress),
             mode,
         )
+    }
+
+    private suspend fun importOwnStream(
+        reader: () -> java.io.Reader, scratch: File, mode: ImportMode, onProgress: (Float) -> Unit,
+    ): Pair<ImportReport, String> {
+        onProgress(0f)
+        val failures = mutableListOf<ImportFailure>()
+        val opened = OwnBackupStream.open(reader, scratch, importNaming(), onProgress) { failures += it }
+        val report = importSessions(opened, mode, failures)
+        val reportSaved = saveImportReport(report)
+        onProgress(1f)
+        return report to importSummary(Res.get(R.string.backup_source_simplechat), report,
+            if (reportSaved) emptyList() else listOf(AppText.of(R.string.import_report_not_saved)))
     }
 
     /**
@@ -1008,7 +1194,22 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
      */
     private fun importNaming() = ExternalBackup.ImportNaming(
         storeImage = { bytes, mime -> AttachmentFiles.save(context, bytes, mime) },
+        storeImageStream = { source, mime -> AttachmentFiles.save(context, source, mime) },
+        discardImage = { AttachmentFiles.delete(context, it) },
     )
+
+    private fun saveImportReport(report: ImportReport): Boolean = try {
+        val target = File(context.filesDir, "last-import-report.json")
+        val temporary = File(context.filesDir, "last-import-report.tmp")
+        temporary.writeText(backupJson.encodeToString(ImportReport.serializer(), report), Charsets.UTF_8)
+        check(temporary.renameTo(target)) { "Could not save import report" }
+        true
+    } catch (error: Exception) {
+        android.util.Log.w(ImportLogTag, "Import summary file unavailable: ${error.javaClass.simpleName}")
+        false
+    }
+
+    fun lastImportReportFile(): File? = File(context.filesDir, "last-import-report.json").takeIf { it.isFile }
 
     /** 把落盘附件的字节读回内存，供构造请求 / 导出备份使用（都在 IO 上做）。 */
     internal suspend fun materialize(attachments: List<Attachment>): List<Attachment> =
@@ -1034,12 +1235,11 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
             var dropped = 0
             val prepared = attachments.mapNotNull { attachment ->
                 if (!attachment.isImage) return@mapNotNull attachment
-                val bytes = if (attachment.isStored) {
-                    AttachmentFiles.read(context, attachment.path)
+                val image = if (attachment.isStored) {
+                    ApiImage.prepare { AttachmentFiles.open(context, attachment) }
                 } else {
-                    runCatching { Base64.decode(attachment.data, Base64.NO_WRAP) }.getOrNull()
+                    runCatching { Base64.decode(attachment.data, Base64.NO_WRAP) }.getOrNull()?.let { ApiImage.prepare(it) }
                 }
-                val image = bytes?.let { ApiImage.prepare(it) }
                 if (image == null) {
                     dropped++
                     null
@@ -1098,10 +1298,7 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
      * 预设**各模式都不删本地已有项**，只按 id 覆盖 —— 预设是用户长期积累的资产，
      * 不该因为恢复一份旧备份就被清掉。
      */
-    suspend fun importParsed(file: BackupFile, mode: ImportMode): ImportReport =
-        importStream(file.conversations.asSequence(), file.presets, mode, expected = file.conversations.size)
-
-    // ── 同步：流式导出 / 流式导入 ─────────────────────────
+    // ── 同步：逐会话导出 / 流式导入 ───────────────────────
     //
     // 同步刻意**不复用** exportBackup()：那一个把整个库建在一个 BackupFile 里，
     // 峰值内存 = 会话 + 正文 + 全部图片 base64 之和。几百个带图会话就是几百兆，
@@ -1120,7 +1317,7 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
     internal suspend fun backupConversationForSync(id: String): BackupConversation? {
         val row = conversations.findById(id) ?: return null
         return row.toBackup(
-            messages = messages.getAllFor(id),
+            messages = loadMessagesSafely(id),
             presetIds = conversationPresets.getFor(id)
                 .sortedBy { it.sortOrder }
                 .map { it.presetId },
@@ -1140,6 +1337,9 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
         conversations: Sequence<BackupConversation>,
         presetsToWrite: List<BackupPreset>,
     ): ImportReport = importStream(conversations, presetsToWrite, ImportMode.MERGE)
+
+    suspend fun importParsed(file: BackupFile, mode: ImportMode): ImportReport =
+        importStream(file.conversations.asSequence(), file.presets, mode, expected = file.conversations.size)
 
     /**
      * **流式**导入：逐批取会话、逐批写库。
@@ -1165,106 +1365,23 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
         failures: List<ImportFailure> = emptyList(),
         droppedImages: Int = 0,
     ): ImportReport {
-        var alreadyPresent = 0
-        var importedMessages = 0
-        var importedConversations = 0
-        val writeFailures = mutableListOf<ImportFailure>()
-
-        /*
-         * 同名判定要反复用（每个会话一次），先取一份标题快照。
-         *
-         * 它同时充当"本次导入已经占用的标题"：同一份备份里出现两个同名会话时，
-         * 第二个也能拿到不同的副本名，不会两条都叫「副本」。
-         */
-        val titles = mutableSetOf<String>()
-        db.withTransaction { titles += conversations.allTitles() }
-
-        fun count(outcome: Pair<Boolean, Int>) {
-            val (wasSkipped, messagesWritten) = outcome
-            if (wasSkipped) alreadyPresent++ else {
-                importedConversations++
-                importedMessages += messagesWritten
-            }
-        }
-
-        val batch = ArrayList<BackupConversation>(ImportBatchSize)
-        suspend fun flush() {
-            if (batch.isEmpty()) return
-            val items = ArrayList(batch)
-            batch.clear()
-
-            // 先整批一个事务（快路径）；计数放在事务**提交之后**，回滚时不会多算
-            val titlesBeforeBatch = LinkedHashSet(titles)
-            val batchOutcome = runCatching {
-                db.withTransaction { items.map { item -> item to writeConversation(item, mode, titles) } }
-            }
-            val outcomes = batchOutcome.getOrNull()
-            if (outcomes != null) {
-                outcomes.forEach { (_, outcome) -> count(outcome) }
-                return
-            }
-
-            /*
-             * 整批回滚了：逐条重试，把坏的那条隔离出来。
-             *
-             * 必须先把 `titles` 恢复成整批之前的样子 —— 回滚的只是数据库，
-             * 内存里那个集合已经被改过了，留着会让后面的同名判定出错。
-             */
-            android.util.Log.w(ImportLogTag, "一批 ${items.size} 条写入失败，改为逐条重试", batchOutcome.exceptionOrNull())
-            titles.clear()
-            titles += titlesBeforeBatch
-            for (item in items) {
-                val before = LinkedHashSet(titles)
-                val outcome = runCatching {
-                    db.withTransaction { writeConversation(item, mode, titles) }
-                }
-                if (outcome.isSuccess) {
-                    count(outcome.getOrThrow())
-                } else {
-                    titles.clear()
-                    titles += before
-                    writeFailures += ImportFailure(
-                        title = item.title,
-                        reference = item.id,
-                        reason = ImportFailure.Reason.WRITE_FAILED,
-                    )
-                    android.util.Log.w(ImportLogTag, "会话写入失败，已隔离：${item.title}", outcome.exceptionOrNull())
+        // All formats share transactional reconciliation and collision protection.
+        // The legacy adapter can still materialize one external conversation while parsing.
+        val source = object : ImportSessionSource {
+            override val expected = expected
+            override val indexVerified: Boolean? = null
+            override val presets = presetsToWrite
+            override suspend fun forEachSession(block: suspend (ImportSession) -> Unit) {
+                for (conversation in conversationsSeq) {
+                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                    block(ImportSession(conversation.copy(messages = emptyList()),
+                        expectedMessages = conversation.messages.size) { sink ->
+                        conversation.messages.forEach { sink(it) }
+                    })
                 }
             }
         }
-
-        for (conversation in conversationsSeq) {
-            batch += conversation
-            if (batch.size >= ImportBatchSize) flush()
-        }
-        flush()
-
-        if (presetsToWrite.isNotEmpty()) {
-            db.withTransaction {
-                for (preset in presetsToWrite) {
-                    presets.upsert(
-                        PresetEntity(
-                            id = preset.id,
-                            name = preset.name,
-                            content = preset.content,
-                            sortOrder = preset.sortOrder,
-                            createdAt = preset.createdAt,
-                            updatedAt = preset.updatedAt.takeIf { it > 0L } ?: preset.createdAt,
-                        ),
-                    )
-                }
-            }
-        }
-
-        return ImportReport(
-            conversations = importedConversations,
-            messages = importedMessages,
-            presets = presetsToWrite.size,
-            alreadyPresent = alreadyPresent,
-            expected = expected,
-            failures = failures + writeFailures,
-            droppedImages = droppedImages,
-        )
+        return importSessions(source, mode, failures.toMutableList()).copy(droppedImages = droppedImages)
     }
 
     /**
@@ -1279,7 +1396,10 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
         report: ImportReport,
         warnings: List<AppText>,
     ): String = buildString {
-        append(Res.get(R.string.import_done, sourceName, report.conversations, report.messages))
+        append(Res.get(if (report.complete) R.string.import_done else R.string.import_partial,
+            sourceName, report.conversations, report.messages))
+        if (report.indexVerified == false) append(Res.get(R.string.import_index_unverified))
+        if (report.repairedMessages > 0) append(Res.get(R.string.import_repaired_messages, report.repairedMessages))
         report.expected?.let { expected ->
             if (expected != report.conversations + report.alreadyPresent) {
                 append(Res.get(R.string.import_done_expected, expected))
@@ -1298,7 +1418,7 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
             )
             /*
              * 能说出**是哪一条**就尽量说：DeepSeek 归档的索引里有标题，
-             * 用户看到"《夏萧因重逢对话》没能导入"才知道该重建哪一个，
+             * 用户看到"《示例会话》没能导入"才知道该重建哪一个，
              * 一个光秃秃的"1 个未能导入"帮不上忙。最多列 3 个，再多就把提示撑成一段日志了。
              */
             val titles = report.failures
@@ -1333,29 +1453,218 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
                 Res.get(R.string.import_fail_item, Res.get(reason.labelRes()), count)
             }
 
+    // ── DeepSeek 导出：逐条流式写库 ────────────────────────
+    //
+    // 为什么单独一条链路：它的单条会话可以几十 MB（长篇创作 + 大量分支），
+    // 整条建进内存再写会 OOM，所以走"读一条、写一条"（见 `ImportSession`）。
+    // 本应用备份与已解析的外部格式都复用同一个会话事务写入器。
+
     /**
-     * 写**一条**会话（含它的消息与预设挂载）。返回 `(是否被跳过, 写入的消息数)`。
+     * 逐条会话写库：**每个会话一个事务**。
      *
-     * 三种策略的判定都在这里，调用方（[importStream]）只负责分批与计数。
+     * 为什么不沿用"一批 50 个会话一个事务"：流式会话的正文是现从 ZIP 里读的，
+     * 攒 50 个会话就意味着攒 50 份正文 —— 又回到内存问题。每会话一个事务的代价
+     * 只是多几次提交。峰值仍受最大单条消息影响，必须用低内存设备验证。
      */
-    private suspend fun writeConversation(
+    private suspend fun importSessions(
+        stream: ImportSessionSource,
+        mode: ImportMode,
+        failures: MutableList<ImportFailure>,
+    ): ImportReport {
+        var alreadyPresent = 0
+        var importedMessages = 0
+        var importedConversations = 0
+        val writeFailures = mutableListOf<ImportFailure>()
+        val audits = mutableListOf<ImportedSessionAudit>()
+        val importedIds = mutableSetOf<String>()
+        var repairedMessages = 0
+
+        /*
+         * 同名判定要反复用（每个会话一次），先取一份标题快照。
+         *
+         * 它同时充当"本次导入已经占用的标题"：同一份备份里出现两个同名会话时，
+         * 第二个也能拿到不同的副本名，不会两条都叫「副本」。
+         */
+        val titles = mutableSetOf<String>()
+        db.withTransaction { titles += conversations.allTitles() }
+
+        if (stream.presets.isNotEmpty()) db.withTransaction {
+            stream.presets.forEach { preset -> presets.upsert(PresetEntity(
+                id = preset.id, name = preset.name, content = preset.content, sortOrder = preset.sortOrder,
+                createdAt = preset.createdAt, updatedAt = preset.updatedAt,
+            )) }
+        }
+
+        stream.forEachSession { session ->
+            val header = session.header
+            val titlesBefore = titles.toSet()
+            val createdPaths = linkedSetOf<String>()
+            fun discardCreated() {
+                session.discard()
+                createdPaths.forEach { AttachmentFiles.delete(context, it) }
+            }
+            val outcome = try {
+                db.withTransaction { writeStreamedSession(session, mode, titles, importedIds, createdPaths) }
+            } catch (error: CancellationException) {
+                discardCreated()
+                throw error
+            } catch (error: Throwable) {
+                discardCreated()
+                titles.clear()
+                titles += titlesBefore
+                /*
+                 * 一条会话写不进去就隔离它：事务已经整体回滚，这条会话不会留下
+                 * 半截数据，后面的会话照常导入。原因如实记进结果页 ——
+                 * 用户至少知道"少了哪一个"。
+                 */
+                android.util.Log.w(ImportLogTag, "Session import failed: ${error.javaClass.simpleName}")
+                writeFailures += ImportFailure(
+                    title = header.title,
+                    reference = header.id,
+                    reason = when (error) {
+                        is android.database.sqlite.SQLiteFullException -> ImportFailure.Reason.INSUFFICIENT_SPACE
+                        is OutOfMemoryError -> ImportFailure.Reason.INSUFFICIENT_MEMORY
+                        is java.io.IOException -> if (context.filesDir.usableSpace < 16L * 1024 * 1024) ImportFailure.Reason.INSUFFICIENT_SPACE else ImportFailure.Reason.WRITE_FAILED
+                        else -> ImportFailure.Reason.WRITE_FAILED
+                    },
+                    detail = "${error.javaClass.simpleName}: ${error.message}",
+                )
+                null
+            }
+            audits += ImportedSessionAudit(header.id, outcome?.targetId, session.expectedMessages,
+                outcome?.messages ?: 0, if (outcome == null) "FAILED" else if (outcome.skipped) "ALREADY_PRESENT" else "IMPORTED")
+            when {
+                outcome == null -> Unit
+                outcome.skipped -> alreadyPresent++
+                else -> {
+                    importedConversations++
+                    importedMessages += outcome.messages
+                    repairedMessages += session.repairedMessages
+                    outcome.targetId?.let { importedIds += it }
+                }
+            }
+        }
+
+        return ImportReport(
+            conversations = importedConversations,
+            messages = importedMessages,
+            presets = stream.presets.size,
+            alreadyPresent = alreadyPresent,
+            expected = stream.expected,
+            failures = failures.toList() + writeFailures,
+            // 图片丢弃数在消费过程中累加，由调用方补进来（见 importExternalFile）
+            droppedImages = 0,
+            repairedMessages = repairedMessages,
+            indexVerified = stream.indexVerified,
+            sessions = audits + failures.map { ImportedSessionAudit(it.reference.orEmpty(), null, null, 0, "FAILED") },
+        )
+    }
+
+    /** 写一条流式会话的结果。[skipped] 表示按导入策略跳过了（已存在）。 */
+    private class StreamedOutcome(val skipped: Boolean, val messages: Int = 0, val targetId: String? = null)
+
+    /**
+     * 把一条流式会话写进库：会话行 → 逐条消息 → 预设挂载 → 附件引用。
+     *
+     * 整段跑在调用方给的事务里：要么整条会话落地，要么一条都不留。
+     * 消息按条数和字符数双重限制分批插入；ID 冲突必须回滚，不能覆盖别的会话。
+     */
+    private suspend fun writeStreamedSession(
+        session: ImportSession,
+        mode: ImportMode,
+        titles: MutableSet<String>,
+        protectedIds: Set<String> = emptySet(),
+        createdPaths: MutableSet<String>,
+    ): StreamedOutcome {
+        val prepared = prepareConversation(session.header, mode, titles, protectedIds)
+            ?: return StreamedOutcome(skipped = true, targetId = session.header.id)
+        val conversation = prepared.conversation
+        val remapId = prepared.remapId
+
+        // 会话内重复 ID 显式失败，全局 ID 冲突由 ABORT 插入保护。
+        val existing = messages.idsFor(conversation.id).toHashSet()
+        val batch = ArrayList<BackupMessage>(ImportMessageBatch)
+        val imagePaths = LinkedHashSet<String>()
+        var written = 0
+        var batchChars = 0L
+        var received = 0
+
+        suspend fun flush() {
+            if (batch.isEmpty()) return
+            val entities = batch.map { it.toEntity(conversation.id).withOffloadedImages(createdPaths) }
+            // 外置后的图片路径要一起登记，否则删会话时这些文件会变成没人管的垃圾
+            entities.forEach { entity ->
+                Attachments.decode(entity.attachments).mapNotNullTo(imagePaths) { it.path }
+            }
+            messages.insertImported(entities)
+            written += entities.size
+            batch.clear()
+            batchChars = 0
+        }
+
+        session.forEachMessage { raw ->
+            received++
+            val message = if (remapId == null) {
+                raw
+            } else {
+                raw.copy(
+                    id = remapId(raw.id),
+                    parentId = if (raw.parentId.isBlank()) "" else remapId(raw.parentId),
+                )
+            }
+            check(existing.add(message.id)) { "Duplicate imported message: ${message.id}" }
+            val chars = message.content.length.toLong() + (message.reasoning?.length ?: 0) +
+                message.attachments.sumOf { it.data.length.toLong() }
+            if (batch.isNotEmpty() && batchChars + chars > 512_000) flush()
+            batch += message
+            batchChars += chars
+            if (batch.size >= ImportMessageBatch || batchChars >= 512_000) flush()
+        }
+        flush()
+        session.expectedMessages?.let { check(received == it && written == it) { "Message count mismatch: $received/$written/$it" } }
+        check(messages.countFor(conversation.id) == written) { "Stored message count mismatch" }
+
+        // 恢复挂载的预设（顺序有意义：拼接顺序会影响模型对主次的判断）
+        writePresetLinks(conversation.id, conversation.enabledPresetIds)
+        /*
+         * 登记落盘图片的引用（只记 path，几十字节）：删除会话时据此删文件，
+         * 避开 messages.attachments 那一列的大 JSON（读它会撞 CursorWindow）。
+         */
+        if (imagePaths.isNotEmpty()) {
+            attachmentRefs.upsertAll(
+                imagePaths.map { path -> AttachmentRefEntity(path = path, conversationId = conversation.id) },
+            )
+        }
+        return StreamedOutcome(skipped = false, messages = written, targetId = conversation.id)
+    }
+
+    /**
+     * 导入一条会话的"外壳"：按策略判重 / 改名 / 换 id，写会话行。返回 null 表示应跳过。
+     *
+     * 抽出来是因为两条链路（常规备份的分批事务、DeepSeek 的逐条流式）都要它 ——
+     * 各写一遍的话，"同名怎么处理"迟早会在其中一条上分叉。
+     */
+    private suspend fun prepareConversation(
         raw: BackupConversation,
         mode: ImportMode,
         titles: MutableSet<String>,
-    ): Pair<Boolean, Int> {
+        protectedIds: Set<String> = emptySet(),
+    ): PreparedConversation? {
         var conversation = raw
+        var remapId: ((String) -> String)? = null
 
         when (mode) {
             ImportMode.MERGE -> {
                 // 增量：按 id 去重。已存在就跳过，本地改动一律不动
-                if (conversations.findExistingId(conversation.id) != null) return true to 0
+                if (conversations.findExistingId(conversation.id) != null) return null
             }
 
             ImportMode.REPLACE_SAME -> {
                 // 同名 = 同一条会话：先删旧的（消息 / 预设挂载 / 摘要靠外键级联）
-                val clash = conversations.findIdByTitle(conversation.title)
-                    ?: conversations.findExistingId(conversation.id)
-                if (clash != null) {
+                val clash = conversations.findExistingId(conversation.id)
+                    ?: conversations.findIdByTitle(conversation.title)
+                check(conversation.id !in protectedIds) { "Duplicate source conversation id: ${conversation.id}" }
+                if (clash != null && clash !in protectedIds) {
                     deleteConversationRecords(clash)
                     titles.remove(conversation.title)
                 }
@@ -1372,9 +1681,10 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
                         suffix = Res.get(R.string.conversation_fork_suffix),
                         suffixN = { n -> Res.get(R.string.conversation_fork_suffix_n, n) },
                     )
-                    conversation = conversation
-                        .copy(title = title)
-                        .withFreshIds("${conversation.id}~${System.currentTimeMillis()}")
+                    val newId = "${conversation.id}~${UUID.randomUUID()}"
+                    conversation = conversation.copy(title = title).withFreshIds(newId)
+                    // 与 withFreshIds 的 id 规则保持一致（消息 id 与父子引用一起换）
+                    remapId = { old -> if (old.isBlank()) "" else "$newId#$old" }
                 }
             }
         }
@@ -1394,32 +1704,15 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
                 pinnedAt = conversation.pinnedAt,
             ),
         )
-
-        var written = 0
-        for (message in conversation.messages) {
-            // 消息主键是全局的：已存在就跳过（增量的常规情形；换 id 后不会撞）
-            if (messages.findExistingId(message.id) != null) continue
-            messages.upsert(message.toEntity(conversation.id).withOffloadedImages())
-            written++
-        }
-
-        // 恢复挂载的预设（顺序有意义：拼接顺序会影响模型对主次的判断）
-        writePresetLinks(conversation.id, conversation.enabledPresetIds)
-
-        /*
-         * 登记落盘图片的引用。
-         *
-         * 只记 path（几十字节），删除会话时据此删文件 —— 避开 messages.attachments
-         * 那一列的大 JSON（读它会撞 CursorWindow）。
-         */
-        val refs = conversation.messages
-            .flatMap { message -> message.attachments.mapNotNull { it.path } }
-            .distinct()
-            .map { path -> AttachmentRefEntity(path = path, conversationId = conversation.id) }
-        if (refs.isNotEmpty()) attachmentRefs.upsertAll(refs)
-
-        return false to written
+        return PreparedConversation(conversation, remapId)
     }
+
+    private class PreparedConversation(
+        val conversation: BackupConversation,
+        /** 消息 id 重映射（同名新命名时会换 id）；为 null 表示不需要改。 */
+        val remapId: ((String) -> String)?,
+    )
+
     /**
      * 删掉一条会话及其附属记录 —— 「覆盖同名」用。
      *
@@ -1475,12 +1768,11 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
 fun List<MessageEntity>.toUiMessages(): List<UiMessage> = map { it.toUi() }
 
 /**
- * 流式导入每批写多少条会话。
+ * 流式导入时每条会话里一次写多少条消息。
  *
- * 太小则事务开销高（每条会话一次 fsync），太大又回到占内存 —— 一批里带着
- * 各会话的图片 base64，所以取 50 而不是 100。
+ * 与 512,000 字符阈值共同控制批次；单条超大消息仍会单独处理。
  */
-private const val ImportBatchSize = 50
+private const val ImportMessageBatch = 32
 
 /**
  * 导入链路的日志 tag。
@@ -1493,5 +1785,13 @@ private const val ImportLogTag = "SimpleChat/Import"
 /** 导入结果里最多列出几个失败会话的标题（再多就把提示撑成一段日志了）。 */
 private const val MaxFailedTitlesInSummary = 3
 
-/** 附件列的截断长度：40 万字符 ≈ 300KB 图，远小于 2MB 的 CursorWindow。 */
-private const val CappedAttachmentsChars = 400_000
+/**
+ * 按 id 批量取消息时，一次带多少个 id。
+ *
+ * SQLite 的绑定变量数有上限（老系统 999），400 留足余量，又不会因为批太小
+ * 而把一条路径拆成上百次查询。
+ */
+private const val MessageQueryChunk = 400
+
+/** Five byte slices plus metadata stay well below a CursorWindow's capacity. */
+private const val ExportTextChunkBytes = 16_384

@@ -11,11 +11,14 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ModalDrawerSheet
@@ -35,6 +38,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
@@ -45,6 +52,7 @@ import com.simplechat.app.R
 import com.simplechat.app.db.ConversationEntity
 import com.simplechat.app.ui.chat.ChatScreen
 import com.simplechat.app.ui.chat.ChatViewModel
+import com.simplechat.app.ui.chat.HorizontalScrollRegions
 import com.simplechat.app.ui.common.AppConfirmDialog
 import com.simplechat.app.ui.common.AppShadow
 import com.simplechat.app.ui.common.AppTextInputDialog
@@ -54,6 +62,7 @@ import com.simplechat.app.ui.common.screenTransform
 import com.simplechat.app.ui.history.ConversationSearchPage
 import com.simplechat.app.ui.history.HistoryDrawerContent
 import com.simplechat.app.ui.history.HistoryViewModel
+import com.simplechat.app.ui.history.searchResultKey
 import com.simplechat.app.ui.settings.SettingsScreen
 import com.simplechat.app.ui.theme.LocalChatColors
 import kotlinx.coroutines.launch
@@ -93,11 +102,11 @@ private val DrawerCorner = 16.dp
  * 它的搜索框、它的列表，都在同一块面板上。
  */
 @Composable
-fun RootScreen() {
+fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
     val container = (LocalContext.current.applicationContext as App).container
     val scope = rememberCoroutineScope()
 
-    val chatViewModel: ChatViewModel = viewModel(
+    val chatViewModel: ChatViewModel = chat ?: viewModel(
         factory = ChatViewModel.factory(
             chatApi = container.chatApi,
             settingsStore = container.settingsStore,
@@ -105,13 +114,14 @@ fun RootScreen() {
             openCodeSessionId = container.openCodeSessionId,
         ),
     )
-    val historyViewModel: HistoryViewModel = viewModel(
+    val historyViewModel: HistoryViewModel = history ?: viewModel(
         factory = HistoryViewModel.factory(container.chatRepository),
     )
 
     val conversations by historyViewModel.conversations.collectAsStateWithLifecycle()
     val syncState by container.syncManager.state.collectAsStateWithLifecycle()
-    val searchHits by historyViewModel.searchHits.collectAsStateWithLifecycle()
+    // 上游把搜索改成了分页模型（searchPage）；我们这侧原来的 searchHits 已随之消失
+    val searchPage by historyViewModel.searchPage.collectAsStateWithLifecycle()
     val drawerState = rememberDrawerState(DrawerValue.Closed)
 
     /*
@@ -122,7 +132,13 @@ fun RootScreen() {
     var route by rememberSaveable { mutableStateOf(Route.CHAT) }
 
     /** 抽屉是否处于搜索态。见类注释：它是抽屉的状态，不是一条路由。 */
-    var searchMode by remember { mutableStateOf(false) }
+    var searchMode by rememberSaveable { mutableStateOf(false) }
+    var readingSearchResult by rememberSaveable { mutableStateOf(false) }
+    var openingSearchResult by remember { mutableStateOf(false) }
+    var selectedSearchResultKey by rememberSaveable { mutableStateOf<String?>(null) }
+    val searchListState = rememberLazyListState()
+    var horizontalRegionPressed by remember { mutableStateOf(false) }
+    var drawerOrigin by remember { mutableStateOf(Offset.Zero) }
 
     var renameTarget by remember { mutableStateOf<ConversationEntity?>(null) }
     var deleteTarget by remember { mutableStateOf<ConversationEntity?>(null) }
@@ -167,6 +183,11 @@ fun RootScreen() {
         route = Route.CHAT
     }
 
+    // Android's edge-back gesture and the back button return to the same search session.
+    BackHandler(enabled = route == Route.CHAT && readingSearchResult && !drawerState.isOpen) {
+        scope.launch { drawerState.open() }
+    }
+
     /*
      * ⚠️ 这条不能省，而且**不是** Material3 帮我们做的。
      *
@@ -179,9 +200,11 @@ fun RootScreen() {
     }
 
     // 搜索态按返回 → 回抽屉列表。抽屉**保持打开** —— 用户本来就是从那儿进来的。
-    BackHandler(enabled = searchMode) {
+    BackHandler(enabled = searchMode && drawerState.isOpen) {
         historyViewModel.updateQuery("")
         searchMode = false
+        readingSearchResult = false
+        selectedSearchResultKey = null
     }
 
     // ── 抽屉：搜索时把面板从 78% 撑满 ──────────────────────
@@ -198,9 +221,20 @@ fun RootScreen() {
     val sheetShape = RoundedCornerShape(topEnd = sheetCorner, bottomEnd = sheetCorner)
 
     ModalNavigationDrawer(
+        modifier = Modifier.onGloballyPositioned { drawerOrigin = it.boundsInRoot().topLeft }
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                    horizontalRegionPressed = HorizontalScrollRegions.any { it.contains(drawerOrigin + down.position) }
+                    try {
+                        do { val event = awaitPointerEvent(PointerEventPass.Initial) }
+                        while (event.changes.any { it.pressed })
+                    } finally { horizontalRegionPressed = false }
+                }
+            },
         drawerState = drawerState,
         // 撑满时禁止拖动：那时它已经不是"抽屉"了，往左拖会把它拖成一个奇怪的宽度
-        gesturesEnabled = route == Route.CHAT && !searchMode,
+        gesturesEnabled = !horizontalRegionPressed && route == Route.CHAT && (!searchMode || (readingSearchResult && !drawerState.isOpen)),
         // 遮罩由下面 content 里的显式 scrim 画，内置 scrim 关掉，避免双层遮罩。
         scrimColor = Color.Transparent,
         drawerContent = {
@@ -241,19 +275,35 @@ fun RootScreen() {
                 ) { searching ->
                     if (searching) {
                         ConversationSearchPage(
-                            hits = searchHits,
-                            currentConversationId = chatViewModel.currentConversationId,
+                            hits = searchPage.hits,
+                            hasMore = searchPage.hasMore,
+                            onLoadMore = historyViewModel::loadMoreSearchResults,
+                            listState = searchListState,
+                            autoFocus = !readingSearchResult && drawerState.targetValue == DrawerValue.Open,
+                            selectedResultKey = selectedSearchResultKey,
                             query = historyViewModel.query,
-                            onQueryChange = { historyViewModel.updateQuery(it) },
+                            onQueryChange = { selectedSearchResultKey = null; historyViewModel.updateQuery(it) },
                             onBack = {
                                 historyViewModel.updateQuery("")
                                 searchMode = false
+                                readingSearchResult = false
+                                selectedSearchResultKey = null
                             },
-                            onClick = { conversation ->
-                                historyViewModel.updateQuery("")
-                                searchMode = false
-                                closeDrawer()
-                                chatViewModel.openConversation(conversation.id)
+                            onClick = { hit ->
+                                val keyword = historyViewModel.query.trim()
+                                if (!openingSearchResult) {
+                                    openingSearchResult = true
+                                    selectedSearchResultKey = hit.searchResultKey
+                                    readingSearchResult = true
+                                    historyViewModel.exitSelection()
+                                    scope.launch {
+                                        try {
+                                            // Let the drawer and keyboard leave before locating visible text.
+                                            drawerState.close()
+                                            chatViewModel.openConversation(hit.conversation.id, hit.messageId, keyword)
+                                        } finally { openingSearchResult = false }
+                                    }
+                                }
                             },
                             onRename = { renameTarget = it },
                             onTogglePin = { historyViewModel.togglePin(it) },
@@ -265,7 +315,7 @@ fun RootScreen() {
                             currentConversationId = chatViewModel.currentConversationId,
                             selectionMode = historyViewModel.selectionMode,
                             selectedIds = historyViewModel.selectedIds.toList(),
-                            onSearchClick = { searchMode = true },
+                            onSearchClick = { readingSearchResult = false; searchMode = true },
                             onClick = { conversation ->
                                 closeDrawer()
                                 chatViewModel.openConversation(conversation.id)
@@ -312,6 +362,10 @@ fun RootScreen() {
                             vm = chatViewModel,
                             onOpenDrawer = { scope.launch { drawerState.open() } },
                             onNewConversation = {
+                                readingSearchResult = false
+                                selectedSearchResultKey = null
+                                searchMode = false
+                                historyViewModel.updateQuery("")
                                 chatViewModel.newConversation()
                             },
                         )
