@@ -2145,6 +2145,17 @@ private fun AboutPage(onOpenLicenses: () -> Unit) {
     var checking by remember { mutableStateOf(false) }
     var checkResult by remember { mutableStateOf<UpdateChecker.Result?>(null) }
 
+    /*
+     * 一句话说清这是什么。不写"基于 XX 二次开发"这类像免责声明的话 ——
+     * 它就是一个独立应用，只是把出处标在下面的「参考实现」里。
+     */
+    Text(
+        text = stringResource(R.string.about_intro),
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onBackground,
+        modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
+    )
+
     SettingsSectionLabel(stringResource(R.string.about_version))
 
     SettingsCard {
@@ -2192,6 +2203,12 @@ private fun AboutPage(onOpenLicenses: () -> Unit) {
             label = stringResource(R.string.about_project_url),
             value = ProjectUrl,
             url = ProjectUrl,
+        )
+        RowDivider(inset = 16.dp)
+        LinkRow(
+            label = stringResource(R.string.about_reference),
+            value = ReferenceUrl,
+            url = ReferenceUrl,
         )
     }
 
@@ -2692,10 +2709,20 @@ private fun SettingsSwitchRow(
 }
 
 /**
- * 仓库地址。写成常量而不是资源：它是**代码里的一个事实**，不随界面语言变，
- * 也不该被翻译（翻成别的语言反而点不开）。改仓库时只改这一处。
+ * 本应用的仓库地址。
+ *
+ * 写成常量而不是资源：它是**代码里的一个事实**，不随界面语言变，也不该被翻译
+ * （翻成别的语言反而点不开）。改仓库时只改这一处（另见 `UpdateChecker`）。
  */
-private const val ProjectUrl = "https://github.com/Pokanshuu/Simple-Chat"
+private const val ProjectUrl = "https://github.com/ZhuNemo/mydeepseek"
+
+/**
+ * 参考实现（上游）。
+ *
+ * 这个应用不是从零写的：界面骨架、消息树、Markdown 渲染这些都来自 Simple Chat。
+ * 留一行链接是对原作者的交代，也让想追根溯源的人找得到起点。
+ */
+private const val ReferenceUrl = "https://github.com/Pokanshuu/Simple-Chat"
 
 /**
  * 可点击的信息行 —— 样式与 [InfoRow] 一致，只是值用主色、整行可点。

@@ -25,9 +25,14 @@ import okhttp3.Request
  */
 object UpdateChecker {
 
-    /** 仓库地址：与「关于」页里的项目链接同一处。 */
+    /**
+     * 仓库地址：与「关于」页的「项目地址」同一处。
+     *
+     * ⚠️ 必须是**本仓库**，不能是上游 Simple-Chat —— 两边的版本号是两条独立的线
+     * （上游 v1.1.5 / 本应用 v1.2.x），指过去会永远提示"发现新版本 v1.1.5"。
+     */
     private const val LATEST_RELEASE_URL =
-        "https://api.github.com/repos/Pokanshuu/Simple-Chat/releases/latest"
+        "https://api.github.com/repos/ZhuNemo/mydeepseek/releases/latest"
 
     /**
      * 独立的客户端：只用于版本查询。

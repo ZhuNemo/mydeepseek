@@ -43,7 +43,7 @@ internal fun licenseTextUrl(license: String): String = when (license) {
 
 /** 本应用自己的许可与版权。 */
 internal const val APP_LICENSE = "MIT"
-internal const val APP_COPYRIGHT = "Copyright © 2026 Pokanshu"
+internal const val APP_COPYRIGHT = "Copyright © 2026 Pokanshu（Simple Chat）"
 
 /**
  * 参考实现（**未随包分发代码**，仅作署名）。

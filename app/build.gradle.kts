@@ -30,12 +30,24 @@ android {
     buildToolsVersion = "37.0.0"
 
     defaultConfig {
-        applicationId = "com.simplechat.app"
+        /*
+         * ⚠️ 应用身份（安装包名）。
+         *
+         * 与上面的 `namespace` 刻意不同：namespace 只决定 R 类与源码包路径，
+         * 改了要动几百个文件的 package 声明；applicationId 只决定"这是哪个应用"，
+         * 换掉就与旧版 / 上游彻底分开，而代码一行都不用动。
+         * FileProvider 的 authority 用的是 `${applicationId}.fileprovider`，会自动跟随。
+         */
+        applicationId = "com.zhunemo.mydeepseek"
         minSdk = 26
         targetSdk = 37
         // 版本号取本仓库（我们的功能线），上游的 testInstrumentationRunner 保留
-        versionCode = 16
-        versionName = "1.2.3"
+        /*
+          * 版本从 1.0.0 起算：换包名等于换了一条发行线（com.zhunemo.mydeepseek），
+          * 之前 com.simplechat.app 的 16 / 1.2.3 属于另一条线，不必延续。
+          */
+        versionCode = 1
+        versionName = "1.0.0"
         testInstrumentationRunner = "com.simplechat.app.DeviceRegression"
         vectorDrawables { useSupportLibrary = true }
     }

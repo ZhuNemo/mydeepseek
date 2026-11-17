@@ -211,6 +211,8 @@
     <string name="font_scale_hint">将会影响对话正文、思考内容与全部界面文字。</string>
 
     <!-- ── 设置：关于 ───────────────────────────────────── -->
+    <string name="about_intro">一个把对话留在本机的 DeepSeek 客户端：消息、图片、朗读都在设备上，聊天记录可以用自己的网盘同步。</string>
+    <string name="about_reference">参考实现</string>
     <string name="about_version">版本</string>
     <string name="about_update">更新</string>
     <string name="about_check_update">检查更新</string>

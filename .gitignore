@@ -51,3 +51,6 @@ ICON.png
 .dsh-acl-recovery/
 __pycache__/
 *.pyc
+
+# 图标设计稿（一次性预览，不进仓库）
+/icon-preview.html

@@ -1,29 +1,40 @@
 # myDeepSeek
 
-> A self-hosted-flavoured Android client for DeepSeek. Native Jetpack Compose, ~4 MB release APK after R8.
+> An Android DeepSeek client that keeps the conversation on your device. Native Jetpack Compose, ~4 MB release APK after R8.
 
 **[中文](README.md) | English**
 
-![Version](https://img.shields.io/badge/version-1.2.3-blue)
+![Version](https://img.shields.io/badge/version-1.0.0-blue)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+![Platform](https://img.shields.io/badge/Android-8.0%2B%20%C2%B7%20API%2026-3ddc84)
 
-## What this is
+**Repository**: <https://github.com/ZhuNemo/mydeepseek>
 
-myDeepSeek is a personal fork of [SimpleChat](https://github.com/Pokanshuu/Simple-Chat).
-The foundation is unchanged — light, fast, offline-first, no account system — with three
-targeted changes and a few real bug fixes (see [CODE_REVIEW.md](CODE_REVIEW.md)):
+## What it is
 
-| Change | Detail |
+myDeepSeek is a standalone Android chat client. Point it at any OpenAI-compatible endpoint
+(DeepSeek's own included) and your messages, images and speech stay on the device — no account
+system, no relay server. To move between devices, sync your history to a drive you own.
+
+Three principles:
+
+| Principle | What it looks like |
 |---|---|
-| **Images above the bubble** | Sent images render as fixed 104dp square previews **above** the message bubble (up to three per row, `Crop`), tap to view full screen, long-press for the message menu. Image-only messages no longer draw an empty bubble. |
-| **History grouped by month** | The drawer goes from Today / Yesterday / Past 7 days / Earlier to **Pinned + one group per month** (`November 2026`). The old buckets ended up stuffing ~90% of a long history into "Earlier". |
-| **WebDAV sync (incremental)** | Settings → Cloud sync. The remote side is **one file per chat** plus images keyed by content hash: only changed chats are uploaded, each PUT is a few tens of KB, and an interrupted sync resumes where it stopped. Peak memory tracks the largest single chat. Merging is per conversation by `updatedAt` (last-write-wins). Optional sync on launch, manual sync, connection test. |
-| **Fix: sent images were never written to disk** | Picked photos were inlined as base64 into `messages.attachments`; one 3 MB photo made a 4 MB row, past Android's 2 MB `CursorWindow` limit, so that conversation became unreadable and the image was silently dropped by the fallback path. Now the send path offloads like the import path always did. |
-| **Fix: deleting a message leaked image files** | Files exclusively owned by deleted messages (and their refs) are now reclaimed. |
-| **Fix: Keystore decryption on the main thread** | The settings flow now reads on IO. |
-| **Fix: wrong pager start page for stored images** | Stored attachments carry an empty `data`, so two same-named images matched each other; `path` is now part of the comparison. |
+| **Your data stays yours** | The local database and private files are the only source of truth. No cloud account, export always works, uninstall really deletes. |
+| **Long chats have to work** | Hundreds of messages or hundreds of thousands of characters must open, scroll and branch without stutter — and hit-testing on a giant bubble must not break. |
+| **Details match the official app** | Images sit in their own block instead of deforming the bubble, history is grouped by month, speech can use the official voices. |
 
-## Features kept from upstream
+Where it differs from "a shell around an API key":
+
+- **Sync to your own drive** — no third-party account. The remote side is one file per chat plus
+  images keyed by content hash, so only changed chats move and an interrupted sync resumes.
+- **Images actually hit the disk** — photos are written to private storage before the row is
+  inserted, so a 4 MB base64 row can never blow past Android's 2 MB `CursorWindow` and make a
+  whole conversation unreadable (a data-losing bug in the original implementation).
+- **History grouped by month** — after a year of use, 90% of chats no longer collapse into "Earlier".
+- **Delete means reclaim** — image files owned solely by deleted messages are removed with them.
+
+## Features
 
 - Any OpenAI-compatible endpoint; the official DeepSeek endpoint can use the **Anthropic-compatible** channel (web search, link reading, inline citations, server-side titles).
 - SSE streaming with live Markdown, collapsible reasoning, "continue generation".
@@ -33,19 +44,10 @@ targeted changes and a few real bug fixes (see [CODE_REVIEW.md](CODE_REVIEW.md))
 - JSON backup, ZIP archive with per-chat Markdown, Markdown export; imports from Chatbox and DeepSeek exports.
 - Dark mode, accent colours, font scale, Chinese/English UI.
 
-### Merge status: up to v1.1.5
-
-The fork started from v1.1.3 and now carries everything upstream shipped after it (v1.1.4 + v1.1.5):
-API profiles (several endpoint/model/key sets, one tap to switch), global search with paging and
-jump-to-message, text selection, background generation, check-for-updates, and the open-source
-license list.
-
-Both sides were kept — conflicts were resolved semantically rather than by picking a winner.
-Upstream also rewrote the user bubble and also fixed the TTS crash on Huawei ROMs; those
-implementations were taken, then the square image preview was layered back on top.
-See `CODE_REVIEW.md` for the per-file decisions.
-
 ## Build
+
+The APK ships as `com.zhunemo.mydeepseek` — a different application id from upstream Simple Chat
+(`com.simplechat.app`), so both can live on one device with separate data.
 
 Requirements: **JDK 21** (Android Studio's bundled JBR 21 works), Android SDK platform 37 / build-tools 37.0.0.
 JDK 17 can compile but cannot run the unit tests — the `highlights` dependency ships Java 21 bytecode.
@@ -171,7 +173,16 @@ API keys and the WebDAV password are AES-256-GCM encrypted with keys inside the 
 never leave the device; requests go straight to the endpoint you configure; sync happens only between
 your device and your drive. Schema changes use explicit Room migrations — no destructive fallbacks.
 
-## License
+## Credits and license
 
-MIT. Forked from [Pokanshuu/Simple-Chat](https://github.com/Pokanshuu/Simple-Chat); this is a
-personal branch, not an official release of the upstream project.
+Released under the MIT license (see [LICENSE](LICENSE)), keeping the original copyright notice.
+
+The UI skeleton, message tree, Markdown rendering and protocol implementation come from
+**Simple Chat**:
+
+- Reference implementation: <https://github.com/Pokanshuu/Simple-Chat>
+
+The conversation UI, sync, icon and this document are what this repository changed; each item is
+recorded in [`CODE_REVIEW.md`](CODE_REVIEW.md). This repository is maintained independently and is
+not an official release of the upstream project — please file issues
+[here](https://github.com/ZhuNemo/mydeepseek/issues).

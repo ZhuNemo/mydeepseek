@@ -1,56 +1,41 @@
 # myDeepSeek
 
-> 一个为自己定制的 Android 端 DeepSeek 客户端。Jetpack Compose 原生实现，release 经 R8 压缩后约 4 MB。
+> 一个把对话留在本机的 Android DeepSeek 客户端。Jetpack Compose 原生实现，release 经 R8 压缩后约 4 MB。
 
 **中文 | [English](README.en.md)**
 
-![Version](https://img.shields.io/badge/version-1.2.3-blue)
+![Version](https://img.shields.io/badge/version-1.0.0-blue)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+![Platform](https://img.shields.io/badge/Android-8.0%2B%20%C2%B7%20API%2026-3ddc84)
 
-## 这是什么
+**仓库**：<https://github.com/ZhuNemo/mydeepseek>
 
-myDeepSeek 是从 [SimpleChat](https://github.com/Pokanshuu/Simple-Chat) fork 出来的个人定制版：
-保留了它"轻、快、离线优先、无账号体系"的底子，在三个地方按自己的使用习惯做了改造 ——
-**图片预览、历史按月归档、WebDAV 云同步**，并顺手修掉了原代码里几处会真正影响数据安全的问题
-（详见 [CODE_REVIEW.md](CODE_REVIEW.md)）。
+## 它是什么
 
-适合的场景：
+myDeepSeek 是一个独立的 Android 聊天客户端：接任意 OpenAI 兼容端点（内置 DeepSeek 官方），
+消息、图片、朗读全部留在设备上 —— 没有账号体系，对话内容不经过任何第三方服务器；
+要跨设备，就把聊天记录同步到你自己的网盘。
 
-- 在日常对话里发图（截图、照片），希望图片像官方客户端那样**独立成块**，而不是把气泡撑变形
-- 会话写到几百条，需要一个能一眼扫到"上个月那个方案"的历史列表
-- 手机 + 平板两台设备，想用自己的网盘（坚果云 / Nextcloud）同步，而不是注册第三方账号
+三条设计原则：
 
-## 上游同步到 v1.1.5
-
-本仓库的起点是原项目 v1.1.3，已经合入它之后的全部改动（v1.1.4 + v1.1.5）。
-
-- **API 配置管理**：多份配置并存（地址 / 模型 / 协议 / Key 各自独立），点一下就切换
-- **全局搜索**：跨会话搜正文与标题，分页加载、可跳到命中的那一条
-- **选择文本**：长按起选、拖动拉选区，系统工具栏自带复制
-- **后台继续生成**：切走页面不打断回复
-- **检查更新**：关于页直接查 GitHub Releases
-- **开源许可清单**：关于 → 开源许可
-
-合并时保持了"两边都保"：上游的功能与我这边的定制同时生效，冲突按语义逐处裁决
-（例：上游也重写了用户气泡、也修了华为 ROM 上的 TTS 闪退，两处取它们的实现再叠加我的图片预览）。
-细节见 `CODE_REVIEW.md`。
-
-## 这次定制改了什么
-
-| 改动 | 说明 |
+| 原则 | 落到实处的样子 |
 |---|---|
-| **图片预览独立成块** | 用户消息里的图片改为气泡**上方的固定正方形预览**（104dp、`Crop`、最多三张一排），点击整屏查看，长按出消息菜单；纯图片消息不再画一个空气泡。原先是把图片按原比例塞进气泡，竖图会把气泡拉成一条，文字被挤到最底下只剩一行。 |
-| **历史按月分组** | 抽屉从「今天 / 昨天 / 7 天内 / 更早」改成「置顶 + 按月」，标题形如 `2026年11月`（英文 `November 2026`）。原来的分桶在长期使用后会把九成会话压进「更早」，等于没分组。 |
-| **WebDAV 同步（逐会话增量）** | 设置 → 云端同步。网盘上**一个会话一个文件**、图片按内容哈希单独存：只传变化过的会话，单次 PUT 只有几十 KB，断了能续；内存峰值只跟最大的那条会话有关。按 `updatedAt` 做 last-write-wins 合并。支持「启动时自动同步」、手动同步、测试连接。密码与 API Key 一样只存 Keystore 密文。 |
-| **修复：发送的图片没有落盘** | 拍照 / 相册的图片原先以 base64 内联进 `messages.attachments`，一张 3MB 的照片就是一行 4MB 的 TEXT，超过 Android `CursorWindow` 的 2MB 上限 → 该会话读不出来、图片被兜底逻辑截断后消失。现在发送路径与导入路径一样先落盘再写库，并登记到 `attachment_refs`。 |
-| **修复：删消息不回收图片文件** | 单条删除消息时，被它独占的图片文件与引用登记会一并清掉，不再默默占着存储。 |
-| **修复：主线程做 Keystore 解密** | 设置流改为在 IO 上读取，配置变化时不再在组合线程里过 Binder 解密。 |
-| **修复：多图查看起始页错位** | 落盘图片的 `data` 是空串，原先只按「文件名 + data」定位当前图，两张同名图会翻错页；现在连 `path` 一起比。 |
-| 其它 | 应用名改为 myDeepSeek；README 重写；新增 GitHub Actions 构建流水线；新增同步合并逻辑的单元测试。 |
+| **数据是你的** | 本地数据库与私有目录就是唯一事实。没有云账号，导出永远可用，卸载即彻底删除。 |
+| **长会话必须能用** | 几百条消息、几十万字的会话，打开、滚动、切换分支都不该卡；超长气泡的点击不能失效。 |
+| **细节贴近官方** | 图片独立成块而不是把气泡撑变形；历史按月归档；朗读可以用官方音色。 |
+
+和"自己填个 API Key 的壳"相比，差别主要在这里：
+
+- **同步到你自己的网盘**：不需要注册第三方账号。网盘上是一个会话一个文件、图片按内容哈希存放，
+  只传变化过的那些，传一半断了下次接着传。
+- **图片真的落盘**：拍照 / 相册进来的图先写进私有目录再入库，不会因为一行超过 Android
+  `CursorWindow` 的 2MB 上限而让整个会话读不出来（这是原实现里一个会丢数据的坑）。
+- **历史按月归档**：长期使用之后，九成会话不会全被压进同一个「更早」。
+- **删除即回收**：删消息时被它独占的图片文件一并清掉，不会默默占着空间。
 
 ## 特性
 
-沿袭上游，仍然保留：
+**对话与模型**
 
 - **多服务端**：任意 OpenAI 兼容端点，内置 DeepSeek 与 OpenCode Go 配置；DeepSeek 官方端点可走 **Anthropic 兼容**扩展通道（智能搜索 / 链接阅读 / 正文引用 / 时间地点提醒）。
 - **流式输出**：SSE 逐字渲染，Markdown 实时渲染，定稿前后版式不跳。
@@ -63,12 +48,17 @@ myDeepSeek 是从 [SimpleChat](https://github.com/Pokanshuu/Simple-Chat) fork �
 - **数据出口**：JSON 备份、ZIP 归档（备份 + 每个会话的 Markdown 文稿）、Markdown 导出；可导入本应用备份、Chatbox 备份、DeepSeek 官方导出。
 - **外观 / 语言**：深色模式、主题色、字号倍率、中英双语。
 
-新增：
+**图片、归档与同步**
 
-- **云端同步（WebDAV）**：见下文「云端同步」。
-- 历史抽屉按月分组。
+- **图片独立成块**：用户消息里的图片排在气泡**上方**，固定正方形预览（104dp、`Crop`、最多三张一排），
+  点击整屏查看，长按出消息菜单；只发图片的消息不再画一个空气泡。
+- **历史按月分组**：抽屉是「置顶 + 按月」，标题形如 `2026年11月`（英文 `November 2026`）。
+- **WebDAV 同步**：见下文「云端同步（WebDAV）」。
 
 ## 快速开始
+
+安装包名是 `com.zhunemo.mydeepseek`，与上游 Simple Chat（`com.simplechat.app`）**不同**：
+两者可以同时装在一台设备上，互不覆盖，数据也各自独立。
 
 ### 环境要求
 
@@ -80,7 +70,7 @@ myDeepSeek 是从 [SimpleChat](https://github.com/Pokanshuu/Simple-Chat) fork �
 ### 本地构建
 
 ```bash
-git clone <你的仓库地址> myDeepSeek
+git clone https://github.com/ZhuNemo/mydeepseek.git
 cd myDeepSeek
 ./gradlew assembleDebug          # 产物：app/build/outputs/apk/debug/
 ```
@@ -348,9 +338,14 @@ app/src/main/java/com/simplechat/app/
 
 见 [`CODE_REVIEW.md`](CODE_REVIEW.md)：按严重程度列出发现的问题、已修复项与保留的风险点。
 
-## 许可证与致谢
+## 出处与许可
 
-基于 MIT 许可证开源（见 [LICENSE](LICENSE)）。
+以 MIT 许可证发布（见 [LICENSE](LICENSE)），保留原作者版权声明。
 
-上游项目：[Pokanshuu/Simple-Chat](https://github.com/Pokanshuu/Simple-Chat)。
-本仓库是它的个人定制分支，不是上游官方版本；问题请提到本仓库。
+这个应用的界面骨架、消息树、Markdown 渲染与协议实现来自 **Simple Chat**：
+
+- 参考实现：<https://github.com/Pokanshuu/Simple-Chat>
+
+对话框、同步、图标与本文档是本仓库相对它做的改动，逐条记录在
+[`CODE_REVIEW.md`](CODE_REVIEW.md)。本仓库是独立维护的版本，不是上游官方发行版 ——
+问题请提到[本仓库](https://github.com/ZhuNemo/mydeepseek/issues)。

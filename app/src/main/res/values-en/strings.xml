@@ -206,6 +206,8 @@
     <string name="font_scale_hint">Affects chat text, thinking content and all interface text.</string>
 
     <!-- ── Settings: about ──────────────────────────────── -->
+    <string name="about_intro">A DeepSeek client that keeps the conversation on your device: messages, images and speech stay local, and history syncs to a drive you own.</string>
+    <string name="about_reference">Reference implementation</string>
     <string name="about_version">Version</string>
     <string name="about_update">Update</string>
     <string name="about_check_update">Check for updates</string>
