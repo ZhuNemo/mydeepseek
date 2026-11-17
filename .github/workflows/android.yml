@@ -102,6 +102,27 @@ jobs:
       - name: 赋予 gradlew 执行权限
         run: chmod +x ./gradlew
 
+      # 排障用：Gradle 报 "Plugin ... was not found in any of the following sources" 时，
+      # 十有八九是仓库可达性问题，而不是版本号写错。这一步把三个关键地址的 HTTP 状态打出来，
+      # 下次红了一眼就能看出是哪个仓库不通（不阻断构建）。
+      #
+      # 参考状态码：200 = 正常；403/404 = 仓库里确实没有该 artifact（版本号错）；
+      # 000 = 连不上（DNS / 超时）。
+      - name: 检查依赖仓库可达性
+        continue-on-error: true
+        run: |
+          check() {
+            printf '  %-28s ' "$1"
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 -L "$2" || echo 000)
+            echo "HTTP $code"
+          }
+          echo "Android Gradle Plugin（Google Maven）:"
+          check "AGP 9.4.1" "https://dl.google.com/dl/android/maven2/com/android/tools/build/gradle/9.4.1/gradle-9.4.1.pom"
+          echo "KSP plugin marker（Central）:"
+          check "ksp 2.3.12" "https://repo.maven.apache.org/maven2/com/google/devtools/ksp/com.google.devtools.ksp.gradle.plugin/2.3.12/com.google.devtools.ksp.gradle.plugin-2.3.12.pom"
+          echo "Kotlin Gradle Plugin（Central）:"
+          check "kotlin 2.4.10" "https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-gradle-plugin/2.4.10/kotlin-gradle-plugin-2.4.10.pom"
+
       - name: 单元测试
         run: ./gradlew --no-daemon --stacktrace testDebugUnitTest
 
