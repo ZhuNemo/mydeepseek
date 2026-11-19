@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -110,12 +111,6 @@ internal fun ThinkingHeader(
 internal fun WaitingIndicator(modifier: Modifier = Modifier) {
     val colors = LocalChatColors.current
     val transition = rememberInfiniteTransition(label = "waitingFirstToken")
-    val rotation by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(tween(900, easing = LinearEasing)),
-        label = "waitingRotation",
-    )
     val dots by transition.animateFloat(
         initialValue = 0f,
         targetValue = 4f,
@@ -131,18 +126,20 @@ internal fun WaitingIndicator(modifier: Modifier = Modifier) {
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Canvas(modifier = Modifier.size(15.dp)) {
-            val stroke = 2.dp.toPx()
-            drawArc(
-                color = colors.processText,
-                startAngle = rotation,
-                sweepAngle = 250f,
-                useCenter = false,
-                style = Stroke(width = stroke, cap = StrokeCap.Round),
-                topLeft = Offset(stroke / 2f, stroke / 2f),
-                size = Size(size.width - stroke, size.height - stroke),
-            )
-        }
+        /*
+         * 换成 M3 的 [CircularProgressIndicator]，不再自己画圆弧。
+         *
+         * 原来那个是 Canvas + 一个线性旋转：形状像，但没有 M3 的"头尾收缩"
+         * （indeterminate 的弧长会自己变长变短），旋转变速也是匀速 ——
+         * 一眼能看出"这不是系统的转圈"。M3 的实现还自带无障碍语义。
+         *
+         * 尺寸取 16dp（原 15dp）：M3 最小的 spinner 是 20dp 档，16 在行内更协调。
+         */
+        CircularProgressIndicator(
+            modifier = Modifier.size(16.dp),
+            color = colors.processText,
+            strokeWidth = 2.dp,
+        )
         Text(
             // 省略号按秒循环出现：三个点，一格一个
             text = Res.get(R.string.reply_waiting) + ".".repeat(dots.toInt().coerceIn(0, 3)),

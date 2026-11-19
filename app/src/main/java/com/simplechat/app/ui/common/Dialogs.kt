@@ -12,6 +12,8 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -125,69 +127,64 @@ fun AppConfirmDialog(
     onDismiss: () -> Unit,
     onConfirm: () -> Unit,
     destructive: Boolean = false,
+    /**
+     * 标题/正文与按钮之间的自定义内容（勾选框、选项列表等）。
+     *
+     * 加这个参数是为了「删除时顺便删云端」那种**带副作用的确认**：
+     * 弹窗本身不该知道业务，但也不该为了一个勾选框再写一个几乎一样的弹窗。
+     */
+    extraContent: (@Composable () -> Unit)? = null,
 ) {
-    val colors = LocalChatColors.current
-    Dialog(onDismissRequest = onDismiss) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(ContainerShape)
-                .background(colors.card)
-                .padding(horizontal = 20.dp, vertical = 22.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onSurface,
-            )
-            message?.let {
-                Spacer(Modifier.size(8.dp))
-                Text(
-                    text = it,
-                    style = MaterialTheme.typography.labelMedium,
-                    color = colors.placeholder,
-                )
-            }
-
-            Spacer(Modifier.size(20.dp))
-
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(PillShape)
-                    .background(
-                        if (destructive) colors.danger else MaterialTheme.colorScheme.primary,
+    /*
+     * 用 M3 的 [AlertDialog]，不再自绘"整宽胶囊按钮"。
+     *
+     * 自绘那版是 iOS 风格的双大按钮；M3 的对话框是**右下角文字按钮**
+     * （取消在左、确认在右），形状是 28dp 的 extraLarge 圆角，
+     * 容器色是 surfaceContainerHigh。换成官方组件之后，水波纹、字号、
+     * 按钮间距、无障碍角色全都跟着系统走，不用再维护。
+     *
+     * 破坏性操作用 error 色写确认按钮 —— M3 里没有"红色填充按钮"这种做法，
+     * 用文字色表达危险性更符合规范，也不会把弹窗变成一块红。
+     */
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column {
+                if (message != null) {
+                    Text(
+                        text = message,
+                        style = MaterialTheme.typography.bodyMedium,
                     )
-                    .clickable(onClick = onConfirm)
-                    .padding(vertical = 14.dp),
-                contentAlignment = Alignment.Center,
-            ) {
+                }
+                extraContent?.let {
+                    Spacer(Modifier.size(12.dp))
+                    it()
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
                 Text(
                     text = confirmText,
-                    style = MaterialTheme.typography.titleSmall,
-                    color = androidx.compose.ui.graphics.Color.White,
+                    color = if (destructive) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.primary
+                    },
                 )
             }
-
-            Spacer(Modifier.size(6.dp))
-
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(PillShape)
-                    .clickable(onClick = onDismiss)
-                    .padding(vertical = 14.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = stringResource(R.string.action_cancel),
-                    style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.onSurface,
-                )
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(R.string.action_cancel))
             }
-        }
-    }
+        },
+        shape = MaterialTheme.shapes.extraLarge,
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+        titleContentColor = MaterialTheme.colorScheme.onSurface,
+        textContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
 }
 
 @Composable

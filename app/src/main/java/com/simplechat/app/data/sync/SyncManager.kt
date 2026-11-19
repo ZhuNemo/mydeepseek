@@ -136,6 +136,39 @@ class SyncManager(
 
     // ── 主流程 ───────────────────────────────────────────
 
+    /**
+     * 从云端删掉这些会话的**全部版本**。
+     *
+     * 本地删了会话却不动远端，下次同步会把它当成"远端更新"重新拉回来 ——
+     * 用户看到的就是「删了又自己回来了」。所以删除动作要能延伸到网盘。
+     *
+     * 三个设计点：
+     *
+     * - **按 id 删所有版本**：远端可能因为并发/失败留下 `<id>.<旧时间>.json`，
+     *   只删"最新那版"会留残骸，下次照样被认出来。
+     * - **与同步互斥**：两边同时动同一批文件时，会出现"同步刚传上去、这边又删掉"
+     *   或者相反。用同一把 [running] 锁串起来。
+     * - **失败静默**：删本地是主操作，云端删不掉最多是下次又冒出来；
+     *   不该让一次网络故障把用户点了的"删除"整个回滚。
+     */
+    suspend fun deleteRemoteConversations(ids: Set<String>) {
+        if (ids.isEmpty()) return
+        withContext(Dispatchers.IO) {
+            val stored = settingsStore.current()
+            if (!stored.syncConfigured) return@withContext
+            val config = stored.davConfig()
+            val root = stored.davPath
+            running.withLock {
+                runCatching {
+                    client.listNames(config, SyncLayout.conversationDir(root))
+                        .mapNotNull { SyncLayout.parseConversationName(it) }
+                        .filter { it.id in ids }
+                        .forEach { client.delete(config, SyncLayout.conversationPath(root, it.name)) }
+                }
+            }
+        }
+    }
+
     private suspend fun sync() {
         if (!running.tryLock()) return
         val work = File(context.cacheDir, SyncWorkDir).apply { mkdirs() }

@@ -5,6 +5,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import java.util.Locale
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -2034,11 +2035,23 @@ class ChatViewModel(
      * 日期最敏感，而 `11月19日` 这种本地化写法在不同语言下还会换顺序，
      * 对"算一下隔了几天"这类推理没有好处。
      */
-    private fun stampedText(text: String): String =
-        Res.get(
-            R.string.prompt_current_time,
-            LocalDateTime.now().format(TimeStampFormat),
-        ) + "\n\n" + text
+    private fun stampedText(text: String): String {
+        val cjk = Res.bool(R.bool.ui_is_cjk)
+        val locale = if (cjk) Locale.SIMPLIFIED_CHINESE else Locale.getDefault()
+        /*
+         * 用**自然语言**写日期，而不是 `2026-11-19 15:35`。
+         *
+         * ISO 格式对排序友好，但对"今天是星期几""上周三说过什么"这类问题并不直观：
+         * 模型得自己从日期推星期。直接给出「2026年11月19日 星期四 15:35」，
+         * 星期、年月日、时刻一次到位，正是人类在对话里报时间的方式。
+         *
+         * 语言跟着界面走：英文界面给 `Thursday, 19 November 2026 15:35`，
+         * 避免中文日期混在英文回答里。
+         */
+        val pattern = if (cjk) "yyyy年M月d日 EEEE HH:mm" else "EEEE, d MMMM yyyy HH:mm"
+        val formatted = LocalDateTime.now().format(DateTimeFormatter.ofPattern(pattern, locale))
+        return Res.get(R.string.prompt_current_time, formatted) + "\n\n" + text
+    }
 
     private suspend fun buildRequestMessages(): List<OutMessageDto> {
         skippedNoVision = 0; skippedUnreadable = 0
@@ -2204,10 +2217,3 @@ private fun String.toConversationModeSafe(): ConversationMode =
  */
 internal fun thinkingSeconds(ms: Long): Long = ((ms + 500) / 1000).coerceAtLeast(1)
 
-/**
- * 时间戳格式：与语言无关，模型最容易正确解析的那一种。
- *
- * 不用 `yyyy年M月d日` 这类本地化写法 —— 它会随界面语言改变顺序，
- * 而模型对 ISO 风格的日期最敏感（"隔了几天"这类推理靠的就是这个）。
- */
-private val TimeStampFormat: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")

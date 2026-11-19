@@ -366,7 +366,7 @@
     <!-- ── 发给模型的提示词（按界面语言取） ─────────────── -->
     <string name="prompt_title_system">你是一个起标题的助手。用不超过 12 个字概括这段对话在聊什么。只输出标题本身：不要引号、不要书名号、不要结尾标点、不要任何解释或前缀。</string>
     <string name="prompt_compact_system">你是一个上下文压缩器，服务于长篇文学创作。把用户给你的对话记录压缩成一份「前情提要」。\n\n必须保留：\n1. 所有人物姓名、称呼、亲属与关系变化\n2. 地名、时间、场景等设定细节\n3. 已发生的关键情节与因果链条\n4. 已经确立的文风约定（人称、视角、语气、禁忌）\n5. 尚未回收的伏笔与悬念\n\n要求：\n- 用陈述性文字，不要对话体\n- 不要评价、不要续写、不要写「以上是摘要」之类的元话术\n- 篇幅控制在原文的 10% 以内\n- 直接输出提要正文</string>
-    <string name="prompt_current_time">当前时间：%1$s</string>
+    <string name="prompt_current_time">（现在是 %1$s。凡是涉及日期、时间、星期，或「今天 / 明天 / 上周」这类相对时间的判断，都以这个时间为准。）</string>
     <string name="prompt_recap_intro">以下是此前对话的前情提要，用于维持设定与情节连贯。不要复述它，直接继续。\n\n</string>
     <string name="prompt_compact_existing">【已有前情提要】\n</string>
     <string name="prompt_compact_new">\n\n【以下是新增的对话】\n</string>
@@ -485,6 +485,7 @@
     <string name="hist_rename_title">重命名对话</string>
     <string name="hist_delete_title">删除后，该对话将不可恢复</string>
     <string name="hist_delete_body">该对话的所有消息与版本都会被一并清除</string>
+    <string name="hist_delete_cloud">同时删除云端记录</string>
     <string name="hist_delete_confirm">删除该对话</string>
     <string name="hist_delete_selected_title">删除后，这 %1$d 个对话将不可恢复</string>
     <string name="hist_delete_selected_body">它们的所有消息与版本都会被一并清除</string>
@@ -617,6 +618,8 @@
     <string name="vault_remove_action">移出保险箱</string>
     <string name="vault_not_encrypted">保险箱只隐藏界面，不加密数据库。</string>
     <!-- ── 同步（WebDAV） ───────────────────────────────── -->
+    <string name="sync_status_on">已配置</string>
+    <string name="sync_status_off">未配置</string>
     <string name="settings_sync">云端同步</string>
     <string name="settings_sync_summary">WebDAV（坚果云 / Nextcloud）</string>
     <string name="settings_group_sync">同步</string>

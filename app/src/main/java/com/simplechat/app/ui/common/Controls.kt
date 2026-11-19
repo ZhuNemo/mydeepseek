@@ -28,6 +28,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -187,17 +189,23 @@ fun AppSlider(
     // pointerInput 的 block 只在 key 变化时重建，直接闭包捕获会拿到旧 lambda
     val finishedCallback by rememberUpdatedState(onValueChangeFinished)
 
-    val thumbIdle = with(density) { 9.dp.toPx() }
-    val thumbActive = with(density) { 13.dp.toPx() }
-    val trackThin = with(density) { 3.dp.toPx() }
-    val trackThick = with(density) { 5.dp.toPx() }
-    val tickHeight = with(density) { 7.dp.toPx() }
-    val edge = with(density) { 16.dp.toPx() }
+    /*
+     * 尺寸与配色取 Material 3 的 Slider 规格：
+     * - 轨道 4dp（原来 3→5dp 会随按下变粗，M3 是恒定 4dp）
+     * - 拇指直径 20dp（原来 9dp，按下放大到 13dp；M3 是拇指不变、出现 40dp 光晕）
+     * - 未选中轨道用 surfaceContainerHighest，选中段与拇指用 primary
+     * - 刻度是小圆点（4dp），压在轨道上
+     */
+    val trackHeight = with(density) { 4.dp.toPx() }
+    val thumbRadius = with(density) { 10.dp.toPx() }
+    val haloRadius = with(density) { 20.dp.toPx() }
+    val tickRadius = with(density) { 2.dp.toPx() }
+    val edge = with(density) { 20.dp.toPx() }
 
     val activeColor = MaterialTheme.colorScheme.primary
-    val idleColor = colors.outline
-    val thumbFill = colors.card
-    val tickColor = colors.placeholder
+    val inactiveTrack = MaterialTheme.colorScheme.surfaceContainerHighest
+    val haloColor = activeColor.copy(alpha = 0.12f)
+    val tickColor = MaterialTheme.colorScheme.onSurfaceVariant
 
     val span = (valueRange.endInclusive - valueRange.start).takeIf { it > 0f } ?: 1f
     val fraction = ((value - valueRange.start) / span).coerceIn(0f, 1f)
@@ -235,49 +243,49 @@ fun AppSlider(
             contentAlignment = Alignment.Center,
         ) {
             Canvas(modifier = Modifier.fillMaxWidth().height(44.dp)) {
-            val cy = size.height / 2f
-            val startX = edge
-            val endX = size.width - edge
-            val radius = if (pressed) thumbActive else thumbIdle
-            val thumbX = startX + (endX - startX) * fraction
-            val lineWidth = if (pressed) trackThick else trackThin
+                val cy = size.height / 2f
+                val startX = edge
+                val endX = size.width - edge
+                val thumbX = startX + (endX - startX) * fraction
 
-            // 刻度：先画，被轨道覆盖中段，两端露出来当"齿"
-            if (intervals > 0) {
-                repeat(intervals + 1) { index ->
-                    val tx = startX + (endX - startX) * (index.toFloat() / intervals)
-                    drawLine(
-                        color = tickColor,
-                        start = Offset(tx, cy - tickHeight / 2f),
-                        end = Offset(tx, cy + tickHeight / 2f),
-                        strokeWidth = trackThin,
-                        cap = StrokeCap.Round,
-                    )
+                // 未选中轨道：整条先铺一遍，选中段盖上去
+                drawLine(
+                    color = inactiveTrack,
+                    start = Offset(startX, cy),
+                    end = Offset(endX, cy),
+                    strokeWidth = trackHeight,
+                    cap = StrokeCap.Round,
+                )
+                drawLine(
+                    color = if (enabled) activeColor else inactiveTrack,
+                    start = Offset(startX, cy),
+                    end = Offset(thumbX, cy),
+                    strokeWidth = trackHeight,
+                    cap = StrokeCap.Round,
+                )
+
+                // M3 的按下反馈：拇指周围一圈 40dp 的淡淡光晕，而不是把拇指放大
+                if (pressed && enabled) {
+                    drawCircle(color = haloColor, radius = haloRadius, center = Offset(thumbX, cy))
                 }
-            }
 
-            drawLine(
-                color = idleColor,
-                start = Offset(startX, cy),
-                end = Offset(endX, cy),
-                strokeWidth = lineWidth,
-                cap = StrokeCap.Round,
-            )
-            drawLine(
-                color = if (enabled) activeColor else idleColor,
-                start = Offset(startX, cy),
-                end = Offset(thumbX, cy),
-                strokeWidth = lineWidth,
-                cap = StrokeCap.Round,
-            )
+                // 刻度：小圆点压在轨道上，选中侧的用主色（M3 的 ticks 就是这个形态）
+                if (intervals > 0) {
+                    repeat(intervals + 1) { index ->
+                        val tx = startX + (endX - startX) * (index.toFloat() / intervals)
+                        drawCircle(
+                            color = if (tx <= thumbX) activeColor else tickColor,
+                            radius = tickRadius,
+                            center = Offset(tx, cy),
+                        )
+                    }
+                }
 
-            drawCircle(color = thumbFill, radius = radius, center = Offset(thumbX, cy))
-            drawCircle(
-                color = if (enabled) activeColor else idleColor,
-                radius = radius,
-                center = Offset(thumbX, cy),
-                style = Stroke(width = 1.5.dp.toPx()),
-            )
+                drawCircle(
+                    color = if (enabled) activeColor else inactiveTrack,
+                    radius = thumbRadius,
+                    center = Offset(thumbX, cy),
+                )
             }
         }
 
@@ -413,52 +421,38 @@ fun AppSwitch(
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
 ) {
-    val colors = LocalChatColors.current
     /*
-     * M3 的 switch 是 52×32。直接照搬会在这个偏窄的设置列里显得很大，
-     * 取 46×28：拇指 22dp ≥ 20dp 的可辨下限，轨道也够得着 48dp 触控区
-     * （外层的行本身有 48dp 高，触控面积由行给，不由开关自己给）。
+     * 直接用 M3 的 [Switch]，不再自绘。
+     *
+     * 原来那版是拿两个 Box 拼的（38×22 轨道 + 16dp 白圆），能跑，但：
+     * - 没有状态层（按下无水波纹 / 无 hover 反馈）；
+     * - 没有 M3 的拇指伸缩动画（未选中 16dp、选中 24dp）；
+     * - 选中态没有对勾，Android 用户看不出"这是开关"；
+     * - 触控区就是轨道本身，比 48dp 小。
+     *
+     * M3 的 Switch 这些都自带，尺寸也是标准的 52×32 —— 既然整个应用要换成
+     * 谷歌的视觉语言，控件本身就该用官方的，而不是"画得像"。
      */
-    val trackWidth = 46.dp
-    val trackHeight = 28.dp
-    val thumbSize = 22.dp
-    val padding = 3.dp
-
-    val thumbOffset by animateDpAsState(
-        targetValue = if (checked) trackWidth - thumbSize - padding else padding,
-        animationSpec = tween(SwitchThumbMs, easing = MotionEasing),
-        label = "switchThumb",
+    Switch(
+        checked = checked,
+        onCheckedChange = onCheckedChange,
+        modifier = modifier,
+        enabled = enabled,
+        thumbContent = if (checked) {
+            {
+                Icon(
+                    imageVector = AppIcons.Check,
+                    contentDescription = null,
+                    modifier = Modifier.size(SwitchDefaults.IconSize),
+                )
+            }
+        } else {
+            null
+        },
     )
-
-    val trackColor = when {
-        !enabled -> colors.divider
-        checked -> MaterialTheme.colorScheme.primary
-        // 关闭态的轨道用描边色而不是另一种灰：深色下才和卡片分得开
-        else -> colors.outline
-    }
-
-    Box(
-        modifier = modifier
-            .size(trackWidth, trackHeight)
-            .clip(PillShape)
-            .background(trackColor)
-            .toggleable(
-                value = checked,
-                enabled = enabled,
-                role = Role.Switch,
-                onValueChange = onCheckedChange,
-            ),
-        contentAlignment = Alignment.CenterStart,
-    ) {
-        Box(
-            modifier = Modifier
-                .padding(start = thumbOffset)
-                .size(thumbSize)
-                .clip(CircleShape)
-                .background(if (enabled) Color.White else colors.placeholder),
-        )
-    }
 }
+
+/** 滑块滑动时长。够看出"滑过去"，又不至于点完还等它。 */
 
 /** 滑块滑动时长。够看出"滑过去"，又不至于点完还等它。 */
 private const val SwitchThumbMs = 160

@@ -361,7 +361,7 @@
     <!-- ── Prompts sent to the model ─────────────────────── -->
     <string name="prompt_title_system">You name conversations. Summarise what this conversation is about in at most 5 words. Output the title only: no quotes, no book-title marks, no trailing punctuation, no explanation or prefix.</string>
     <string name="prompt_compact_system">You are a context compressor for long-form creative writing. Compress the conversation log the user gives you into a recap.\n\nAlways keep:\n1. Every character name, form of address, and changes in kinship and relationships\n2. Place names, times, and scene/setting details\n3. Key plot events that already happened, and their cause and effect\n4. Style conventions already established (person, point of view, tone, taboos)\n5. Foreshadowing and suspense not yet resolved\n\nRules:\n- Use declarative prose, not dialogue\n- Do not evaluate, do not continue the story, and do not write meta lines such as “this was a summary”\n- Keep it within 10% of the original length\n- Output the recap body directly</string>
-    <string name="prompt_current_time">Current time: %1$s</string>
+    <string name="prompt_current_time">(The current date and time is %1$s. Treat this as the reference for any question involving dates, times, weekdays, or relative expressions such as today, tomorrow or last week.)</string>
     <string name="prompt_recap_intro">Below is a recap of the earlier conversation, to keep settings and plot consistent. Do not repeat it; just continue.\n\n</string>
     <string name="prompt_compact_existing">[Existing recap]\n</string>
     <string name="prompt_compact_new">\n\n[New conversation since]\n</string>
@@ -482,6 +482,7 @@
     <string name="hist_rename_title">Rename conversation</string>
     <string name="hist_delete_title">Once deleted, this conversation cannot be recovered</string>
     <string name="hist_delete_body">All messages and versions in this conversation will be removed as well</string>
+    <string name="hist_delete_cloud">Also delete from cloud</string>
     <string name="hist_delete_confirm">Delete this conversation</string>
     <string name="hist_delete_selected_title">Once deleted, these %1$d conversations cannot be recovered</string>
     <string name="hist_delete_selected_body">All their messages and versions will be removed as well</string>
@@ -614,6 +615,8 @@
     <string name="vault_remove_action">Remove from vault</string>
     <string name="vault_not_encrypted">The vault hides the UI only; the database is not encrypted.</string>
     <!-- ── Sync (WebDAV) ────────────────────────────────── -->
+    <string name="sync_status_on">Configured</string>
+    <string name="sync_status_off">Not configured</string>
     <string name="settings_sync">Cloud sync</string>
     <string name="settings_sync_summary">WebDAV (Nutstore / Nextcloud)</string>
     <string name="settings_group_sync">Sync</string>

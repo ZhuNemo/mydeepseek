@@ -236,38 +236,81 @@ private fun buildScheme(
      * 因为另一个在拦着。现在只留「主题色」，推导方式由这里固定。
      *
      * 为什么是 Fidelity 而不是默认的 TonalSpot：
-     *
-     * - TonalSpot 会把 primary 的 chroma **钳到 36**（MCU 的"克制"策略），
-     *   于是 #4D6BFE 这种本身很艳的品牌色被洗成灰蓝 —— 就是"饱和度不够"的根源。
-     * - Fidelity 直接用 seed 自己的 hue + chroma，出来的就是品牌色本身，
-     *   深色下也不会突然褪色。
-     * - 选它而不是 Vibrant：Vibrant 会给低饱和 seed（比如「灰」主题色）
-     *   强行加色，灰变成蓝灰，反而不对。
+     * TonalSpot 会把 primary 的 chroma **钳到 36**，于是 #4D6BFE 这种本身很艳的
+     * 品牌色被洗成灰蓝 —— 那正是"饱和度不够"的根源。Fidelity 直接用 seed 的
+     * hue + chroma；不用 Vibrant 是因为它会给「灰」这种低饱和 seed 强行加色。
      */
     val base = dynamicColorScheme(
         seedColor = seed,
         isDark = dark,
         style = PaletteStyle.Fidelity,
     )
-    if (!dark || !pureBlack) return base
 
     /*
-     * 纯黑模式：**只把中性底压到纯黑**，品牌色不动。
+     * ══════════════════════════════════════════════════════════
+     *  **中性色一律收归中性**：主题色只染"本来就有颜色的东西"
+     * ══════════════════════════════════════════════════════════
      *
-     * 不能整体替换成 `surface = Black` —— M3 的层次全靠 surfaceContainer 那几档
-     * 的明度差（卡片浮在页面上、菜单浮在卡片上）。全部压成 #000 之后，
-     * 所有容器连成一片，界面会"糊"掉。这里保留 6 档微差（#000 → #222）。
+     * MCU 生成的是**整套**色板：不只 primary 带色，连 background / surface /
+     * outline / onSurface 都是"带一点点色相的中性色"。Material 自己的演示里
+     * 这很协调，但在这里用户看到的是"整个界面都被染色了" —— 换个主题色，
+     * 背景和卡片跟着泛蓝 / 泛绿。
+     *
+     * 覆盖规则：
+     * - **保留** base 的 primary / secondary / tertiary / error 及其容器与 on*
+     * - **覆盖** 所有中性角色（背景、表面、描边、正文色）为固定灰阶
+     *
+     * 结果：背景永远纯白（浅色）/ 纯黑或近黑（深色），卡片是中性灰，
+     * 只有按钮、选中态、用户气泡、开关这些本来有颜色的地方跟着主题色变。
+     *
+     * `surfaceTint` 一起覆盖成透明：M3 用它给 elevated 表面叠色，
+     * 保留的话卡片会泛出主题色 —— 正是要避免的。
      */
-    return base.copy(
-        background = Color.Black,
-        surface = Color.Black,
-        surfaceVariant = Color(0xFF1E1E1E),
-        surfaceContainerLowest = Color.Black,
-        surfaceContainerLow = Color(0xFF0A0A0A),
-        surfaceContainer = Color(0xFF121212),
-        surfaceContainerHigh = Color(0xFF1A1A1A),
-        surfaceContainerHighest = Color(0xFF222222),
-    )
+    return if (dark) {
+        base.copy(
+            background = if (pureBlack) Color.Black else Color(0xFF0E0E10),
+            surface = if (pureBlack) Color.Black else Color(0xFF0E0E10),
+            surfaceDim = if (pureBlack) Color.Black else Color(0xFF0B0B0D),
+            surfaceBright = Color(0xFF3A3A3E),
+            surfaceVariant = Color(0xFF1E1F22),
+            surfaceContainerLowest = if (pureBlack) Color.Black else Color(0xFF09090B),
+            surfaceContainerLow = if (pureBlack) Color(0xFF080808) else Color(0xFF141417),
+            surfaceContainer = if (pureBlack) Color(0xFF101010) else Color(0xFF1A1A1E),
+            surfaceContainerHigh = if (pureBlack) Color(0xFF181818) else Color(0xFF222226),
+            surfaceContainerHighest = if (pureBlack) Color(0xFF202020) else Color(0xFF2A2A2F),
+            surfaceTint = Color.Transparent,
+            onBackground = Color(0xFFE9E9EC),
+            onSurface = Color(0xFFE9E9EC),
+            onSurfaceVariant = Color(0xFF9DA2AB),
+            outline = Color(0xFF3C3F45),
+            outlineVariant = Color(0xFF2A2C31),
+            inverseSurface = Color(0xFFE9E9EC),
+            inverseOnSurface = Color(0xFF17181B),
+            scrim = Color.Black,
+        )
+    } else {
+        base.copy(
+            background = Color.White,
+            surface = Color.White,
+            surfaceDim = Color(0xFFDDDEE2),
+            surfaceBright = Color.White,
+            surfaceVariant = Color(0xFFF1F2F4),
+            surfaceContainerLowest = Color.White,
+            surfaceContainerLow = Color(0xFFF8F8FA),
+            surfaceContainer = Color(0xFFF2F3F5),
+            surfaceContainerHigh = Color(0xFFEBECEF),
+            surfaceContainerHighest = Color(0xFFE4E5E9),
+            surfaceTint = Color.Transparent,
+            onBackground = Color(0xFF17181B),
+            onSurface = Color(0xFF17181B),
+            onSurfaceVariant = Color(0xFF5B6068),
+            outline = Color(0xFF8B8F97),
+            outlineVariant = Color(0xFFE3E4E8),
+            inverseSurface = Color(0xFF303135),
+            inverseOnSurface = Color(0xFFF4F4F6),
+            scrim = Color.Black,
+        )
+    }
 }
 
 @Composable

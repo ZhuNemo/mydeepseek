@@ -13,13 +13,19 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
@@ -34,6 +40,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
@@ -146,6 +153,8 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
 
     var renameTarget by remember { mutableStateOf<ConversationEntity?>(null) }
     var deleteTarget by remember { mutableStateOf<ConversationEntity?>(null) }
+    /** 删除时是否连云端一起删。默认勾选 —— 只删本地的话下次同步就回来了。 */
+    var deleteFromCloud by remember { mutableStateOf(true) }
     var hideTarget by remember { mutableStateOf<ConversationEntity?>(null) }
     val vaultCoroutine = rememberCoroutineScope()
     val storedSettings by container.settingsStore.flow
@@ -474,11 +483,41 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
     }
 
     deleteTarget?.let { target ->
+        // 每次打开都回到"勾选"：上一次的取消不该成为下一次的默认
+        LaunchedEffect(target.id) { deleteFromCloud = true }
+
         AppConfirmDialog(
             title = stringResource(R.string.hist_delete_title),
             message = stringResource(R.string.hist_delete_body),
             confirmText = stringResource(R.string.hist_delete_confirm),
             destructive = true,
+            /*
+             * 只有配了同步的人才看到这个勾选框。
+             *
+             * 没配 WebDAV 的用户看到"同时删除云端记录"只会困惑：什么云端？
+             * 他从没设过。所以这一项跟着 [StoredSettings.syncConfigured] 显隐。
+             */
+            extraContent = if (storedSettings.syncConfigured) {
+                {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Checkbox(
+                            checked = deleteFromCloud,
+                            onCheckedChange = { deleteFromCloud = it },
+                        )
+                        Text(
+                            text = stringResource(R.string.hist_delete_cloud),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(start = 4.dp),
+                        )
+                    }
+                }
+            } else {
+                null
+            },
             onDismiss = { deleteTarget = null },
             onConfirm = {
                 // 删的正是当前正在看的会话 → 立刻回到空态，
@@ -487,6 +526,15 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
                     chatViewModel.newConversation()
                 }
                 historyViewModel.delete(target.id)
+                /*
+                 * 云端删除走后台：它是网络操作，不该让"删除"这个动作等它。
+                 * 失败也只是下次同步又出现（见 deleteRemoteConversations 的说明）。
+                 */
+                if (storedSettings.syncConfigured && deleteFromCloud) {
+                    vaultCoroutine.launch {
+                        container.syncManager.deleteRemoteConversations(setOf(target.id))
+                    }
+                }
                 deleteTarget = null
             },
         )

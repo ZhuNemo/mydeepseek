@@ -1019,10 +1019,11 @@ private fun RootPage(
             icon = AppIcons.Cloud,
             label = stringResource(R.string.settings_sync),
             // 只给"配没配"，不显示地址 —— 那一行是给人扫一眼的，不是配置面板
+            // 只给状态，不给协议名 —— 那一行是"扫一眼"用的，详情在二级页
             value = if (stored.syncConfigured) {
-                stringResource(R.string.settings_sync_summary)
+                stringResource(R.string.sync_status_on)
             } else {
-                stringResource(R.string.api_key_unset)
+                stringResource(R.string.sync_status_off)
             },
             onClick = { onOpen(SettingsPage.SYNC) },
         )
@@ -1181,7 +1182,16 @@ private fun RootPage(
         SettingsNavRow(
             icon = AppIcons.Volume,
             label = stringResource(R.string.tts_voice),
-            value = stored.ttsVoiceLabel.ifBlank { stringResource(R.string.tts_voice_default) },
+            /*
+             * 只显示音色名。
+             *
+             * 完整标签是「Tide（男声 · DeepSeek 官方）」这种，在列表行里放不下，
+             * 截断成「Tide（男…」既难看也没信息量。括号里的内容在二级页完整可看。
+             */
+            value = stored.ttsVoiceLabel
+                .substringBefore("（")
+                .trim()
+                .ifBlank { stringResource(R.string.tts_voice_default) },
             onClick = { onOpen(SettingsPage.VOICE) },
         )
     }
@@ -2607,11 +2617,11 @@ private fun AccentSwatch(
 /**
  * 右侧值分到的宽度权重（标题是 1）。
  *
- * 0.62 ≈ 标题 62% / 值 38%：手机宽度下标题能完整显示四到六个汉字，
- * 足够覆盖「云端同步」「朗读音色」这类标题；值那边放"跟随系统""简体中文"也够，
- * 更长的（WebDAV 地址、音色名）走省略号。
+ * 0.5 ≈ 标题 2/3 / 值 1/3：手机宽度下标题能完整显示六到八个汉字，
+ * 「云端同步」「朗读音色」「自动折叠思考内容」都在安全区内；
+ * 值那边放"跟随系统""简体中文""已配置"也够。
  */
-private const val ValueWeight = 0.62f
+private const val ValueWeight = 0.5f
 
 @Composable
 fun SettingsNavRow(
@@ -2673,10 +2683,14 @@ fun SettingsNavRow(
                  *
                  * 固定 200dp 的问题与上面同源：它只看自己，不看标题还剩多少。
                  * 比例分配把"标题 vs 值"变成一个确定的分割，无论屏幕多窄，
-                 * 标题都能拿到约 62% 的宽度；`fill = false` 让短值按内容收缩，
-                 * 不会把右边顶出一块空白。
+                 * 标题都能拿到约 2/3 的宽度。
+                 *
+                 * ⚠️ 必须是 `fill = true`（默认）：`fill = false` 时短值只占内容宽，
+                 * 它后面的剩余空间**不会还给标题**，而是变成值右侧的一块空隙 ——
+                 * 表现就是"值和箭头没贴到右边"。填充之后，`textAlign = End`
+                 * 让文字紧贴箭头左侧，右边线始终整齐。
                  */
-                modifier = Modifier.weight(ValueWeight, fill = false),
+                modifier = Modifier.weight(ValueWeight),
             )
         }
         Icon(
