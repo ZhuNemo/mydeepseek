@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /** 同步进行到哪一步（界面据此给一句话 + 一个转圈）。 */
@@ -154,7 +155,7 @@ class SyncManager(
     suspend fun deleteRemoteConversations(ids: Set<String>) {
         if (ids.isEmpty()) return
         withContext(Dispatchers.IO) {
-            val stored = settingsStore.current()
+            val stored = settings.current()
             if (!stored.syncConfigured) return@withContext
             val config = stored.davConfig()
             val root = stored.davPath
