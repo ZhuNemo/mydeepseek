@@ -104,6 +104,10 @@ fun HistoryDrawerContent(
     onPinSelected: (Boolean) -> Unit,
     onDeleteSelected: () -> Unit,
     onOpenSettings: () -> Unit,
+    /** 打开保险箱（解锁界面）。 */
+    onOpenVault: () -> Unit = {},
+    /** 把某条会话移入保险箱；确认弹窗由调用方负责。 */
+    onHide: (ConversationEntity) -> Unit = {},
     /**
      * 下拉刷新：触发一次云同步。
      *
@@ -183,6 +187,7 @@ fun HistoryDrawerContent(
                                 onRename = { onRename(conversation) },
                                 onTogglePin = { onTogglePin(conversation) },
                                 onDelete = { onDelete(conversation) },
+                            onHide = { onHide(conversation) },
                             )
                         }
                     }
@@ -206,6 +211,27 @@ fun HistoryDrawerContent(
                 onCancel = onExitSelection,
             )
         } else {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onOpenVault)
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Icon(
+                    imageVector = AppIcons.Lock,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.size(21.dp),
+                )
+                Text(
+                    text = stringResource(R.string.vault_open),
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+            }
+
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -385,6 +411,8 @@ internal fun ConversationRow(
     onRename: () -> Unit,
     onTogglePin: () -> Unit,
     onDelete: () -> Unit,
+    /** 移入保险箱。搜索页不给这个动作 —— 那里是"找东西"，不是"整理"。 */
+    onHide: () -> Unit = {},
     highlightQuery: String = "",
     /** 搜索命中正文时的一行片段；仅标题命中时为 null。 */
     snippet: String? = null,
@@ -507,6 +535,11 @@ internal fun ConversationRow(
             }
             // 分隔线固定接在危险操作之前 —— 结构不随数据变化
             AppMenuDivider()
+            AppMenuItem(stringResource(R.string.vault_hide_action), AppIcons.Lock) {
+                menuOpen = false
+                onHide()
+            }
+
             AppMenuItem(stringResource(R.string.action_delete), AppIcons.Trash, destructive = true) {
                 menuOpen = false
                 onDelete()

@@ -113,6 +113,23 @@ data class StoredSettings(
     val themeModeId: String = "SYSTEM",
     /** 主题色：AccentColor.name，见 ui/theme/Theme.kt。 */
     val accentColorId: String = "BLUE",
+    /**
+     * M3 调色板样式（Material Color Utilities 的 scheme 变体）。
+     *
+     * 存枚举名而不是序号：以后增删中间档位时，老配置不会整体错位。
+     */
+    val paletteStyleId: String = "TonalSpot",
+    /** 深色模式下把中性底压到纯黑（OLED）。只影响中性色，品牌色不动。 */
+    val pureBlack: Boolean = false,
+
+    // ── 保险箱 ───────────────────────────────────────────
+    /** PIN 的 PBKDF2 哈希与 salt（Base64）。空 = 还没设过 PIN。 */
+    val vaultPinHash: String = "",
+    val vaultPinSalt: String = "",
+    /** 密保问题（明文，要显示给用户看）。 */
+    val vaultQuestion: String = "",
+    val vaultAnswerHash: String = "",
+    val vaultAnswerSalt: String = "",
     /** 字号倍率。 */
     val fontScale: Float = 1.0f,
     /** 字号是否跟随系统辅助功能设置。 */
@@ -202,6 +219,13 @@ data class StoredSettings(
     /** 当前通道是否支持联网搜索。 */
     val supportsWebSearch: Boolean get() = resolvedApiStyle == ApiStyle.ANTHROPIC
 
+    /** 是否已经设过保险箱 PIN。没设过时第一次进保险箱要引导设置。 */
+    val hasVaultPin: Boolean get() = vaultPinHash.isNotBlank() && vaultPinSalt.isNotBlank()
+
+    /** 是否配过密保问题（用于忘记 PIN 后重置）。 */
+    val hasVaultRecovery: Boolean
+        get() = vaultQuestion.isNotBlank() && vaultAnswerHash.isNotBlank() && vaultAnswerSalt.isNotBlank()
+
     /** 同步配置是否填全（三样缺一不可）。 */
     val syncConfigured: Boolean
         get() = davUrl.isNotBlank() && davUser.isNotBlank() && davPassword.isNotBlank()
@@ -236,6 +260,13 @@ class SettingsStore(
             maxTokens = prefs[Keys.MAX_TOKENS] ?: StoredSettings().maxTokens,
             themeModeId = prefs[Keys.THEME_MODE] ?: StoredSettings().themeModeId,
             accentColorId = prefs[Keys.ACCENT_COLOR] ?: StoredSettings().accentColorId,
+            paletteStyleId = prefs[Keys.PALETTE_STYLE] ?: StoredSettings().paletteStyleId,
+            pureBlack = prefs[Keys.PURE_BLACK] ?: StoredSettings().pureBlack,
+            vaultPinHash = prefs[Keys.VAULT_PIN_HASH].orEmpty(),
+            vaultPinSalt = prefs[Keys.VAULT_PIN_SALT].orEmpty(),
+            vaultQuestion = prefs[Keys.VAULT_QUESTION].orEmpty(),
+            vaultAnswerHash = prefs[Keys.VAULT_ANSWER_HASH].orEmpty(),
+            vaultAnswerSalt = prefs[Keys.VAULT_ANSWER_SALT].orEmpty(),
             fontScale = prefs[Keys.FONT_SCALE] ?: StoredSettings().fontScale,
             followSystemFont = prefs[Keys.FOLLOW_SYSTEM_FONT]
                 ?: StoredSettings().followSystemFont,
@@ -399,6 +430,51 @@ class SettingsStore(
 
     suspend fun setThemeMode(modeId: String) {
         preferences.edit { it[Keys.THEME_MODE] = modeId }
+    }
+
+    // ── 保险箱 ───────────────────────────────────────────
+
+    /** 设置（或更换）PIN。salt 一起换 —— 复用旧 salt 会让两次设置的哈希可比。 */
+    suspend fun setVaultPin(pin: String) {
+        val salt = VaultCredentials.newSalt()
+        val hash = VaultCredentials.hash(pin, salt)
+        context.settingsDataStore.edit {
+            it[Keys.VAULT_PIN_SALT] = salt
+            it[Keys.VAULT_PIN_HASH] = hash
+        }
+    }
+
+    /** 密保问题与答案。答案只在设置时哈希一次，之后永不回显。 */
+    suspend fun setVaultRecovery(question: String, answer: String) {
+        val salt = VaultCredentials.newSalt()
+        val hash = VaultCredentials.hash(answer, salt)
+        context.settingsDataStore.edit {
+            it[Keys.VAULT_QUESTION] = question.trim()
+            it[Keys.VAULT_ANSWER_SALT] = salt
+            it[Keys.VAULT_ANSWER_HASH] = hash
+        }
+    }
+
+    /** 校验 PIN。命中返回 true。计算在调用方线程，PBKDF2 要一两百毫秒 —— 记得放 IO。 */
+    suspend fun verifyVaultPin(pin: String): Boolean {
+        val current = flow.first()
+        if (!current.hasVaultPin) return false
+        return VaultCredentials.matches(pin, current.vaultPinSalt, current.vaultPinHash)
+    }
+
+    /** 校验密保答案。 */
+    suspend fun verifyVaultAnswer(answer: String): Boolean {
+        val current = flow.first()
+        if (!current.hasVaultRecovery) return false
+        return VaultCredentials.matches(answer.trim(), current.vaultAnswerSalt, current.vaultAnswerHash)
+    }
+
+    suspend fun setPaletteStyle(styleId: String) {
+        context.settingsDataStore.edit { it[Keys.PALETTE_STYLE] = styleId }
+    }
+
+    suspend fun setPureBlack(enabled: Boolean) {
+        context.settingsDataStore.edit { it[Keys.PURE_BLACK] = enabled }
     }
 
     suspend fun setAccentColor(colorId: String) {
@@ -615,6 +691,15 @@ class SettingsStore(
         val MAX_TOKENS = intPreferencesKey("max_tokens")
         val THEME_MODE = stringPreferencesKey("theme_mode")
         val ACCENT_COLOR = stringPreferencesKey("accent_color")
+        val PALETTE_STYLE = stringPreferencesKey("palette_style")
+        val PURE_BLACK = booleanPreferencesKey("pure_black")
+
+        // ── 保险箱 ──────────────────────────────────────
+        val VAULT_PIN_HASH = stringPreferencesKey("vault_pin_hash")
+        val VAULT_PIN_SALT = stringPreferencesKey("vault_pin_salt")
+        val VAULT_QUESTION = stringPreferencesKey("vault_question")
+        val VAULT_ANSWER_HASH = stringPreferencesKey("vault_answer_hash")
+        val VAULT_ANSWER_SALT = stringPreferencesKey("vault_answer_salt")
         val FONT_SCALE = floatPreferencesKey("font_scale")
         val FOLLOW_SYSTEM_FONT = booleanPreferencesKey("follow_system_font")
         val AUTO_COLLAPSE_THINKING = booleanPreferencesKey("auto_collapse_thinking")

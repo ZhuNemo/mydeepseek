@@ -82,6 +82,25 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
     fun observeConversations(): Flow<List<ConversationEntity>> = conversations.observeAll()
 
     /**
+     * 保险箱里的会话。
+     *
+     * 单独一个 Flow 而不是给 [observeConversations] 加参数：列表页与保险箱页
+     * 是两条互斥的 UI 路径，"要不要看到隐藏的"不该是运行时开关 ——
+     * 那样一次误传参数就把保险箱内容摆到主列表上。
+     */
+    fun observeHiddenConversations(): Flow<List<ConversationEntity>> = conversations.observeHidden()
+
+    /**
+     * 进出保险箱。
+     *
+     * 会顺带把 `updatedAt` 推到当前时间 —— 列表按它排序，刚藏进去的会话
+     * 下次解锁时应当排在最前，而不是沉到一年前的位置。
+     */
+    suspend fun setConversationHidden(id: String, hidden: Boolean) {
+        conversations.setHidden(id, hidden, System.currentTimeMillis())
+    }
+
+    /**
      * 观察**单个会话**。
      *
      * 存在的理由只有一个：让「标题」有唯一真相。
@@ -1316,6 +1335,15 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
      */
     internal suspend fun backupConversationForSync(id: String): BackupConversation? {
         val row = conversations.findById(id) ?: return null
+        /*
+         * 保险箱不参与云同步。
+         *
+         * `syncStamps()` 那层已经在 SQL 里过滤过一次，这里再挡一道：
+         * 同步是从"清单"驱动的，而清单与取内容之间隔着一次挂起 ——
+         * 用户完全可能在这中间把某条会话拖进保险箱。少这一道，
+         * 那次同步就会把它传上云，而且再也收不回来。
+         */
+        if (row.hidden) return null
         return row.toBackup(
             messages = loadMessagesSafely(id),
             presetIds = conversationPresets.getFor(id)
@@ -1702,6 +1730,7 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
                 updatedAt = conversation.updatedAt,
                 pinned = conversation.pinned,
                 pinnedAt = conversation.pinnedAt,
+                hidden = conversation.hidden,
             ),
         )
         return PreparedConversation(conversation, remapId)

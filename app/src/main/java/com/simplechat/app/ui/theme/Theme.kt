@@ -2,6 +2,10 @@ package com.simplechat.app.ui.theme
 
 import androidx.annotation.StringRes
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.runtime.remember
+import androidx.compose.ui.graphics.luminance
+import com.materialkolor.PaletteStyle
+import com.materialkolor.dynamicColorScheme
 import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
@@ -158,19 +162,44 @@ private val DarkChatColors = ChatColors(
 val LocalChatColors = staticCompositionLocalOf { LightChatColors }
 
 /**
- * 把主题色套到基础色板上。
+ * 从 M3 的 [ColorScheme] 派生出这个应用自己的语义色板。
  *
- * 只换两处"品牌色表面"：**选中态填充**与**用户气泡**。
- * 它们原来是写死的淡蓝（`CapsuleSelectedLight` / `UserBubbleLight`），
- * 换成绿色主题后若还留着蓝，一眼就是"没换干净"。
+ * ### 为什么保留 [ChatColors] 这一层，而不是让界面直接用 `MaterialTheme.colorScheme`
+ *
+ * 界面上有 123 处 `LocalChatColors.current.xxx`。直接换成语义化程度更低的
+ * `colorScheme.surfaceContainerHigh` 之类，等于把 123 个调用点连同它们的
+ * **业务含义**（"这是气泡"、"这是输入框底"）一起重写 —— 改完没人知道
+ * 某个地方为什么是那个颜色。保留这一层，映射关系只在这一个函数里，
+ * 换主题体系时也只改这里。
+ *
+ * 映射原则：**先找语义最接近的 M3 角色，找不到才用固定色**。
+ * 目前只有 `warning` 与 `scrim` 是固定的 —— M3 没有"警告"角色，
+ * 而 `scrim` 需要按明暗分别取值（用 `colorScheme.scrim` 在深色下盖在近黑底上等于没有）。
  */
-private fun chatColors(dark: Boolean, accent: AccentColor): ChatColors {
-    val tint = tintOf(accent.primary(dark), dark)
-    return (if (dark) DarkChatColors else LightChatColors).copy(
-        userBubble = tint,
-        capsuleSelected = tint,
-    )
-}
+private fun chatColors(scheme: ColorScheme): ChatColors = ChatColors(
+    // 用户气泡走 primaryContainer：浅品牌底 + 深品牌字，正是 M3 的"强调容器"语义
+    userBubble = scheme.primaryContainer,
+    onUserBubble = scheme.onPrimaryContainer,
+    processText = scheme.onSurfaceVariant,
+    processBar = scheme.outlineVariant,
+    placeholder = scheme.onSurfaceVariant,
+    pageBackground = scheme.background,
+    settingsBackground = scheme.surface,
+    card = scheme.surfaceContainer,
+    outline = scheme.outlineVariant,
+    divider = scheme.outlineVariant.copy(alpha = 0.7f),
+    danger = scheme.error,
+    // M3 没有"警告"角色；tertiary 是品牌色的第三档，用来提示"注意"语义会串
+    warning = WarningAmber,
+    capsuleSelected = scheme.secondaryContainer,
+    fieldBackground = scheme.surfaceContainerHighest,
+    menuBackground = scheme.surfaceContainerHigh,
+    markdownCodeBlock = scheme.surfaceContainerHighest,
+    markdownInlineCode = scheme.surfaceContainerHigh,
+    markdownQuoteBar = scheme.primary,
+    markdownRule = scheme.outlineVariant,
+    scrim = Color.Black.copy(alpha = if (scheme.background.luminance() > 0.5f) 0.45f else 0.62f),
+)
 
 /**
  * 当前是不是深色。
@@ -184,73 +213,57 @@ private fun chatColors(dark: Boolean, accent: AccentColor): ChatColors {
 val LocalIsDarkTheme = staticCompositionLocalOf { false }
 
 /**
- * 品牌色色板。
+ * 用 Material Color Utilities 生成整套 M3 色板。
  *
- * **刻意不做动态取色（Monet / 莫奈取色）。**
+ * 关键：**seed 只有一个**（取浅色那档的品牌色）。早先的写法给深浅两套颜色，
+ * 那是手调色板的思路；MCU 的 tonal palette 是从**单一 seed** 推导出
+ * 0–100 的明度阶梯，深浅模式各取不同档位 —— 给它两个 seed 等于让它算两遍，
+ * 深色下的主色会与浅色下的色相漂移。
  *
- * 动态取色会把背景、表面、描边全部染上壁纸的颜色 —— 阅读类应用里
- * 正文底色的色偏直接影响长时间阅读的舒适度，而"跟随壁纸"并不带来
- * 任何功能价值，只是让界面看起来像别人的应用。
- *
- * 这里要的是**稳定的中性底 + 一个**（由用户在设置里选定的）**品牌色**：
- * 正文区永远是干净的近白 / 近黑，品牌色永远可辨认 —— 换的只是**色相**，
- * 而不是"跟着壁纸跑"。见 [AccentColor]。
+ * [style] 对应设置页「调色板样式」：TonalSpot（默认，最克制）/ Vibrant /
+ * Expressive / Neutral / Monochrome / Fidelity / Content / Rainbow / FruitSalad。
  */
-private fun staticScheme(dark: Boolean, accent: AccentColor): ColorScheme {
-    val primary = accent.primary(dark)
-    val tint = tintOf(primary, dark)
-    return if (dark) {
-        darkColorScheme(
-            primary = primary,
-            onPrimary = Color.White,
-            primaryContainer = tint,
-            onPrimaryContainer = primary,
-            background = PageBgDark,
-            onBackground = TextPrimaryDark,
-            surface = CardDark,
-            onSurface = TextPrimaryDark,
-            surfaceVariant = FieldBgDark,
-            onSurfaceVariant = TextSecondaryDark,
-            outline = OutlineDark,
-            outlineVariant = DividerDark,
-            error = DangerRedDark,
-            onError = Color.White,
-        )
-    } else {
-        lightColorScheme(
-            primary = primary,
-            onPrimary = Color.White,
-            primaryContainer = tint,
-            onPrimaryContainer = primary,
-            background = PageBgLight,
-            onBackground = TextPrimaryLight,
-            surface = CardLight,
-            onSurface = TextPrimaryLight,
-            surfaceVariant = FieldBgLight,
-            onSurfaceVariant = TextSecondaryLight,
-            outline = OutlineLight,
-            outlineVariant = DividerLight,
-            error = DangerRed,
-            onError = Color.White,
-        )
-    }
+private fun buildScheme(
+    dark: Boolean,
+    seed: Color,
+    style: PaletteStyle,
+    pureBlack: Boolean,
+): ColorScheme {
+    val base = dynamicColorScheme(
+        seedColor = seed,
+        isDark = dark,
+        style = style,
+    )
+    if (!dark || !pureBlack) return base
+
+    /*
+     * 纯黑模式：**只把中性底压到纯黑**，品牌色不动。
+     *
+     * 不能整体替换成 `surface = Black` —— M3 的层次全靠 surfaceContainer 那几档
+     * 的明度差（卡片浮在页面上、菜单浮在卡片上）。全部压成 #000 之后，
+     * 所有容器连成一片，界面会"糊"掉。这里保留 6 档微差（#000 → #222）。
+     */
+    return base.copy(
+        background = Color.Black,
+        surface = Color.Black,
+        surfaceVariant = Color(0xFF1E1E1E),
+        surfaceContainerLowest = Color.Black,
+        surfaceContainerLow = Color(0xFF0A0A0A),
+        surfaceContainer = Color(0xFF121212),
+        surfaceContainerHigh = Color(0xFF1A1A1A),
+        surfaceContainerHighest = Color(0xFF222222),
+    )
 }
 
-/**
- * @param accent 主题色（设置页「个性化 → 主题色」）。只影响品牌色那一族，
- *   页面底色与功能色不动 —— 见 [AccentColor]。
- * @param fontScale 全局字号倍率（设置页「字体大小」）。
- *
- * 用 `LocalDensity.fontScale` 实现，而不是逐个改 `TextStyle`：
- * `sp` 换算受影响、`dp` 布局不受影响 —— 正是"只调字号"的语义，
- * 且对 `MarkdownBodyStyle`、`CodeTextStyle` 这些散落的样式一并生效，
- * 不会漏改。
- */
 @Composable
 fun SimpleChatTheme(
     themeMode: ThemeMode = ThemeMode.SYSTEM,
     accent: AccentColor = AccentColor.BLUE,
     fontScale: Float = 1f,
+    /** 调色板样式（M3 tonal palette 的推导方式）。 */
+    paletteStyle: PaletteStyle = PaletteStyle.TonalSpot,
+    /** 深色下把中性底压到纯黑（OLED 省电 / 观感）。 */
+    pureBlack: Boolean = false,
     content: @Composable () -> Unit,
 ) {
     val dark = when (themeMode) {
@@ -259,12 +272,24 @@ fun SimpleChatTheme(
         ThemeMode.DARK -> true
     }
 
-    val scheme = staticScheme(dark, accent)
+    /*
+     * 色板按 (seed, 明暗, style, 纯黑) 缓存：生成一整套 tonal palette 要跑
+     * 完整的 HCT 色彩空间换算，比一次重组贵得多 —— 不缓存的话每次重组都重算。
+     */
+    val scheme = remember(dark, accent, paletteStyle, pureBlack) {
+        buildScheme(
+            dark = dark,
+            seed = accent.primary(dark = false),
+            style = paletteStyle,
+            pureBlack = pureBlack,
+        )
+    }
+    val colors = remember(scheme) { chatColors(scheme) }
 
     val baseDensity = LocalDensity.current
 
     CompositionLocalProvider(
-        LocalChatColors provides chatColors(dark, accent),
+        LocalChatColors provides colors,
         LocalIsDarkTheme provides dark,
         LocalDensity provides Density(
             density = baseDensity.density,

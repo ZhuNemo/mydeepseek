@@ -47,6 +47,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.simplechat.app.data.StoredSettings
 import com.simplechat.app.App
 import com.simplechat.app.R
 import com.simplechat.app.db.ConversationEntity
@@ -63,6 +64,7 @@ import com.simplechat.app.ui.history.ConversationSearchPage
 import com.simplechat.app.ui.history.HistoryDrawerContent
 import com.simplechat.app.ui.history.HistoryViewModel
 import com.simplechat.app.ui.history.searchResultKey
+import com.simplechat.app.ui.vault.VaultScreen
 import com.simplechat.app.ui.settings.SettingsScreen
 import com.simplechat.app.ui.theme.LocalChatColors
 import kotlinx.coroutines.launch
@@ -78,6 +80,8 @@ import kotlinx.coroutines.launch
 private enum class Route(val depth: Int) {
     CHAT(0),
     SETTINGS(1),
+    /** 保险箱（解锁后是列表）。 */
+    VAULT(1),
 }
 
 /** 抽屉平时的宽度。 */
@@ -142,6 +146,12 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
 
     var renameTarget by remember { mutableStateOf<ConversationEntity?>(null) }
     var deleteTarget by remember { mutableStateOf<ConversationEntity?>(null) }
+    var hideTarget by remember { mutableStateOf<ConversationEntity?>(null) }
+    val vaultCoroutine = rememberCoroutineScope()
+    val storedSettings by container.settingsStore.flow
+        .collectAsStateWithLifecycle(initialValue = StoredSettings())
+    val vaultConversations by remember { container.chatRepository.observeHiddenConversations() }
+        .collectAsStateWithLifecycle(initialValue = emptyList())
     var confirmBatchDelete by remember { mutableStateOf(false) }
 
     // 首次进入播种内置预设
@@ -339,6 +349,11 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
                              */
                             onRefresh = { container.syncManager.startSync() },
                             refreshing = syncState.running,
+                            onOpenVault = {
+                                closeDrawer()
+                                route = Route.VAULT
+                            },
+                            onHide = { hideTarget = it },
                         )
                     }
                 }
@@ -374,6 +389,21 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
                                 searchMode = false
                                 historyViewModel.updateQuery("")
                                 chatViewModel.newConversation()
+                            },
+                        )
+
+                        Route.VAULT -> VaultScreen(
+                            stored = storedSettings,
+                            conversations = vaultConversations,
+                            onBack = { route = Route.CHAT },
+                            onOpenConversation = { id ->
+                                route = Route.CHAT
+                                chatViewModel.openConversation(id)
+                            },
+                            onVerifyPin = { pin -> container.settingsStore.verifyVaultPin(pin) },
+                            onSetPin = { pin -> container.settingsStore.setVaultPin(pin) },
+                            onVerifyAnswer = { answer ->
+                                container.settingsStore.verifyVaultAnswer(answer)
                             },
                         )
 
@@ -420,6 +450,25 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
             onConfirm = { value ->
                 historyViewModel.rename(target.id, value)
                 renameTarget = null
+            },
+        )
+    }
+
+    hideTarget?.let { target ->
+        AppConfirmDialog(
+            title = stringResource(R.string.vault_hide_title),
+            message = stringResource(
+                R.string.vault_hide_body,
+                target.title.ifBlank { stringResource(R.string.conversation_default_title) },
+            ),
+            confirmText = stringResource(R.string.vault_hide_action),
+            onDismiss = { hideTarget = null },
+            onConfirm = {
+                val id = target.id
+                hideTarget = null
+                // 藏起来的正是当前会话 → 先回空态，否则对话页会挂着一条从列表里消失的会话
+                if (chatViewModel.currentConversationId == id) chatViewModel.newConversation()
+                vaultCoroutine.launch { container.chatRepository.setConversationHidden(id, true) }
             },
         )
     }

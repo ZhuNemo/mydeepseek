@@ -16,11 +16,27 @@ interface ConversationDao {
     @Query(
         """
         SELECT * FROM conversations
+        WHERE hidden = 0
         ORDER BY pinned DESC,
                  CASE WHEN pinned THEN pinnedAt ELSE updatedAt END DESC
         """,
     )
     fun observeAll(): Flow<List<ConversationEntity>>
+
+    /** 保险箱里的会话。解锁后才订阅这个 Flow。 */
+    @Query(
+        """
+        SELECT * FROM conversations
+        WHERE hidden = 1
+        ORDER BY pinned DESC,
+                 CASE WHEN pinned THEN pinnedAt ELSE updatedAt END DESC
+        """,
+    )
+    fun observeHidden(): Flow<List<ConversationEntity>>
+
+    /** 进出保险箱。 */
+    @Query("UPDATE conversations SET hidden = :hidden, updatedAt = :now WHERE id = :id")
+    suspend fun setHidden(id: String, hidden: Boolean, now: Long)
 
     /** One bounded preview per matching message, including inactive variants; title-only hits remain visible. */
     @Query(
@@ -37,7 +53,7 @@ interface ConversationDao {
             END AS variantCount
         FROM conversations c
         LEFT JOIN messages m ON m.conversationId = c.id AND instr(lower(m.content), lower(:query)) > 0
-        WHERE length(:query) > 0 AND (m.id IS NOT NULL OR instr(lower(c.title), lower(:query)) > 0)
+        WHERE c.hidden = 0 AND length(:query) > 0 AND (m.id IS NOT NULL OR instr(lower(c.title), lower(:query)) > 0)
         ORDER BY c.pinned DESC,
                  CASE WHEN c.pinned THEN c.pinnedAt ELSE c.updatedAt END DESC,
                  c.id ASC, m.createdAt DESC, m.id ASC
@@ -83,7 +99,9 @@ interface ConversationDao {
      * 刻意**不查整行**：同步要先知道"远端哪些更新"，而那是一个 id+时间戳的
      * 小表；把 `systemPrompt` 之类一起读回来纯属浪费。返回顺序固定，导出可复现。
      */
-    @Query("SELECT id, updatedAt FROM conversations ORDER BY updatedAt DESC, id ASC")
+    @Query(
+        "SELECT id, updatedAt FROM conversations WHERE hidden = 0 ORDER BY updatedAt DESC, id ASC",
+    )
     suspend fun stamps(): List<ConversationStamp>
 
     /** 导出用：全量（含未激活的历史版本）。 */

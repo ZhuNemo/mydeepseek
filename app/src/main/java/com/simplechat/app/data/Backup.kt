@@ -61,6 +61,14 @@ data class BackupConversation(
     val pinnedAt: Long? = null,
     val createdAt: Long,
     val updatedAt: Long,
+    /**
+     * 是否在保险箱里。
+     *
+     * 带进备份是为了**整份恢复后保险箱内容仍然藏得住** —— 否则恢复完一打开列表，
+     * 那些会话就重新露面了。老备份没有这一项，读成 false（不在保险箱），
+     * 因为默认值存在，不需要升备份版本号。
+     */
+    val hidden: Boolean = false,
     /** 挂载的预设 id，按拼接顺序。 */
     val enabledPresetIds: List<String> = emptyList(),
     val messages: List<BackupMessage> = emptyList(),
@@ -131,6 +139,7 @@ internal fun ConversationEntity.toBackup(
     systemPrompt = systemPrompt,
     pinned = pinned,
     pinnedAt = pinnedAt,
+    hidden = hidden,
     createdAt = createdAt,
     updatedAt = updatedAt,
     enabledPresetIds = presetIds,

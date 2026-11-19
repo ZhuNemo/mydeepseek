@@ -25,7 +25,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
     // v7：messages 增加 timeline / stopReason（Anthropic 兼容通道的内容块时间线）
     // v8：新增 attachment_refs（落盘图片的引用，删会话时据此清理文件）
     // v9：附件可被多个会话引用（分叉后删除原会话不能丢图）
-    version = 9,
+    version = 10,
     exportSchema = true,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -153,6 +153,18 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * 9 → 10：会话加「保险箱」标记。
+         *
+         * 只加一列、带默认值 —— 老会话自动是"不在保险箱"。
+         * 不重建表：这一列的默认值就是全部语义，没有需要回填的东西。
+         */
+        private val MIGRATION_9_10 = object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE conversations ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
         fun build(context: Context, name: String = "simplechat.db"): AppDatabase =
             Room.databaseBuilder(
                 context.applicationContext,
@@ -167,6 +179,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_6_7,
                     MIGRATION_7_8,
                     MIGRATION_8_9,
+                    MIGRATION_9_10,
                 )
                 .build()
     }

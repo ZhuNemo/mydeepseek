@@ -15,6 +15,7 @@ import com.simplechat.app.ui.RootScreen
 import com.simplechat.app.ui.theme.AccentColor
 import com.simplechat.app.ui.theme.ApplySystemBarAppearance
 import com.simplechat.app.ui.theme.SimpleChatTheme
+import com.materialkolor.PaletteStyle
 import com.simplechat.app.ui.theme.ThemeMode
 
 class MainActivity : ComponentActivity() {
@@ -71,6 +72,11 @@ class MainActivity : ComponentActivity() {
                 themeMode = themeMode,
                 accent = accent,
                 fontScale = fontScale,
+                // 存的是枚举名，认不出来就回到默认档（换版本删过档位时不至于崩）
+                paletteStyle = runCatching {
+                    PaletteStyle.valueOf(current?.paletteStyleId.orEmpty())
+                }.getOrDefault(PaletteStyle.TonalSpot),
+                pureBlack = current?.pureBlack ?: false,
             ) {
                 ApplySystemBarAppearance()
                 RootScreen()

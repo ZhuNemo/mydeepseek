@@ -41,6 +41,14 @@ data class ConversationEntity(
     val updatedAt: Long,
     val pinned: Boolean = false,
     val pinnedAt: Long? = null,
+    /**
+     * 保险箱：加入后不出现在会话列表、不被搜索命中、不参与云同步。
+     *
+     * ⚠️ **只是界面隐藏，不是加密。** 本列存在的意义是"别人拿着你已解锁的手机
+     * 翻列表时看不到"，数据库文件本身仍是明文 —— root / 备份 / 取证工具照样读得到。
+     * 真要防这个，得把正文用密钥加密（见 README「保险箱」一节的说明）。
+     */
+    val hidden: Boolean = false,
 )
 
 /**

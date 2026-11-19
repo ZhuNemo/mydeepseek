@@ -975,6 +975,61 @@ object AppIcons {
         }
     }
 
+    /** 保险箱（Lucide: lock） */
+    val Lock: ImageVector by lazy {
+        vector("Lock") {
+            stroke {
+                // 锁体
+                moveTo(5f, 11f)
+                lineTo(19f, 11f)
+                lineTo(19f, 21f)
+                lineTo(5f, 21f)
+                close()
+                // 锁梁：从左肩向上绕一个半圆，再落回右肩
+                moveTo(7f, 11f)
+                lineTo(7f, 7f)
+                arcToRelative(5f, 5f, 0f, false, true, 10f, 0f)
+                lineTo(17f, 11f)
+            }
+        }
+    }
+
+    /** 钥匙（Lucide: key） */
+    val Key: ImageVector by lazy {
+        vector("Key") {
+            stroke {
+                // 环
+                arcToRelative(4f, 4f, 0f, true, true, 4f, 4f)
+                // 柄与齿
+                moveTo(13f, 11f)
+                lineTo(4f, 20f)
+                lineTo(4f, 22f)
+                moveTo(7f, 20f)
+                lineTo(9f, 20f)
+                moveTo(6f, 18f)
+                lineTo(8f, 18f)
+            }
+        }
+    }
+
+    /** 退格（Lucide: delete） */
+    val Backspace: ImageVector by lazy {
+        vector("Backspace") {
+            stroke {
+                moveTo(20f, 5f)
+                lineTo(9f, 5f)
+                lineTo(2f, 12f)
+                lineTo(9f, 19f)
+                lineTo(20f, 19f)
+                close()
+                moveTo(18f, 9f)
+                lineTo(12f, 15f)
+                moveTo(12f, 9f)
+                lineTo(18f, 15f)
+            }
+        }
+    }
+
     /**
      * 主题色（Lucide: palette）
      *

@@ -10,6 +10,10 @@ lifecycle = "2.11.0"
 
 composeBom = "2026.09.00"
 
+# Material Color Utilities 的 Compose 封装：生成 M3 的 tonal palette
+# （TonalSpot / Vibrant / Expressive / Neutral / Monochrome / Fidelity / Content / Rainbow / FruitSalad）
+materialkolor = "5.0.1"
+
 markdown = "0.45.0"
 # 代码高亮。本来是 markdown-renderer-code 的传递依赖（运行时已经在包里），
 # 显式声明是为了能直接用它的 API 做**增量高亮**（见 ui/markdown/CodeFence.kt）。
@@ -44,6 +48,7 @@ androidx-compose-ui-tooling = { group = "androidx.compose.ui", name = "ui-toolin
 androidx-compose-ui-tooling-preview = { group = "androidx.compose.ui", name = "ui-tooling-preview" }
 androidx-compose-foundation = { group = "androidx.compose.foundation", name = "foundation" }
 androidx-compose-material3 = { group = "androidx.compose.material3", name = "material3" }
+material-kolor = { group = "com.materialkolor", name = "material-kolor", version.ref = "materialkolor" }
 
 # --- Markdown (第三方) ---
 markdown-renderer = { group = "com.mikepenz", name = "multiplatform-markdown-renderer", version.ref = "markdown" }
