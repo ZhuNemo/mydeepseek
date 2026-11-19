@@ -122,6 +122,19 @@ import org.intellij.markdown.flavours.gfm.GFMTokenTypes.CELL
  * 两者叠加：频率决定"多久动一次"，分块决定"每次要做多少"。
  * 定稿前后**像素级一致**由"两阶段用同一套渲染"保证，不靠降级。
  */
+/**
+ * 正文进入渲染管线前的**唯一**归一化入口。
+ *
+ * 渲染（[MarkdownText]）与预热（[warmMarkdownCache]）必须拿到**逐字相同**的文本，
+ * 因为切块结果与解析结果都以文本为 key 缓存 —— 差一个字符就是永久 miss：
+ * 后台老老实实解析了一遍，主线程再从头解析一遍。
+ *
+ * 这就是之前"长了就卡"的隐形原因之一：预热多跑了一步 `normalizeListIndent`，
+ * 两条路的 key 对不上，预热全白做。
+ */
+internal fun normalizeForMarkdown(content: String): String =
+    normalizeSoftBreaks(normalizeHtml(content))
+
 @Composable
 fun MarkdownText(
     content: String,
@@ -143,7 +156,7 @@ fun MarkdownText(
      */
     val revealed = rememberSmoothReveal(streaming = streaming, value = content)
 
-    val text = remember(revealed) { normalizeSoftBreaks(normalizeHtml(revealed)) }
+    val text = remember(revealed) { normalizeForMarkdown(revealed) }
 
     MarkdownTextBlocks(
         source = text,
@@ -207,6 +220,46 @@ private var cachedChars = 0
 private const val MarkdownStateCacheMaxChars = 400_000
 
 /**
+ * 切块结果缓存（按 source 做 LRU）。
+ *
+ * 切块本身是 O(n) 的纯字符串扫描：20 万字要切出上百块，主线程跑一次
+ * 就是几十毫秒。**预热时已经切过一遍**，这里把结果存下来，首帧组合
+ * 直接命中，不用再扫一遍。
+ *
+ * 容量按 source 字符数计（20 万字符 ≈ 400 KB 的 UTF-16），与
+ * [MarkdownStateCache] 是两笔独立预算：这里存的是"块文本"，那里存的是
+ * "解析后的状态"，后者贵得多。
+ */
+private val BlockCache = LinkedHashMap<String, List<MarkdownBlock>>(8, 0.75f, true)
+private var cachedBlockChars = 0
+private const val BlockCacheMaxChars = 200_000
+
+/**
+ * 取切块结果（没有就切一次并缓存）。
+ *
+ * 加锁的粒度与 [markdownStateOf] 一致：**锁内只查/存**，切块在锁外 ——
+ * 后台预热与主线程首次组合可能同时进来，让主线程等后台切完反而更糟。
+ */
+internal fun splitBlocksCached(source: String): List<MarkdownBlock> {
+    if (source.isEmpty()) return emptyList()
+    synchronized(BlockCache) { BlockCache[source]?.let { return it } }
+
+    val blocks = splitMarkdownBlocks(source)
+
+    synchronized(BlockCache) {
+        BlockCache[source]?.let { return it }
+        BlockCache[source] = blocks
+        cachedBlockChars += source.length
+        while (cachedBlockChars > BlockCacheMaxChars && BlockCache.size > 1) {
+            val eldest = BlockCache.keys.firstOrNull() ?: break
+            BlockCache.remove(eldest)
+            cachedBlockChars -= eldest.length
+        }
+    }
+    return blocks
+}
+
+/**
  * 取（没有就同步解析）一段文本的 Markdown 状态。
  *
  * ⚠️ **解析必须在锁外做**。
@@ -246,12 +299,35 @@ private fun markdownStateOf(text: String): State {
  * 走的是和渲染**同一条**切块路径（[normalizeHtml] → [normalizeSoftBreaks] → [splitMarkdownBlocks]），
  * 所以这里解析出来的块文本与真正渲染时逐字相同，缓存必然命中。
  *
+ * ### [maxBlocks] 为什么存在
+ *
+ * 原先这里只预热"短于 2.4 万字"的消息，超长消息直接跳过 —— 理由是
+ * "解析它要几百毫秒，预热只会把后台线程占满"。但那不是省掉了工作量，
+ * 而是把它推给了**主线程**：首帧组合时冷缓存，同步解析整条消息，
+ * 于是就有了"点开超长对话 → 卡死 → 闪退"。
+ *
+ * 现在改成**超长消息也预热**，只是**只预热首帧要用的那几块**
+ * （`MarkdownInitialBlocks`，与 `MarkdownTextBlocks` 的窗口一致）。
+ * 剩下的块由渐进式渲染逐帧补齐，主线程永远不撞上冷缓存的大段文本。
+ *
  * 见 `ChatScreen` 里那个预热 effect 与 [MarkdownStateCache] 的说明。
  */
-internal fun warmMarkdownCache(content: String) {
+internal fun warmMarkdownCache(content: String, maxBlocks: Int = Int.MAX_VALUE) {
     if (content.isEmpty()) return
-    val normalized = normalizeListIndent(normalizeSoftBreaks(normalizeHtml(content)))
-    splitMarkdownBlocks(normalized).forEach { markdownStateOf(it.text) }
+    /*
+     * ⚠️ 归一化必须与渲染路径**逐字一致**，否则缓存永不命中。
+     *
+     * 早先这里多跑了一步 `normalizeListIndent`，而 `MarkdownText` 里没有 ——
+     * 于是预热算出来的块文本与真正渲染时的 key 不同，**整个预热从来没生效过**，
+     * 主线程每次都是冷缓存同步解析。这正是"预热了却依然卡"的原因。
+     *
+     * 现在两边都走 [normalizeForMarkdown]；只要有人再往这条链上加一步，
+     * 就必须同时改那一个函数，而不是只改其中一条路径。
+     */
+    val normalized = normalizeForMarkdown(content)
+    val blocks = splitBlocksCached(normalized)
+    val head = if (maxBlocks >= blocks.size) blocks else blocks.subList(0, maxBlocks)
+    head.forEach { markdownStateOf(it.text) }
 }
 
 /**

@@ -18,6 +18,7 @@ import com.simplechat.app.data.ApiKey
 import com.simplechat.app.data.BackgroundGeneration
 import com.simplechat.app.data.Attachment
 import com.simplechat.app.data.ChatRepository
+import com.simplechat.app.ui.markdown.MarkdownInitialBlocks
 import com.simplechat.app.ui.markdown.warmMarkdownCache
 import kotlinx.coroutines.Dispatchers
 import com.simplechat.app.data.Res
@@ -80,12 +81,17 @@ import kotlinx.coroutines.sync.Mutex
 private const val WarmTailMessages = 10
 
 /**
- * 预热时单条消息的长度上限。
+ * 预热的总字符预算。
  *
- * 一条几万字的消息解析要几百毫秒；替它预热不会让首屏更快（列表本身也要等它排版），
- * 只会把后台线程占满、拖慢真正该快的那几条。
+ * 从尾部往前累计，到量就停。这条预算的意义是**给"打开"设一个上限**：
+ * 后台解析约 1–2 秒的量，再多就只是在拖慢打开动画，而多出来的那几条
+ * 本来也还没进视口。
+ *
+ * ⚠️ 早先这里是一条**单条长度上限**（超过 2.4 万字就整条不预热），
+ * 那条规则把超长消息推到了主线程上：首帧冷缓存同步解析 → 卡死 → ANR。
+ * 现在超长消息也预热，只是每条只预热首帧要用的块数（见 `warmMarkdownCache`）。
  */
-private const val WarmTailMaxChars = 24_000
+private const val WarmBudgetChars = 120_000
 
 class ChatViewModel(
     private val chatApi: ChatApi,
@@ -561,11 +567,21 @@ class ChatViewModel(
              * 转圈因此是顺的。
              */
             withContext(Dispatchers.Default) {
-                loaded.asReversed()
-                    .take(WarmTailMessages)
-                    // 超长消息不预热：解析它本身就要几百毫秒，预热只会把后台线程占满
-                    .filter { it.content.length <= WarmTailMaxChars }
-                    .forEach { message -> warmMarkdownCache(message.content) }
+                /*
+                 * 从尾部往前预热，累计到 [WarmBudgetChars] 就停。
+                 *
+                 * ⚠️ 这里**不再按单条长度跳过**。跳过超长消息 = 把它留给主线程
+                 * 首帧冷解析，而那正是"点开超长对话卡死闪退"的成因。
+                 * 现在超长消息也预热，但只预热首帧窗口那几块
+                 * （[MarkdownInitialBlocks]，与 `MarkdownTextBlocks` 一致），
+                 * 更后面的块由渐进式渲染逐帧补齐。
+                 */
+                var budget = WarmBudgetChars
+                for (message in loaded.asReversed().take(WarmTailMessages)) {
+                    if (budget <= 0) break
+                    warmMarkdownCache(message.content, maxBlocks = MarkdownInitialBlocks)
+                    budget -= message.content.length
+                }
             }
 
 
