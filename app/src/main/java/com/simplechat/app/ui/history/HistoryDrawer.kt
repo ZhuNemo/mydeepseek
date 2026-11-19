@@ -18,6 +18,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -84,6 +86,7 @@ private val DrawerTextInset = Space.Screen + Space.Inline
  * [ ⚙ 设置 ]                 ← 总设置入口固定在底部
  * ```
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HistoryDrawerContent(
     conversations: List<ConversationEntity>,
@@ -101,6 +104,15 @@ fun HistoryDrawerContent(
     onPinSelected: (Boolean) -> Unit,
     onDeleteSelected: () -> Unit,
     onOpenSettings: () -> Unit,
+    /**
+     * 下拉刷新：触发一次云同步。
+     *
+     * 放在历史列表上而不是顶栏按钮，是因为"我想确认其它设备上的改动有没有过来"
+     * 这个动作，人的第一反应就是往下拉 —— 和几乎所有列表应用一致。
+     */
+    onRefresh: () -> Unit = {},
+    /** 同步进行中。驱动下拉指示器，与同步本身的状态是同一个来源。 */
+    refreshing: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalChatColors.current
@@ -136,37 +148,43 @@ fun HistoryDrawerContent(
                 )
             }
         } else {
-            LazyColumn(
+            PullToRefreshBox(
+                isRefreshing = refreshing,
+                onRefresh = onRefresh,
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                    top = 2.dp,
-                    bottom = 8.dp,
-                ),
             ) {
-                grouped.forEach { (group, items) ->
-                    item(key = group.key) {
-                        GroupHeader(label = group.label())
-                    }
-                    items(items = items, key = { it.id }) { conversation ->
-                        ConversationRow(
-                            conversation = conversation,
-                            current = conversation.id == currentConversationId,
-                            selectionMode = selectionMode,
-                            selected = conversation.id in selectedIds,
-                            onClick = {
-                                if (selectionMode) {
-                                    onToggleSelection(conversation.id)
-                                } else {
-                                    onClick(conversation)
-                                }
-                            },
-                            onEnterSelection = { onEnterSelection(conversation) },
-                            onRename = { onRename(conversation) },
-                            onTogglePin = { onTogglePin(conversation) },
-                            onDelete = { onDelete(conversation) },
-                        )
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                        top = 2.dp,
+                        bottom = 8.dp,
+                    ),
+                ) {
+                    grouped.forEach { (group, items) ->
+                        item(key = group.key) {
+                            GroupHeader(label = group.label())
+                        }
+                        items(items = items, key = { it.id }) { conversation ->
+                            ConversationRow(
+                                conversation = conversation,
+                                current = conversation.id == currentConversationId,
+                                selectionMode = selectionMode,
+                                selected = conversation.id in selectedIds,
+                                onClick = {
+                                    if (selectionMode) {
+                                        onToggleSelection(conversation.id)
+                                    } else {
+                                        onClick(conversation)
+                                    }
+                                },
+                                onEnterSelection = { onEnterSelection(conversation) },
+                                onRename = { onRename(conversation) },
+                                onTogglePin = { onTogglePin(conversation) },
+                                onDelete = { onDelete(conversation) },
+                            )
+                        }
                     }
                 }
             }

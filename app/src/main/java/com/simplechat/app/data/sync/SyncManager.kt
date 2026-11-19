@@ -245,13 +245,26 @@ class SyncManager(
             }
 
             // ── 4. 元信息最后写（预设 / 版本），失败不影响会话数据 ──
-            writeMeta(metaFile, SyncHeader(exportedAt = System.currentTimeMillis(), presets = repository.syncPresets()))
-            client.uploadFile(
-                config = config,
-                remotePath = SyncLayout.metaPath(root),
-                file = metaFile,
-                mediaType = WebDavClient.SyncPayloadMedia,
-            )
+            //
+            // 内容没变就**不写、也不传**。
+            //
+            // 原先这里每次都塞 `exportedAt = now()`，于是 meta 的字节永远不同，
+            // 哪怕一个会话都没改，每次下拉刷新也要多发一个 PUT —— 网盘上看是
+            // "什么都没变却又写了一次"，也白白占用请求配额。
+            // 现在只比 presets（meta 里唯一有语义的字段），一致就整段跳过。
+            val localPresets = repository.syncPresets()
+            if (meta == null || meta.presets != localPresets) {
+                writeMeta(
+                    metaFile,
+                    SyncHeader(exportedAt = System.currentTimeMillis(), presets = localPresets),
+                )
+                client.uploadFile(
+                    config = config,
+                    remotePath = SyncLayout.metaPath(root),
+                    file = metaFile,
+                    mediaType = WebDavClient.SyncPayloadMedia,
+                )
+            }
 
             settings.setDavLastSyncAt(System.currentTimeMillis())
             _state.value = SyncState(

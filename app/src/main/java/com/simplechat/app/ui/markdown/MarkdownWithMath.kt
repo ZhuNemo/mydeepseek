@@ -13,6 +13,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import com.simplechat.app.R
@@ -47,6 +48,8 @@ fun MarkdownWithMath(
     content: String,
     modifier: Modifier = Modifier,
     streaming: Boolean = false,
+    /** 见 [MarkdownText] 的 `textColor`。 */
+    textColor: Color? = null,
 ) {
     // 切分是纯字符串操作，跟着内容走；正文没变就不重切
     val segments = remember(content) { splitMath(content) }
@@ -57,6 +60,7 @@ fun MarkdownWithMath(
             content = (segments.first() as ContentSegment.Text).text,
             modifier = modifier,
             streaming = streaming,
+            textColor = textColor,
         )
         return
     }
@@ -73,9 +77,9 @@ fun MarkdownWithMath(
      * 强制浅色 / 深色，两者可能不一致 —— 会出现"深色页面上一段黑公式"。
      */
     val dark = LocalIsDarkTheme.current
-    val textColor = MaterialTheme.colorScheme.onBackground
-    val latexTheme = remember(dark, textColor) {
-        if (dark) LatexTheme.dark(color = textColor) else LatexTheme.light(color = textColor)
+    val formulaColor = textColor ?: MaterialTheme.colorScheme.onBackground
+    val latexTheme = remember(dark, formulaColor) {
+        if (dark) LatexTheme.dark(color = formulaColor) else LatexTheme.light(color = formulaColor)
     }
 
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -84,6 +88,7 @@ fun MarkdownWithMath(
                 is ContentSegment.Text -> MarkdownText(
                     content = segment.text,
                     streaming = streaming,
+                    textColor = textColor,
                 )
 
                 is ContentSegment.Formula -> CompatibleFormula(segment, LatexConfig(fontSize = fontSize, theme = latexTheme))

@@ -332,6 +332,13 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
                                 closeDrawer()
                                 route = Route.SETTINGS
                             },
+                            /*
+                             * 下拉即同步。指示器直接读同步自己的状态：同步还在跑时
+                             * 再下拉也不会叠第二次（SyncManager 用 Mutex 拦住），
+                             * 于是"转圈"与"真的在同步"始终是同一件事。
+                             */
+                            onRefresh = { container.syncManager.startSync() },
+                            refreshing = syncState.running,
                         )
                     }
                 }

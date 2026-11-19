@@ -3,6 +3,8 @@ package com.simplechat.app.ui.chat
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -2009,6 +2011,19 @@ class ChatViewModel(
         return prepared
     }
 
+    /**
+     * 给正文加一行"当前时间"。
+     *
+     * 格式固定为 `yyyy-MM-dd HH:mm`：**不随界面语言变** —— 模型对 ISO 风格的
+     * 日期最敏感，而 `11月19日` 这种本地化写法在不同语言下还会换顺序，
+     * 对"算一下隔了几天"这类推理没有好处。
+     */
+    private fun stampedText(text: String): String =
+        Res.get(
+            R.string.prompt_current_time,
+            LocalDateTime.now().format(TimeStampFormat),
+        ) + "\n\n" + text
+
     private suspend fun buildRequestMessages(): List<OutMessageDto> {
         skippedNoVision = 0; skippedUnreadable = 0
         val request = mutableListOf<OutMessageDto>()
@@ -2033,7 +2048,22 @@ class ChatViewModel(
         }
 
         // 顺序规则见 `orderedOutgoingMessages`（纯函数，有单测钉死）
-        orderedOutgoingMessages(messages, active).forEach { message ->
+        val outgoingMessages = orderedOutgoingMessages(messages, active)
+
+        /*
+         * 时间戳只挂在**最后一条 user 消息**上，而且**不写库**。
+         *
+         * 为什么不放进 system：DeepSeek / Anthropic 的 prompt 缓存按**前缀**匹配，
+         * system 是序列的第一个元素 —— 它的末尾一变，后面整段历史全部 cache miss，
+         * 长对话每轮都在白付全量上下文的价钱。挂在最后一条用户消息上，前缀
+         * （system + 历史）原样不动，只有本来就要重新发的那一条变了。
+         *
+         * 也不写进 message.content：那是用户的原话，掺进时间会出现在气泡里，
+         * 也会进搜索索引与备份。
+         */
+        val lastUserIndex = outgoingMessages.indexOfLast { it.role == MessageRole.USER }
+
+        outgoingMessages.forEachIndexed { index, message ->
             /*
              * 空消息不发：历史里出错/被中断的 assistant、既没正文也没附件的 user
              * 是可能存在的，而部分兼容网关对空 `content` 直接 400 ——
@@ -2042,7 +2072,12 @@ class ChatViewModel(
             val outgoing = if (message.role == MessageRole.USER && message.attachments.isNotEmpty()) {
                 message.copy(attachments = outgoingAttachments(message.attachments))
             } else message
-            if (!isSendableOutgoing(outgoing)) return@forEach
+            if (!isSendableOutgoing(outgoing)) return@forEachIndexed
+            /*
+             * 只在最后一条用户消息前加时间：模型据此知道"现在是什么时候"，
+             * 而历史里那些"昨天/下周"的指代仍然按各自发送时的语境理解。
+             */
+            val body = if (index == lastUserIndex) stampedText(outgoing.content) else outgoing.content
             request += OutMessageDto(
                 role = if (message.role == MessageRole.USER) "user" else "assistant",
                 /*
@@ -2053,9 +2088,9 @@ class ChatViewModel(
                  * 在协议里是不合法的（会 400），而 AI 回复本来也不该带图。
                  */
                 content = if (message.role != MessageRole.USER || message.attachments.isEmpty()) {
-                    MessageContent.text(message.content)
+                    MessageContent.text(body)
                 } else {
-                    userContent(outgoing.content, outgoing.attachments)
+                    userContent(body, outgoing.attachments)
                 },
             )
         }
@@ -2139,7 +2174,9 @@ class ChatViewModel(
 }
 
 private fun String.toConversationModeSafe(): ConversationMode =
-    runCatching { ConversationMode.valueOf(this) }.getOrDefault(ConversationMode.CREATIVE)
+    runCatching { ConversationMode.valueOf(this) 
+/** 时间戳格式：与语言无关，模型最容易正确解析的那一种。 */
+}.getOrDefault(ConversationMode.CREATIVE)
 
 /**
  * 思考耗时 → 展示用秒数。
@@ -2151,10 +2188,10 @@ private fun String.toConversationModeSafe(): ConversationMode =
  */
 internal fun thinkingSeconds(ms: Long): Long = ((ms + 500) / 1000).coerceAtLeast(1)
 
-
-
-
-
-
-
-
+/**
+ * 时间戳格式：与语言无关，模型最容易正确解析的那一种。
+ *
+ * 不用 `yyyy年M月d日` 这类本地化写法 —— 它会随界面语言改变顺序，
+ * 而模型对 ISO 风格的日期最敏感（"隔了几天"这类推理靠的就是这个）。
+ */
+private val TimeStampFormat: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")

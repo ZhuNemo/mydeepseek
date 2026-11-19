@@ -127,6 +127,13 @@ fun MarkdownText(
     content: String,
     modifier: Modifier = Modifier,
     streaming: Boolean = false,
+    /**
+     * 覆盖正文字色。null = 跟随主题（`onBackground`）。
+     *
+     * 给「思考链」这类次要文本用：它整段是灰的，但**链接、行内代码、引用条**
+     * 也应当跟着这个色系走，而不是继续用正文色 —— 否则灰底里蹦出几块黑的。
+     */
+    textColor: Color? = null,
 ) {
     /*
      * 先**匀速放出一段前缀**（见 [rememberSmoothReveal]），再做 HTML 折算与软换行补全 ——
@@ -144,7 +151,7 @@ fun MarkdownText(
         modifier = modifier,
         blockGap = MarkdownBlockColumnGap,
     ) { blockText, blockModifier ->
-        MarkdownBlockView(text = blockText, modifier = blockModifier)
+        MarkdownBlockView(text = blockText, modifier = blockModifier, textColor = textColor)
     }
 }
 
@@ -266,7 +273,7 @@ internal fun warmMarkdownCache(content: String) {
  * 内容没变的块参数仍然相等 —— 跳过照样成立。）
  */
 @Composable
-private fun MarkdownBlockView(text: String, modifier: Modifier) {
+private fun MarkdownBlockView(text: String, modifier: Modifier, textColor: Color? = null) {
     val colors = LocalChatColors.current
     val scheme = MaterialTheme.colorScheme
 
@@ -317,7 +324,7 @@ private fun MarkdownBlockView(text: String, modifier: Modifier) {
         // 大标题（h1–h3）上方补白：官方 32px，块间距已给 16dp，这里再补 16dp
         modifier = modifier.padding(top = headingTopGap(text)),
         colors = markdownColor(
-            text = scheme.onBackground,
+            text = textColor ?: scheme.onBackground,
             codeBackground = colors.markdownCodeBlock,
             inlineCodeBackground = colors.markdownInlineCode,
             dividerColor = colors.markdownRule,

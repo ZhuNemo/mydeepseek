@@ -358,6 +358,7 @@
     <!-- ── Prompts sent to the model ─────────────────────── -->
     <string name="prompt_title_system">You name conversations. Summarise what this conversation is about in at most 5 words. Output the title only: no quotes, no book-title marks, no trailing punctuation, no explanation or prefix.</string>
     <string name="prompt_compact_system">You are a context compressor for long-form creative writing. Compress the conversation log the user gives you into a recap.\n\nAlways keep:\n1. Every character name, form of address, and changes in kinship and relationships\n2. Place names, times, and scene/setting details\n3. Key plot events that already happened, and their cause and effect\n4. Style conventions already established (person, point of view, tone, taboos)\n5. Foreshadowing and suspense not yet resolved\n\nRules:\n- Use declarative prose, not dialogue\n- Do not evaluate, do not continue the story, and do not write meta lines such as “this was a summary”\n- Keep it within 10% of the original length\n- Output the recap body directly</string>
+    <string name="prompt_current_time">Current time: %1$s</string>
     <string name="prompt_recap_intro">Below is a recap of the earlier conversation, to keep settings and plot consistent. Do not repeat it; just continue.\n\n</string>
     <string name="prompt_compact_existing">[Existing recap]\n</string>
     <string name="prompt_compact_new">\n\n[New conversation since]\n</string>
