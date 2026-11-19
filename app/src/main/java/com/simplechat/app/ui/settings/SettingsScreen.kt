@@ -2604,6 +2604,15 @@ private fun AccentSwatch(
  * 一级入口行：图标 + 标题 +（可选）当前值 + 箭头。
  * 图标传 `null` 即为二级页面里的行 —— 二级不配图标。
  */
+/**
+ * 右侧值分到的宽度权重（标题是 1）。
+ *
+ * 0.62 ≈ 标题 62% / 值 38%：手机宽度下标题能完整显示四到六个汉字，
+ * 足够覆盖「云端同步」「朗读音色」这类标题；值那边放"跟随系统""简体中文"也够，
+ * 更长的（WebDAV 地址、音色名）走省略号。
+ */
+private const val ValueWeight = 0.62f
+
 @Composable
 fun SettingsNavRow(
     icon: ImageVector?,
@@ -2637,6 +2646,17 @@ fun SettingsNavRow(
             // bodyLarge(16sp) 是 M3 列表项标题的标准字号；titleSmall(14) 偏小
             style = MaterialTheme.typography.bodyLarge,
             color = MaterialTheme.colorScheme.onSurface,
+            /*
+             * ⚠️ **标题必须单行 + 省略号。**
+             *
+             * 这行原先只有 `weight(1f)`，而右侧的值是"按内容测量"的
+             * （`widthIn(max = 200.dp)`）—— 长值会先吃掉 200dp，标题被压到
+             * 只剩一个字宽，中文于是逐字换行，变成竖排的"云端同步"。
+             *
+             * 单行之后最坏情况是省略号，读起来仍是"云端同…"，比竖排强得多。
+             */
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
             // 标题吃掉全部剩余空间 → 值 + 箭头被顶到最右，形成一条整齐的右边线
             modifier = Modifier.weight(1f),
         )
@@ -2648,7 +2668,15 @@ fun SettingsNavRow(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 textAlign = TextAlign.End,
-                modifier = Modifier.widthIn(max = 200.dp),
+                /*
+                 * 值改用**按比例**分配（0.62 : 1），不再用固定上限。
+                 *
+                 * 固定 200dp 的问题与上面同源：它只看自己，不看标题还剩多少。
+                 * 比例分配把"标题 vs 值"变成一个确定的分割，无论屏幕多窄，
+                 * 标题都能拿到约 62% 的宽度；`fill = false` 让短值按内容收缩，
+                 * 不会把右边顶出一块空白。
+                 */
+                modifier = Modifier.weight(ValueWeight, fill = false),
             )
         }
         Icon(
