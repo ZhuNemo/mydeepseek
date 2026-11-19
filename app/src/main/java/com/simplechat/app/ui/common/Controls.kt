@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
@@ -84,20 +85,34 @@ import androidx.compose.runtime.withFrameNanos
  * 会话行内缩 8dp，两个色块左右对不齐，一眼就能看出来。
  */
 object Space {
-    /** 屏幕左右安全内边距。所有页面的一级内容都从这里开始。 */
-    val Screen = 16.dp
+    /** 屏幕左右安全内边距。M3 的一级内容从 20dp 起，比 16dp 更"立得住"。 */
+    val Screen = 20.dp
 
     /** 卡片 / 浮层 / 面板的内部内边距。 */
-    val Card = 16.dp
+    val Card = 18.dp
 
     /** 行内元素之间（图标与文字、相邻按钮）。 */
-    val Inline = 12.dp
+    val Inline = 14.dp
 
     /** 组内元素的纵向间距。 */
-    val Gap = 8.dp
+    val Gap = 12.dp
 
     /** 分组之间的纵向间距。 */
-    val Section = 24.dp
+    val Section = 28.dp
+
+    /*
+     * ── 触控与行高（M3 的硬下限）─────────────────────
+     *
+     * Material 3 规定**任何可点元素的触控区不小于 48×48dp**。这套应用原来
+     * 按"紧凑工具"的尺度做（按钮 32、菜单行 46、开关 38×22），在 M3 的
+     * 视觉语言里会显得又小又挤 —— 圆角大、留白多，唯独控件小，比例是反的。
+     */
+
+    /** 标准按钮 / 列表行的最小高度。 */
+    val TouchTarget = 48.dp
+
+    /** 主按钮（带文字）的高度。M3 的 filled button 就是 40dp，视觉上配 48 的触控区。 */
+    val ButtonHeight = 40.dp
 }
 
 // ══════════════════════════════════════════════════════════
@@ -114,13 +129,13 @@ val PillShape = RoundedCornerShape(percent = 50)
  * 两条并排看明显一个粗一个细。**以搜索页那条为准**，横向内边距各留各的
  * （抽屉要与分组标题对齐，见 `HistoryDrawer.DrawerTextInset`）。
  */
-val FieldThickness = 12.dp
+val FieldThickness = 14.dp
 
-/** 列表行、小卡片。 */
-val SoftShape = RoundedCornerShape(14.dp)
+/** 列表行、小卡片。M3 的 medium 圆角是 12dp，这里取 16 —— 与卡片内的行高更协调。 */
+val SoftShape = RoundedCornerShape(16.dp)
 
-/** 大卡片与浮层菜单。 */
-val MenuShape = RoundedCornerShape(18.dp)
+/** 大卡片与浮层菜单。M3 的 large 是 16、extra-large 是 28，取中间偏大。 */
+val MenuShape = RoundedCornerShape(20.dp)
 
 /** 多行容器（输入栏、输入面板）。 */
 val ContainerShape = RoundedCornerShape(24.dp)
@@ -399,9 +414,14 @@ fun AppSwitch(
     enabled: Boolean = true,
 ) {
     val colors = LocalChatColors.current
-    val trackWidth = 38.dp
-    val trackHeight = 22.dp
-    val thumbSize = 16.dp
+    /*
+     * M3 的 switch 是 52×32。直接照搬会在这个偏窄的设置列里显得很大，
+     * 取 46×28：拇指 22dp ≥ 20dp 的可辨下限，轨道也够得着 48dp 触控区
+     * （外层的行本身有 48dp 高，触控面积由行给，不由开关自己给）。
+     */
+    val trackWidth = 46.dp
+    val trackHeight = 28.dp
+    val thumbSize = 22.dp
     val padding = 3.dp
 
     val thumbOffset by animateDpAsState(
@@ -459,8 +479,9 @@ fun IconCircleButton(
     contentDescription: String?,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
-    size: Dp = 36.dp,
-    iconSize: Dp = 18.dp,
+    // M3 的 icon button 是 40dp（触控区 48）；36 是紧凑工具条的尺度
+    size: Dp = 40.dp,
+    iconSize: Dp = 20.dp,
     enabled: Boolean = true,
     /** 非空则铺一层底色。 */
     background: Color? = null,
@@ -549,21 +570,27 @@ fun CapsuleButton(
                 },
             )
             .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 8.dp),
+            /*
+             * 40dp 高 + 16dp 横向内边距：M3 的按钮尺度。
+             * 原来是 12/8（约 32dp 高），在 M3 的大圆角旁边显得像个小标签。
+             */
+            .defaultMinSize(minHeight = Space.ButtonHeight)
+            .padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         if (leadingIcon != null) {
             Icon(
                 imageVector = leadingIcon,
                 contentDescription = null,
                 tint = contentColor,
-                modifier = Modifier.size(16.dp),
+                modifier = Modifier.size(18.dp),
             )
         }
         Text(
             text = text,
-            style = MaterialTheme.typography.labelMedium,
+            // labelLarge(14sp) 才是 M3 的按钮字号；labelMedium(12sp) 是"辅助标签"
+            style = MaterialTheme.typography.labelLarge,
             color = contentColor,
             maxLines = 1,
         )
@@ -572,7 +599,7 @@ fun CapsuleButton(
                 imageVector = trailingIcon,
                 contentDescription = null,
                 tint = contentColor,
-                modifier = Modifier.size(14.dp),
+                modifier = Modifier.size(16.dp),
             )
         }
     }
@@ -585,8 +612,8 @@ fun CapsuleButton(
 /** 菜单宽度。**固定值** —— 宽度随内容浮动会让同一组件在每处长不一样。 */
 val MenuWidth = 208.dp
 
-/** 菜单项固定行高。46dp：离 48dp 的触控下限只差一点，视觉上又不至于太松散。 */
-private val MenuItemHeight = 46.dp
+/** 菜单项固定行高。48dp = M3 的触控下限，也正好是"一眼能点中"的高度。 */
+private val MenuItemHeight = 48.dp
 
 /** 菜单与锚点的间隙。 */
 private val MenuGap = 8.dp

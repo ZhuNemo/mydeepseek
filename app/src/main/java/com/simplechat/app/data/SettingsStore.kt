@@ -114,10 +114,16 @@ data class StoredSettings(
     /** 主题色：AccentColor.name，见 ui/theme/Theme.kt。 */
     val accentColorId: String = "BLUE",
     /**
-     * M3 调色板样式（Material Color Utilities 的 scheme 变体）。
+     * ⚠️ 已废弃，仅保留以免老配置报错。
      *
-     * 存枚举名而不是序号：以后增删中间档位时，老配置不会整体错位。
+     * 调色板推导方式改成固定 Fidelity 了（见 `Theme.buildScheme`）：
+     * 「主题色」与「调色板样式」两个入口同时在决定颜色，用户改一个看不到
+     * 预期效果 —— 那是"两个设置互相打架"，不是可配置性。
+     *
+     * 字段保留是因为 DataStore 里可能还有这个键，删掉读取也不会报错，
+     * 但留着能让旧版本回退时行为一致。
      */
+    @Deprecated("配色推导方式已固定为 Fidelity，不再暴露设置")
     val paletteStyleId: String = "TonalSpot",
     /** 深色模式下把中性底压到纯黑（OLED）。只影响中性色，品牌色不动。 */
     val pureBlack: Boolean = false,
@@ -467,10 +473,6 @@ class SettingsStore(
         val current = flow.first()
         if (!current.hasVaultRecovery) return false
         return VaultCredentials.matches(answer.trim(), current.vaultAnswerSalt, current.vaultAnswerHash)
-    }
-
-    suspend fun setPaletteStyle(styleId: String) {
-        context.settingsDataStore.edit { it[Keys.PALETTE_STYLE] = styleId }
     }
 
     suspend fun setPureBlack(enabled: Boolean) {

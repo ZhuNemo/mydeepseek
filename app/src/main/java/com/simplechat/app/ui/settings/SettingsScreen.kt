@@ -8,7 +8,6 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
-import androidx.annotation.StringRes
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -35,10 +34,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import com.materialkolor.dynamicColorScheme
-import com.materialkolor.PaletteStyle
 import androidx.compose.ui.graphics.Color
-import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.AlertDialog
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -163,8 +159,6 @@ private sealed interface SettingsDialog {
     data object ImportMode : SettingsDialog
     /** 协议通道（自动 / OpenAI 兼容 / Anthropic 兼容）。 */
     data object ApiStyle : SettingsDialog
-    /** 调色板样式（M3 tonal palette 的推导方式）。 */
-    data object PaletteStyle : SettingsDialog
     /** 地区（时间地点提醒里的地点那一项）。 */
     data object Location : SettingsDialog
     /** 云端同步：服务器地址 / 账号 / 应用密码 / 远程目录。 */
@@ -555,7 +549,6 @@ fun SettingsScreen(
                             onThemeChange = { scope.launch { store.setThemeMode(it.name) } },
                             onAccentChange = { scope.launch { store.setAccentColor(it.name) } },
                             onPureBlackChange = { scope.launch { store.setPureBlack(it) } },
-                            onPaletteStyleClick = { dialog = SettingsDialog.PaletteStyle },
                             onLanguageChange = { scope.launch { store.setLanguage(it.name) } },
                             onToggleAutoCollapse = {
                                 scope.launch { store.setAutoCollapseThinking(it) }
@@ -839,17 +832,6 @@ fun SettingsScreen(
             },
         )
 
-        SettingsDialog.PaletteStyle -> PaletteStyleDialog(
-            current = runCatching { PaletteStyle.valueOf(stored.paletteStyleId) }
-                .getOrDefault(PaletteStyle.TonalSpot),
-            seed = accentColor.primary(dark = false),
-            onDismiss = { dialog = null },
-            onPick = { style ->
-                dialog = null
-                scope.launch { store.setPaletteStyle(style.name) }
-            },
-        )
-
         SettingsDialog.SyncServer -> TextInputDialog(
             title = stringResource(R.string.sync_server),
             initial = stored.davUrl,
@@ -1009,7 +991,6 @@ private fun RootPage(
     onThemeChange: (ThemeMode) -> Unit,
     onAccentChange: (AccentColor) -> Unit,
     onPureBlackChange: (Boolean) -> Unit,
-    onPaletteStyleClick: () -> Unit,
     onLanguageChange: (AppLanguage) -> Unit,
     onToggleAutoCollapse: (Boolean) -> Unit,
 ) {
@@ -1094,24 +1075,6 @@ private fun RootPage(
 
         RowDivider()
 
-        /*
-         * 调色板样式单独一行、点开弹窗选：
-         * 九种档位各带一条色带，平铺在卡片里会撑成半屏，也不便于比较。
-         */
-        SettingsNavRow(
-            icon = AppIcons.Palette,
-            label = stringResource(R.string.settings_palette_style),
-            value = stringResource(
-                paletteLabelRes(
-                    runCatching { PaletteStyle.valueOf(stored.paletteStyleId) }
-                        .getOrDefault(PaletteStyle.TonalSpot),
-                ),
-            ),
-            onClick = onPaletteStyleClick,
-        )
-
-        RowDivider()
-
         // 语言：三个互斥选项，弹菜单。换语言 = 改缓存 + 整页重建（见 MainActivity）
         Box {
             SettingsNavRow(
@@ -1165,7 +1128,7 @@ private fun RootPage(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 8.dp, vertical = 6.dp),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     AccentColor.entries.forEach { color ->
                         AccentSwatch(
@@ -1516,138 +1479,6 @@ private fun DataPage(
             color = LocalChatColors.current.placeholder,
             modifier = Modifier.padding(horizontal = 4.dp),
         )
-    }
-}
-
-// ══════════════════════════════════════════════════════════
-//  调色板样式
-// ══════════════════════════════════════════════════════════
-
-/**
- * 档位的展示顺序。
- *
- * 不直接遍历 `PaletteStyle.entries`：枚举顺序是库的实现细节，
- * 调整一下就会把用户的肌肉记忆打乱；这里按 Material Theme Builder 的顺序写死。
- */
-private val PaletteStyles = listOf(
-    PaletteStyle.TonalSpot,
-    PaletteStyle.Neutral,
-    PaletteStyle.Vibrant,
-    PaletteStyle.Expressive,
-    PaletteStyle.Rainbow,
-    PaletteStyle.FruitSalad,
-    PaletteStyle.Monochrome,
-    PaletteStyle.Fidelity,
-    PaletteStyle.Content,
-)
-
-@StringRes
-private fun paletteLabelRes(style: PaletteStyle): Int = when (style) {
-    PaletteStyle.TonalSpot -> R.string.palette_tonal_spot
-    PaletteStyle.Neutral -> R.string.palette_neutral
-    PaletteStyle.Vibrant -> R.string.palette_vibrant
-    PaletteStyle.Expressive -> R.string.palette_expressive
-    PaletteStyle.Rainbow -> R.string.palette_rainbow
-    PaletteStyle.FruitSalad -> R.string.palette_fruit_salad
-    PaletteStyle.Monochrome -> R.string.palette_monochrome
-    PaletteStyle.Fidelity -> R.string.palette_fidelity
-    PaletteStyle.Content -> R.string.palette_content
-}
-
-/**
- * 调色板档位选择。
- *
- * 每一档都**真的生成一次色板**再画色带：色带就是这个档位的视觉定义，
- * 只列名字的话用户没法判断选哪个。九档一起算要走完整的 HCT 换算，
- * 所以按 (档位, seed, 明暗) 缓存，滚动与重组都不会重算。
- */
-@Composable
-private fun PaletteStyleDialog(
-    current: PaletteStyle,
-    seed: Color,
-    onDismiss: () -> Unit,
-    onPick: (PaletteStyle) -> Unit,
-) {
-    val dark = LocalIsDarkTheme.current
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.settings_palette_style)) },
-        text = {
-            Column(
-                modifier = Modifier
-                    .heightIn(max = 420.dp)
-                    .verticalScroll(rememberScrollState()),
-            ) {
-                PaletteStyles.forEach { style ->
-                    val scheme = remember(style, seed, dark) {
-                        dynamicColorScheme(seedColor = seed, isDark = dark, style = style)
-                    }
-                    PaletteStyleRow(
-                        label = stringResource(paletteLabelRes(style)),
-                        scheme = scheme,
-                        selected = style == current,
-                        onClick = { onPick(style) },
-                    )
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = onDismiss) {
-                Text(stringResource(R.string.dialog_close))
-            }
-        },
-    )
-}
-
-@Composable
-private fun PaletteStyleRow(
-    label: String,
-    scheme: ColorScheme,
-    selected: Boolean,
-    onClick: () -> Unit,
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .clickable(onClick = onClick)
-            .padding(horizontal = 10.dp, vertical = 8.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                text = label,
-                style = MaterialTheme.typography.titleSmall,
-                color = MaterialTheme.colorScheme.onSurface,
-                modifier = Modifier.weight(1f),
-            )
-            if (selected) {
-                Icon(
-                    imageVector = AppIcons.Check,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.size(18.dp),
-                )
-            }
-        }
-        // 六格色带：品牌三档 + 一个容器色 + 一个表面色 + 描边，足以看出这个档位的性格
-        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            listOf(
-                scheme.primary,
-                scheme.secondary,
-                scheme.tertiary,
-                scheme.primaryContainer,
-                scheme.surfaceContainer,
-                scheme.outlineVariant,
-            ).forEach { swatch ->
-                Box(
-                    modifier = Modifier
-                        .size(width = 18.dp, height = 9.dp)
-                        .clip(RoundedCornerShape(3.dp))
-                        .background(swatch),
-                )
-            }
-        }
     }
 }
 
@@ -2675,9 +2506,9 @@ fun SettingsSectionLabel(text: String) {
     val colors = LocalChatColors.current
     Text(
         text = text,
-        style = MaterialTheme.typography.labelMedium,
+        style = MaterialTheme.typography.labelLarge,
         color = colors.placeholder,
-        modifier = Modifier.padding(start = 4.dp, top = 24.dp, bottom = 10.dp),
+        modifier = Modifier.padding(start = 4.dp, top = 28.dp, bottom = 12.dp),
     )
 }
 
@@ -2695,7 +2526,7 @@ fun SettingsCard(content: @Composable () -> Unit) {
 }
 
 @Composable
-private fun RowDivider(inset: androidx.compose.ui.unit.Dp = 52.dp) {
+private fun RowDivider(inset: androidx.compose.ui.unit.Dp = 56.dp) {
     val colors = LocalChatColors.current
     Box(
         modifier = Modifier
@@ -2706,8 +2537,8 @@ private fun RowDivider(inset: androidx.compose.ui.unit.Dp = 52.dp) {
     )
 }
 
-/** 主题色菜单的宽度：七个 30dp 色块 + 间距，比默认菜单宽。 */
-private val AccentMenuWidth = 266.dp
+/** 主题色菜单的宽度：七个 40dp 色块 + 8dp 间距，比默认菜单宽。 */
+private val AccentMenuWidth = 352.dp
 
 /**
  * 读系统音色列表的超时。
@@ -2736,19 +2567,19 @@ private fun AccentSwatch(
     val dark = LocalIsDarkTheme.current
     val swatchDesc = stringResource(R.string.a11y_accent_color, color.label)
     Box(
-        modifier = Modifier.size(30.dp),
+        modifier = Modifier.size(40.dp),
         contentAlignment = Alignment.Center,
     ) {
         Box(
             modifier = Modifier
-                .size(22.dp)
+                .size(30.dp)
                 .clip(CircleShape)
                 .background(color.primary(dark)),
         )
         if (selected) {
             Box(
                 modifier = Modifier
-                    .size(30.dp)
+                    .size(34.dp)
                     .border(2.dp, MaterialTheme.colorScheme.onSurface, CircleShape),
             )
         }
@@ -2785,21 +2616,26 @@ fun SettingsNavRow(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 16.dp),
+            /*
+             * 行高 18dp × 2 + 内容 ≈ 64dp。M3 的单行列表项是 56dp，
+             * 这里带图标 + 右侧值，64 才不挤；触控区也稳过 48dp。
+             */
+            .padding(horizontal = 18.dp, vertical = 18.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         if (icon != null) {
             Icon(
                 imageVector = icon,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurface,
-                modifier = Modifier.size(21.dp),
+                modifier = Modifier.size(22.dp),
             )
         }
         Text(
             text = label,
-            style = MaterialTheme.typography.titleSmall,
+            // bodyLarge(16sp) 是 M3 列表项标题的标准字号；titleSmall(14) 偏小
+            style = MaterialTheme.typography.bodyLarge,
             color = MaterialTheme.colorScheme.onSurface,
             // 标题吃掉全部剩余空间 → 值 + 箭头被顶到最右，形成一条整齐的右边线
             modifier = Modifier.weight(1f),
@@ -2812,14 +2648,14 @@ fun SettingsNavRow(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 textAlign = TextAlign.End,
-                modifier = Modifier.widthIn(max = 190.dp),
+                modifier = Modifier.widthIn(max = 200.dp),
             )
         }
         Icon(
             imageVector = AppIcons.ChevronRight,
             contentDescription = null,
             tint = colors.placeholder,
-            modifier = Modifier.size(16.dp),
+            modifier = Modifier.size(18.dp),
         )
     }
 }
@@ -2839,12 +2675,12 @@ private fun SettingsActionRow(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 14.dp),
-        verticalArrangement = Arrangement.spacedBy(3.dp),
+            .padding(horizontal = 18.dp, vertical = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         Text(
             text = label,
-            style = MaterialTheme.typography.titleSmall,
+            style = MaterialTheme.typography.bodyLarge,
             color = if (destructive) colors.danger else MaterialTheme.colorScheme.onSurface,
         )
         if (hint != null) {
@@ -2871,9 +2707,9 @@ private fun SettingsSwitchRow(
         modifier = Modifier
             .fillMaxWidth()
             .clickable { onCheckedChange(!checked) }
-            .padding(horizontal = 16.dp, vertical = 10.dp),
+            .padding(horizontal = 18.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         if (icon != null) {
             Icon(
@@ -2886,7 +2722,7 @@ private fun SettingsSwitchRow(
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = label,
-                style = MaterialTheme.typography.titleSmall,
+                style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurface,
             )
             if (hint != null) {

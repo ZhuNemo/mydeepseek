@@ -226,13 +226,28 @@ val LocalIsDarkTheme = staticCompositionLocalOf { false }
 private fun buildScheme(
     dark: Boolean,
     seed: Color,
-    style: PaletteStyle,
     pureBlack: Boolean,
 ): ColorScheme {
+    /*
+     * 固定 [PaletteStyle.Fidelity]。
+     *
+     * 之前把 style 暴露成设置项，结果是**两个入口在同时决定颜色**：
+     * 「主题色」选色相、「调色板样式」选推导方式 —— 用户改了一个看不到预期效果，
+     * 因为另一个在拦着。现在只留「主题色」，推导方式由这里固定。
+     *
+     * 为什么是 Fidelity 而不是默认的 TonalSpot：
+     *
+     * - TonalSpot 会把 primary 的 chroma **钳到 36**（MCU 的"克制"策略），
+     *   于是 #4D6BFE 这种本身很艳的品牌色被洗成灰蓝 —— 就是"饱和度不够"的根源。
+     * - Fidelity 直接用 seed 自己的 hue + chroma，出来的就是品牌色本身，
+     *   深色下也不会突然褪色。
+     * - 选它而不是 Vibrant：Vibrant 会给低饱和 seed（比如「灰」主题色）
+     *   强行加色，灰变成蓝灰，反而不对。
+     */
     val base = dynamicColorScheme(
         seedColor = seed,
         isDark = dark,
-        style = style,
+        style = PaletteStyle.Fidelity,
     )
     if (!dark || !pureBlack) return base
 
@@ -260,8 +275,6 @@ fun SimpleChatTheme(
     themeMode: ThemeMode = ThemeMode.SYSTEM,
     accent: AccentColor = AccentColor.BLUE,
     fontScale: Float = 1f,
-    /** 调色板样式（M3 tonal palette 的推导方式）。 */
-    paletteStyle: PaletteStyle = PaletteStyle.TonalSpot,
     /** 深色下把中性底压到纯黑（OLED 省电 / 观感）。 */
     pureBlack: Boolean = false,
     content: @Composable () -> Unit,
@@ -276,11 +289,10 @@ fun SimpleChatTheme(
      * 色板按 (seed, 明暗, style, 纯黑) 缓存：生成一整套 tonal palette 要跑
      * 完整的 HCT 色彩空间换算，比一次重组贵得多 —— 不缓存的话每次重组都重算。
      */
-    val scheme = remember(dark, accent, paletteStyle, pureBlack) {
+    val scheme = remember(dark, accent, pureBlack) {
         buildScheme(
             dark = dark,
             seed = accent.primary(dark = false),
-            style = paletteStyle,
             pureBlack = pureBlack,
         )
     }

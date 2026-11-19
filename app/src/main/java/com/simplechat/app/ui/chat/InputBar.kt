@@ -272,7 +272,7 @@ fun InputBar(
                 },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(min = 26.dp, max = 160.dp)
+                    .heightIn(min = 40.dp, max = 180.dp)
                     .focusRequester(focusRequester)
                     /*
                      * 按住说话：只挂在**空输入框**上，且不消费短按 ——
@@ -431,7 +431,7 @@ fun InputBar(
 }
 
 /** 输入栏第二行的统一控件高度。 */
-private val RowButtonSize = 32.dp
+private val RowButtonSize = 40.dp
 
 /** 按住说话时，上滑超过这个距离即视为取消。 */
 private val VoiceCancelSlop = 56.dp

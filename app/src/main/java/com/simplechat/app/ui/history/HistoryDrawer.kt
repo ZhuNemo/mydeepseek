@@ -215,7 +215,7 @@ fun HistoryDrawerContent(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable(onClick = onOpenVault)
-                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                    .padding(horizontal = DrawerInset, vertical = 16.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
@@ -223,7 +223,7 @@ fun HistoryDrawerContent(
                     imageVector = AppIcons.Lock,
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.onSurface,
-                    modifier = Modifier.size(21.dp),
+                    modifier = Modifier.size(22.dp),
                 )
                 Text(
                     text = stringResource(R.string.vault_open),
@@ -236,7 +236,7 @@ fun HistoryDrawerContent(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable(onClick = onOpenSettings)
-                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                    .padding(horizontal = DrawerInset, vertical = 16.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
@@ -244,7 +244,7 @@ fun HistoryDrawerContent(
                     imageVector = AppIcons.Settings,
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.onSurface,
-                    modifier = Modifier.size(21.dp),
+                    modifier = Modifier.size(22.dp),
                 )
                 Text(
                     text = stringResource(R.string.settings_title),
@@ -349,7 +349,7 @@ private fun SearchBox(onClick: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = DrawerInset, vertical = 8.dp)
+            .padding(horizontal = DrawerInset, vertical = 10.dp)
             .clip(PillShape)
             .background(colors.fieldBackground)
             .clickable(onClick = onClick)

@@ -126,16 +126,6 @@
     <string name="settings_data_summary">导入 / 导出 / 清空</string>
     <string name="settings_pure_black">纯黑模式</string>
     <string name="settings_pure_black_hint">深色下把背景压到纯黑，OLED 更省电</string>
-    <string name="settings_palette_style">调色板样式</string>
-    <string name="palette_tonal_spot">Tonal Spot</string>
-    <string name="palette_neutral">Neutral</string>
-    <string name="palette_vibrant">Vibrant</string>
-    <string name="palette_expressive">Expressive</string>
-    <string name="palette_rainbow">Rainbow</string>
-    <string name="palette_fruit_salad">Fruit Salad</string>
-    <string name="palette_monochrome">Monochrome</string>
-    <string name="palette_fidelity">Fidelity</string>
-    <string name="palette_content">Content</string>
     <string name="dialog_close">关闭</string>
     <string name="settings_appearance">外观</string>
     <string name="settings_accent">主题色</string>

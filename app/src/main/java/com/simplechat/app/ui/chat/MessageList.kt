@@ -116,7 +116,7 @@ fun MessageList(
      * 底部要留给**浮在列表之上的输入栏** —— 输入栏不再占位、而是盖在消息区上面，
      * 不给这块留白的话最后一条消息会永远被压在输入栏底下，滚不出来。
      */
-    contentPadding: PaddingValues = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+    contentPadding: PaddingValues = PaddingValues(horizontal = 20.dp, vertical = 14.dp),
     onCopy: (UiMessage) -> Unit = {},
     onRegenerate: (UiMessage) -> Unit = {},
     /** 继续生成：接着这条回复往下写（只有扩展通道能续，见 `ContinuePolicy`）。 */
@@ -232,7 +232,7 @@ fun MessageList(
             .onGloballyPositioned { viewport = it.boundsInWindow() }
             .then(dismissSelectionOnTap),
         contentPadding = searchContentPadding,
-        verticalArrangement = Arrangement.spacedBy(18.dp),
+        verticalArrangement = Arrangement.spacedBy(20.dp),
         /*
          * ⚠️ **顶部为原点（对齐官方）。这一行是流式不滑动的根。**
          *
@@ -613,7 +613,7 @@ fun UserBubble(
                             onClick = onClick,
                             onLongClick = onLongClick,
                         )
-                        .padding(horizontal = 14.dp, vertical = 11.dp),
+                        .padding(horizontal = 16.dp, vertical = 13.dp),
                 ) {
                     // 按下时的浅色层：垫在正文**下面**，正文颜色不受影响
                     if (pressed) {
