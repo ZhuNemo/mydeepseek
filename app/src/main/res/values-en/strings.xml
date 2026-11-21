@@ -91,6 +91,7 @@
     <string name="error_request_failed">Request failed</string>
     <string name="error_no_content">The model returned no content</string>
     <string name="error_send_failed">Send failed: %1$s</string>
+    <string name="error_action_failed">Action failed: %1$s</string>
     <string name="error_no_sendable_messages">There is no user message to send. Enter a new message or clear the outdated context summary and try again.</string>
     <string name="conversation_load_failed">Could not open conversation: %1$s</string>
     <string name="error_write_failed">Could not write to the chosen location</string>

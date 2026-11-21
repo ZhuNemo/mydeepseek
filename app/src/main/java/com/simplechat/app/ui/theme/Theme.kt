@@ -8,6 +8,7 @@ import com.materialkolor.PaletteStyle
 import com.materialkolor.dynamicColorScheme
 import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Shapes
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
@@ -15,9 +16,11 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.dp
 import com.simplechat.app.R
 import com.simplechat.app.data.Res
 
@@ -160,6 +163,25 @@ private val DarkChatColors = ChatColors(
 )
 
 val LocalChatColors = staticCompositionLocalOf { LightChatColors }
+
+/**
+ * M3 的圆角阶梯。
+ *
+ * 之前一直用的是 Material 的默认档（4 / 8 / 12 / 16 / 28），
+ * 那套是按"信息密度高的工具类应用"调的；而这里要的是 M3 **Expressive** 的观感 ——
+ * 大容器 24dp、对话框与浮层 28dp、小控件 8dp。差一档不明显，但**整屏**看下来
+ * 就是"这个是 M3，那个只是像 M3"。
+ *
+ * 只声明这五档：界面上的圆角必须从这里取，别在调用点随手写 `RoundedCornerShape(13.dp)` ——
+ * 一旦允许随手写，半年后就会集齐十几个互不相同的圆角。
+ */
+val SimpleChatShapes = Shapes(
+    extraSmall = RoundedCornerShape(8.dp),
+    small = RoundedCornerShape(12.dp),
+    medium = RoundedCornerShape(16.dp),
+    large = RoundedCornerShape(24.dp),
+    extraLarge = RoundedCornerShape(28.dp),
+)
 
 /**
  * 从 M3 的 [ColorScheme] 派生出这个应用自己的语义色板。
@@ -353,6 +375,7 @@ fun SimpleChatTheme(
     ) {
         MaterialTheme(
             colorScheme = scheme,
+            shapes = SimpleChatShapes,
             typography = SimpleChatTypography,
             content = content,
         )

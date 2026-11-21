@@ -92,6 +92,8 @@
     <string name="error_no_model">还没有选择模型。请在设置 → API 配置里选一个（自定义端点先「测试连接」拉取，或手动填写模型 id）。</string>
     <string name="error_request_failed">请求失败</string>
     <string name="error_send_failed">发送失败：%1$s</string>
+    <!-- 会写库的操作（重试/重新生成/删除/切版本…）失败时的统一文案 -->
+    <string name="error_action_failed">操作失败：%1$s</string>
     <string name="error_no_sendable_messages">当前没有可发送的用户消息，请重新输入消息，或清除已失效的上下文摘要后重试</string>
     <string name="conversation_load_failed">打开对话失败：%1$s</string>
     <string name="error_no_content">模型没有返回内容</string>

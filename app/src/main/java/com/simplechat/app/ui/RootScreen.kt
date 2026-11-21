@@ -133,6 +133,20 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
     val syncState by container.syncManager.state.collectAsStateWithLifecycle()
     // 上游把搜索改成了分页模型（searchPage）；我们这侧原来的 searchHits 已随之消失
     val searchPage by historyViewModel.searchPage.collectAsStateWithLifecycle()
+    /*
+     * 抽屉里的写库操作失败了 → 走对话页那条 banner。
+     *
+     * 这些动作（重命名 / 置顶 / 删除）原本是裸 `launch`：一条数据库异常就会
+     * 让进程直接死掉（`viewModelScope` 没有异常处理器）。现在 HistoryViewModel
+     * 把异常收成一条消息送到这里，用户至少知道"这次没成功"。
+     */
+    val historyError by historyViewModel.error.collectAsStateWithLifecycle()
+    LaunchedEffect(historyError) {
+        historyError?.let {
+            chatViewModel.showBanner(it)
+            historyViewModel.consumeError()
+        }
+    }
     val drawerState = rememberDrawerState(DrawerValue.Closed)
 
     /*

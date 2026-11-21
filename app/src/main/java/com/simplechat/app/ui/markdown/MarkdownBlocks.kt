@@ -43,7 +43,8 @@ import androidx.compose.ui.unit.dp
  * @param source      已 [normalizeSoftBreaks] 的 Markdown 文本。
  * @param streaming   是否处于流式态；为 true 时最后一块套高度下限。
  * @param blockGap    块间距（外层 Column 那一层）。
- * @param renderBlock 单块渲染器。`modifier` 用传入的那个。
+ * @param renderBlock 单块渲染器。`modifier` 用传入的那个；`isTail` 表示这是流式尾块
+ *                   （只有它随 token 变化，也只有它能走"纯段落"快捷路径）。
  */
 @Composable
 internal fun MarkdownTextBlocks(
@@ -51,7 +52,7 @@ internal fun MarkdownTextBlocks(
     streaming: Boolean,
     modifier: Modifier = Modifier,
     blockGap: Dp = 12.dp,
-    renderBlock: @Composable (text: String, modifier: Modifier) -> Unit,
+    renderBlock: @Composable (text: String, modifier: Modifier, isTail: Boolean) -> Unit,
 ) {
     // 切块是 O(n) 纯计算；source 没变就不重算（结果也进缓存，见 [splitBlocksCached]）。
     val blocks = remember(source) { splitBlocksCached(source) }
@@ -73,10 +74,10 @@ internal fun MarkdownTextBlocks(
      * 就是几秒到几十秒。这段时间主线程完全不响应 → 系统判 ANR 并杀掉进程。
      * 用户看到的就是「点开一个超长对话，卡死，然后闪退」。
      *
-     * 而打开会话时的预热恰好把超长消息**排除**了（`WarmTailMaxChars`），
-     * 理由写着"预热只会把后台线程占满" —— 但把活留给主线程不是省掉了它，
-     * 而是把它挪到了最不该待的地方。这次两头都改：预热覆盖首帧要用的块，
-     * 首帧只组合这么多块。
+     * 而打开会话时的预热曾经把超长消息**排除**在外的，理由是"预热只会把后台
+     * 线程占满" —— 但把活留给主线程不是省掉了它，而是把它挪到了最不该待的地方。
+     * 现在两头对齐：预热覆盖首帧要用的块（同一条切块路径、同一种归一化），
+     * 首帧也只组合这么多块。
      *
      * ### 为什么不会看到"内容长出来"
      *
@@ -115,12 +116,21 @@ internal fun MarkdownTextBlocks(
     ) {
         shown.forEachIndexed { index, block ->
             val isTail = streaming && index == blocks.lastIndex
+            /*
+             * 尾块才套高度下限，**代码块例外**。
+             *
+             * 半成品语法（未闭合的 `**`、未成对的列表符号）会让同一段文字重新排版、
+             * 高度变矮，于是界面上下抽一下 —— 钉住历史最大高度正是为了这个。
+             * 但代码块的展开 / 收起**本来就要变高度**：钉住之后高度只会涨，
+             * 收起来会留下一大片空白（用户点了"收起"却没收回，像是坏了）。
+             */
+            val pinHeight = isTail && !block.text.contains("```") && !block.text.contains("~~~")
             // key 用块起始 offset：追加内容时前面的块 key 不变 → 跳过重组与重解析
             key(block.key) {
                 Box(modifier = Modifier.fillMaxWidth()) {
                     renderBlock(
                         block.text,
-                        if (isTail) {
+                        if (pinHeight) {
                             Modifier.retainMinHeightWhileStreaming(
                                 streaming = true,
                                 resetKey = block.key,
@@ -128,6 +138,7 @@ internal fun MarkdownTextBlocks(
                         } else {
                             Modifier
                         },
+                        isTail,
                     )
                 }
             }

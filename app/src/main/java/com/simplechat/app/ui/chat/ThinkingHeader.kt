@@ -5,14 +5,12 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -21,15 +19,12 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.simplechat.app.R
 import com.simplechat.app.data.Res
 import com.simplechat.app.ui.common.AppIcons
+import com.simplechat.app.ui.common.ContainedLoading
 import com.simplechat.app.ui.common.PillShape
 import com.simplechat.app.ui.theme.LocalChatColors
 
@@ -127,18 +122,15 @@ internal fun WaitingIndicator(modifier: Modifier = Modifier) {
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         /*
-         * 换成 M3 的 [CircularProgressIndicator]，不再自己画圆弧。
+         * 用 [ContainedLoading]：会变形的容器 + 轨道点，与整屏加载（切会话）同一套语言。
          *
-         * 原来那个是 Canvas + 一个线性旋转：形状像，但没有 M3 的"头尾收缩"
-         * （indeterminate 的弧长会自己变长变短），旋转变速也是匀速 ——
-         * 一眼能看出"这不是系统的转圈"。M3 的实现还自带无障碍语义。
-         *
-         * 尺寸取 16dp（原 15dp）：M3 最小的 spinner 是 20dp 档，16 在行内更协调。
+         * 这里刻意用**过程文字色**的两个档（实心 + 18% 底）而不是品牌色：
+         * 这一行是"AI 正在想"的辅助信息，不该比正文更抢眼。
          */
-        CircularProgressIndicator(
-            modifier = Modifier.size(16.dp),
+        ContainedLoading(
+            size = 18.dp,
+            containerColor = colors.processText.copy(alpha = 0.18f),
             color = colors.processText,
-            strokeWidth = 2.dp,
         )
         Text(
             // 省略号按秒循环出现：三个点，一格一个

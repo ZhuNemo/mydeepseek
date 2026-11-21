@@ -28,12 +28,9 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -86,9 +83,9 @@ import com.simplechat.app.ui.theme.MarkdownHeadingStyles
 import com.simplechat.app.ui.theme.MarkdownInlineCodeStyle
 import com.simplechat.app.ui.theme.MarkdownTableStyle
 import com.simplechat.app.ui.theme.SimpleChatTypography
-import kotlin.math.ceil
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import org.intellij.markdown.ast.ASTNode
 import org.intellij.markdown.ast.findChildOfType
 import org.intellij.markdown.flavours.gfm.GFMElementTypes.HEADER
@@ -135,6 +132,13 @@ import org.intellij.markdown.flavours.gfm.GFMTokenTypes.CELL
 internal fun normalizeForMarkdown(content: String): String =
     normalizeSoftBreaks(normalizeHtml(content))
 
+/**
+ * 正文渲染的**入口**（自带逐字显示）。
+ *
+ * ⚠️ 带公式的正文不要直接用它 —— 走 [MarkdownWithMath]，由那边**整条回复共用**
+ * 一份显示进度（见那里的说明）。直接把 `MarkdownWithMath` 拆成几段各自调用本函数，
+ * 每一段都会从头开始逐字显示，看起来就是"公式后面的段落重新浮现一次"。
+ */
 @Composable
 fun MarkdownText(
     content: String,
@@ -149,22 +153,53 @@ fun MarkdownText(
     textColor: Color? = null,
 ) {
     /*
-     * 先**匀速放出一段前缀**（见 [rememberSmoothReveal]），再做 HTML 折算与软换行补全 ——
+     * 先**按帧放出一段前缀**（见 [rememberSmoothReveal]），再做 HTML 折算与软换行补全 ——
      * 后面每一步都只处理已经稳定的那段文本。
      *
      * 顺序不能反：归一化只做一次才便宜；先归一化再截断，等于每个字符都要重跑一遍整篇。
      */
     val revealed = rememberSmoothReveal(streaming = streaming, value = content)
+    MarkdownBody(
+        content = revealed,
+        modifier = modifier,
+        streaming = streaming,
+        textColor = textColor,
+    )
+}
 
-    val text = remember(revealed) { normalizeForMarkdown(revealed) }
+/**
+ * 只做渲染、**不做逐字显示**的那一半。
+ *
+ * 拆出来是为了让 [MarkdownWithMath] 把"显示进度"提到整条回复这一层：
+ * 公式切段之后，每段都是这条回复的一部分，进度该共用一条，
+ * 而不是每段各自从第一个字开始重播。
+ *
+ * 归一化与切块都按 `content` 缓存（见 [MarkdownStateCache] / [splitBlocksCached]），
+ * 同一段文本反复进出不会重复解析。
+ */
+@Composable
+internal fun MarkdownBody(
+    content: String,
+    modifier: Modifier = Modifier,
+    streaming: Boolean = false,
+    textColor: Color? = null,
+) {
+    val text = remember(content) { normalizeForMarkdown(content) }
 
     MarkdownTextBlocks(
         source = text,
         streaming = streaming,
         modifier = modifier,
         blockGap = MarkdownBlockColumnGap,
-    ) { blockText, blockModifier ->
-        MarkdownBlockView(text = blockText, modifier = blockModifier, textColor = textColor)
+    ) { blockText, blockModifier, isTail ->
+        MarkdownBlockView(
+            text = blockText,
+            modifier = blockModifier,
+            textColor = textColor,
+            // 只有流式尾块可以走"纯段落"快捷路径：历史消息宁可走完整渲染，
+            // 也不要为了省几百微秒去赌一个判定漏掉的语法（见 LiteralParagraph）
+            plainEligible = isTail && streaming,
+        )
     }
 }
 
@@ -311,8 +346,23 @@ private fun markdownStateOf(text: String): State {
  * 剩下的块由渐进式渲染逐帧补齐，主线程永远不撞上冷缓存的大段文本。
  *
  * 见 `ChatScreen` 里那个预热 effect 与 [MarkdownStateCache] 的说明。
+ *
+ * ### 两道上限 + 可取消
+ *
+ * 预热是**后台的尽力而为**，不能反过来变成负担：
+ *
+ * - 最多 [WarmMaxBlocks] 块（够首屏 + 几屏补窗用）；
+ * - 最多 [WarmMaxChars] 字符（一块可能是 2000 字，也可能是一行）；
+ * - 每块之间查一次协程取消状态：用户翻走 / 换会话时立刻停手，
+ *   不留一个还在解析几十万字的孤儿协程。
+ *
+ * 被截断的那一块文本与真实渲染的尾块不同，那**一块**不命中缓存 —— 无所谓，
+ * 它本来就不在首屏；其余块逐字相同、必然命中。
  */
-internal fun warmMarkdownCache(content: String, maxBlocks: Int = Int.MAX_VALUE) {
+internal suspend fun warmMarkdownCache(
+    content: String,
+    maxBlocks: Int = WarmMaxBlocks,
+) {
     if (content.isEmpty()) return
     /*
      * ⚠️ 归一化必须与渲染路径**逐字一致**，否则缓存永不命中。
@@ -324,22 +374,34 @@ internal fun warmMarkdownCache(content: String, maxBlocks: Int = Int.MAX_VALUE) 
      * 现在两边都走 [normalizeForMarkdown]；只要有人再往这条链上加一步，
      * 就必须同时改那一个函数，而不是只改其中一条路径。
      */
-    val normalized = normalizeForMarkdown(content)
+    val head = if (content.length > WarmMaxChars) content.substring(0, WarmMaxChars) else content
+    val normalized = normalizeForMarkdown(head)
     val blocks = splitBlocksCached(normalized)
-    val head = if (maxBlocks >= blocks.size) blocks else blocks.subList(0, maxBlocks)
-    head.forEach { markdownStateOf(it.text) }
+    val limit = minOf(maxBlocks, blocks.size)
+    for (index in 0 until limit) {
+        currentCoroutineContext().ensureActive()
+        markdownStateOf(blocks[index].text)
+    }
 }
+
+/** 预热最多处理多少块（与 `MarkdownTextBlocks` 的补窗批次同一量级）。 */
+internal const val WarmMaxBlocks = 48
+
+/** 预热最多处理多少字符。24k 字 ≈ 首屏 + 十几屏。 */
+private const val WarmMaxChars = 24_000
 
 /**
  * 单个 Markdown 块的渲染。
  *
- * ### ⚠️ 参数只有 `(String, Modifier)`，这是**刻意的**
+ * ### ⚠️ 参数只有 `(String, Modifier)` 这类**稳定值**，这是**刻意的**
  *
  * Compose 的"跳过重组"是按**参数**判的：只有参数全稳定、且与上次相等，
  * 才会整个跳过这个 composable 的函数体。样式（颜色 / 字体 / 内边距 / 组件）
  * 如果当参数传进来，它们是每次重组都新建的对象 —— 参数永不相等，于是
  * **每一个块、每一帧**都要重走一遍「解析 → 建 AnnotatedString → 排版」。
  * 分块渲染想省的正是这个（只重解析尾块）；一旦样式走参数，就全白做了。
+ *
+ * `plainEligible` 是布尔值，同样稳定 —— 它只在"是不是流式尾块"变化时翻一次。
  *
  * 改成从主题 / CompositionLocal 里读，参数就只剩两个稳定值。流式期间
  * 只有**尾块**的 `text` 在变，前面所有块的参数不变 → **整个跳过**，
@@ -349,9 +411,33 @@ internal fun warmMarkdownCache(content: String, maxBlocks: Int = Int.MAX_VALUE) 
  * 内容没变的块参数仍然相等 —— 跳过照样成立。）
  */
 @Composable
-private fun MarkdownBlockView(text: String, modifier: Modifier, textColor: Color? = null) {
+private fun MarkdownBlockView(
+    text: String,
+    modifier: Modifier,
+    textColor: Color? = null,
+    /** 允许走 [LiteralParagraph] 快捷路径（只有流式尾块为 true）。 */
+    plainEligible: Boolean = false,
+) {
     val colors = LocalChatColors.current
     val scheme = MaterialTheme.colorScheme
+
+    /*
+     * ── 普通段落：绕过库，直接排版 ──────────────────────────
+     *
+     * 判据（[isPlainParagraph]）宁可保守：判错会让原始 Markdown 语法露在屏幕上。
+     *
+     * 三个前提缺一不可：
+     * - 这是**流式尾块**（历史消息走完整渲染，几微秒的差别不值得冒判错的风险）；
+     * - 没有搜索高亮（高亮是库的 `ExtendedSpans` 画的，纯 `Text` 画不出来）；
+     * - 内容是**单个无标记段落**。
+     *
+     * 字号/行高/对齐与库的 `paragraph` 完全同源（都取 `markdownBodyStyle`），
+     * 所以定稿那一刻交回库渲染时版式不变。
+     */
+    if (plainEligible && LocalSearchHighlight.current == null && isPlainParagraph(text)) {
+        LiteralParagraph(text = text, modifier = modifier, textColor = textColor)
+        return
+    }
 
     // 正文样式按语种分档（多语言 §4：中文两端对齐、西文左对齐）。
     // 两份样式都是常量，不产生分配；也不进参数 —— 参数变了就不会跳过重组。
@@ -498,125 +584,6 @@ private fun headingTopGap(text: String): Dp {
  * 唯一例外是大标题（h1–h3）：官方上边距 32px，见 [headingTopGap] 补的那 16dp。
  */
 private val MarkdownBlockColumnGap = 16.dp
-
-/**
- * 一帧的预算（毫秒）。60Hz 是 16.7ms，取 16 留一点余量给排版抖动。
- *
- * 一帧没被拖过这个数，就说明"渲染追得上"，不需要额外冷却。
- */
-private const val FrameBudgetMs = 16L
-
-/**
- * 自适应冷却的上限。
- *
- * 只有"文档大到渲染一次要几百毫秒"才会碰到（几万字 + 表格 + 代码块）。
- * 那时宁可一秒只更新两次，也比每一帧都超时、整屏卡死要好。
- */
-private const val MaxCooldownMs = 2_000L
-
-/** 采样循环的唤醒间隔。只做一次字符串比较，代价可以忽略。 */
-private const val SamplePollMs = 10L
-
-/**
- * 下一次允许更新前要等多久（毫秒）。
- *
- * 直接对应官方 Chat Demo 的 `useThrottleMarkdownRender`：**上次渲染耗时 × 2，上限 2 秒**。
- * 差别只在"耗时"怎么取 —— 那边用 `performance.now()` 前后差，这边拿**帧周期**当代理：
- * 内容是在某一帧里提交并排版的，那一帧被拖长了多少，就是这次更新花了多少。
- *
- * 纯函数，有单测（`MarkdownFrameBudgetTest`）。
- */
-internal fun adaptiveCooldownMs(frameCostMs: Long): Long {
-    val over = frameCostMs - FrameBudgetMs
-    return if (over <= 0L) 0L else (over * 2).coerceAtMost(MaxCooldownMs)
-}
-
-/** 匀速出字的节拍（毫秒）与每拍追赶比例。 */
-private const val RevealTickMs = 32L
-private const val RevealRatio = 0.3f
-
-/**
- * 把高频变化的流式文本喂给 markdown 渲染：**匀速出字 + 帧对齐 + 按帧耗时自适应**。
- *
- * 这一层同时解决两个不同的问题，缺一个都不好看：
- *
- * **一、匀速（对齐 Simple-Agent 的 `useSmoothReveal`）**
- * 网络侧的增量是**突发**的（一个 SSE 包 0 字、下一个 12 字）。来多少画多少，
- * 排版和光标位置就会一段一段跳。这里把"到达"和"显示"解耦：
- *
- * - 每 ~[RevealTickMs] 推进一步，而不是每来一个增量推一次
- * - 每步推进 `max(1, 积压 × [RevealRatio])` —— 积压多时追得快，少时逐字落定
- * - 流结束立刻补齐，尾巴不会拖在缓冲里
- *
- * **二、自适应（对齐官方 Chat Demo 的 `useThrottleMarkdownRender`）**
- * 一帧被拖长了多少毫秒，就冷却多少毫秒；实在追不上时这一拍**少放几个字**。
- * 轻内容等于每帧都在走（连续流动），重内容自动放慢，但**不掉帧**。
- *
- * ⚠️ 不能写成 `LaunchedEffect(value) { delay(n); shown = value }`：
- * 那是 **debounce**，流式期间 `value` 每几十毫秒变一次、计时器永远重启，
- * 界面会**一直不动**，直到流结束才"啪"地全部出现 —— 比不节流还糟。
- *
- * 非流式状态**不挂循环**（只做一次追赶）—— 否则每条已定稿的消息都会留一个
- * 每 10ms 醒一次的协程，一屏十几条就是上百次空唤醒。
- */
-@Composable
-private fun rememberSmoothReveal(streaming: Boolean, value: String): String {
-    var shown by remember { mutableStateOf(value) }
-    val latest by rememberUpdatedState(value)
-    var cooldownMs by remember { mutableLongStateOf(0L) }
-
-    LaunchedEffect(streaming) {
-        if (!streaming) {
-            // 定稿：一次追上，然后退出。此后内容不再变，不需要循环
-            if (shown != latest) shown = latest
-            return@LaunchedEffect
-        }
-        while (isActive) {
-            val target = latest
-            val current = shown
-            // 没有新内容：只醒来比一下字符串引用，代价可以忽略
-            if (target == current) {
-                delay(SamplePollMs)
-                continue
-            }
-            // 上次更新把帧拖长了 → 先按冷却睡一会；新内容不会打断这次冷却
-            if (cooldownMs > 0L) delay(cooldownMs)
-
-            /*
-             * 整段被换掉了（换消息 / 重新生成 / 从别处切回来）：
-             * 没有"逐步浮现"可言，直接跳过去，否则会看到旧内容被一个字一个字擦掉。
-             */
-            if (!target.startsWith(current)) {
-                shown = target
-                continue
-            }
-
-            // 积压多少，就按比例放出来；至少一个字，保证不会停住
-            val backlog = target.length - current.length
-            var advance = maxOf(1, ceil(backlog * RevealRatio).toInt())
-            var end = minOf(current.length + advance, target.length)
-            // 不要把代理对切成两半（emoji 会闪一帧方块）
-            if (end < target.length && target[end - 1].isHighSurrogate()) end -= 1
-            if (end <= current.length) continue
-
-            // 对齐到帧的开始：让"提交 → 分块 → 解析尾块 → 排版 → 绘制"落在同一帧里
-            val startNs = withFrameNanos { it }
-            shown = target.substring(0, end)
-            // 再等下一帧：它的开始时刻减去上一帧的开始，就是这一帧的实际耗时
-            val nextNs = withFrameNanos { it }
-            val frameMs = (nextNs - startNs) / 1_000_000
-            cooldownMs = adaptiveCooldownMs(frameMs)
-
-            // 节奏：不足一拍就补足；这一帧已经很贵就不再额外等
-            val wait = RevealTickMs - frameMs
-            if (wait > 0L) delay(wait)
-        }
-    }
-
-    // 定稿后直接给最新值：不再经过采样状态，避免"最后一帧还差一点"
-    return if (streaming) shown else value
-}
-
 
 // ══════════════════════════════════════════════════════════
 //  代码块：语言标签 + 复制 + 超长折叠

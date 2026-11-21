@@ -21,6 +21,7 @@ import com.simplechat.app.data.Attachment
 import com.simplechat.app.data.ChatRepository
 import com.simplechat.app.ui.markdown.MarkdownInitialBlocks
 import com.simplechat.app.ui.markdown.warmMarkdownCache
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import com.simplechat.app.data.Res
 import com.simplechat.app.data.SettingsStore
@@ -694,6 +695,16 @@ class ChatViewModel(
         banner = null
     }
 
+    /**
+     * 从别处（抽屉里的重命名 / 置顶 / 删除）投递一条全局提示。
+     *
+     * 复用对话页那条 banner，而不是再造一个 Snackbar 宿主：这两类提示的
+     * 呈现位置、时长、关闭方式本来就该一致，多一套只会多一种"提示长得不一样"。
+     */
+    fun showBanner(text: String) {
+        banner = text
+    }
+
     fun refreshModels() {
         if (refreshingModels) return
         refreshingModels = true
@@ -1017,7 +1028,7 @@ class ChatViewModel(
     fun clearCompaction() {
         val active = compaction ?: return
         compaction = null
-        viewModelScope.launch { repository.deleteCompaction(active.id) }
+        launchGuarded("clearCompaction") { repository.deleteCompaction(active.id) }
     }
 
     /** 手工修正摘要（AI 记错人名地名时用）。 */
@@ -1164,7 +1175,7 @@ class ChatViewModel(
         if (isStreaming || target.role != MessageRole.ASSISTANT) return
         val conversationId = currentConversationId ?: return
 
-        viewModelScope.launch {
+        launchGuarded("retry") {
             switchJob?.join()
             repository.resetForRetry(target.id, settings.model.id)
             reloadPath(conversationId)
@@ -1186,7 +1197,7 @@ class ChatViewModel(
         val index = messages.indexOfFirst { it.id == target.id }
         if (index < 0) return
 
-        viewModelScope.launch {
+        launchGuarded("regenerate") {
             // 挂在**被重新生成那条的父亲**下 → 成为它的兄弟，旧回答留着
             val fresh = repository.addActiveVariant(
                 conversationId = conversationId,
@@ -1219,7 +1230,7 @@ class ChatViewModel(
         if (index < 0) return
         if (!canContinueReply(target, isLastOnPath = index == messages.lastIndex)) return
 
-        viewModelScope.launch {
+        launchGuarded("continue") {
             switchJob?.join()
             repository.resumeStreaming(target.id)
             patch(target.id) {
@@ -1230,6 +1241,15 @@ class ChatViewModel(
                 )
             }
             startStream(conversationId, target.id, prefix = target)
+        }.invokeOnCompletion { cause ->
+            /*
+             * 没走到 startStream 就失败（库写不进去）：把这条从 STREAMING 退回原状态。
+             * 否则它会以"正在生成"的样子卡在界面上 —— 操作栏与长按菜单全部禁用，
+             * 用户既删不掉也切不走（见 §44 里那张"僵尸消息"的坑）。
+             */
+            if (cause != null && !isStreaming) {
+                patch(target.id) { it.copy(status = target.status, errorMessage = target.errorMessage) }
+            }
         }
     }
 
@@ -1344,7 +1364,7 @@ class ChatViewModel(
     fun deleteMessage(target: UiMessage) {
         if (isStreaming) return
         val conversationId = currentConversationId ?: return
-        viewModelScope.launch {
+        launchGuarded("deleteMessage") {
             repository.deleteMessage(target.id)
             reloadPath(conversationId)
         }
@@ -1361,8 +1381,8 @@ class ChatViewModel(
      */
     fun forkFrom(target: UiMessage) {
         if (isStreaming) return
-        viewModelScope.launch {
-            val newId = repository.forkConversation(target.id) ?: return@launch
+        launchGuarded("fork") {
+            val newId = repository.forkConversation(target.id) ?: return@launchGuarded
             openConversation(newId)
         }
     }
@@ -1378,9 +1398,9 @@ class ChatViewModel(
         val conversationId = currentConversationId ?: return
         if (variantIndex !in 0 until target.variantCount) return
 
-        viewModelScope.launch {
+        launchGuarded("switchVariant") {
             val id = repository.messageIdAt(conversationId, target.parentId, variantIndex)
-                ?: return@launch
+                ?: return@launchGuarded
             repository.activateVariant(id, conversationId, target.parentId)
             reloadPath(conversationId)
         }
@@ -1395,6 +1415,40 @@ class ChatViewModel(
         streamJob = null
         // 用户主动停止：前台服务立刻收掉，不留一条"正在生成"的通知
         BackgroundGeneration.sync(false)
+    }
+
+    /**
+     * 跑一个**会写库 / 会动文件**的操作，并把异常收敛成一条 banner。
+     *
+     * ### 为什么必须收口
+     *
+     * `viewModelScope` 默认没有 `CoroutineExceptionHandler`：协程体里抛出的
+     * 异常会被交给线程的默认处理器 —— 在 Android 上就是**进程直接死掉**。
+     * 用户看到的是"点了一下重新生成，界面卡了半秒，然后 App 没了"，
+     * 而真正的原因可能只是磁盘满了、库被别的写入锁住了。
+     *
+     * 这类操作（重试 / 重新生成 / 续写 / 删除 / 分叉 / 切版本）此前都是裸
+     * `launch`，一条 SQLite 异常就能带走整个进程。现在统一从这里进：
+     * 失败 → 一条人话 banner，界面其余部分照常可用。
+     *
+     * 取消照旧往外抛：那是正常控制流（切会话会取消旧任务），不是错误。
+     *
+     * @param tag 动作名，**只进日志**（不进界面文案：界面上那句话与语言相关，
+     *            而日志要给开发者看，英文标签更好搜）。
+     */
+    private fun launchGuarded(
+        tag: String,
+        block: suspend CoroutineScope.() -> Unit,
+    ): Job = viewModelScope.launch {
+        try {
+            block()
+        } catch (cancel: kotlinx.coroutines.CancellationException) {
+            throw cancel
+        } catch (error: Exception) {
+            // 原始异常进日志（排查要用），界面只给一句人话
+            android.util.Log.e("SimpleChat/Action", "action failed: " + tag, error)
+            banner = Res.get(R.string.error_action_failed, error.userMessage())
+        }
     }
 
     /**
@@ -2152,8 +2206,8 @@ class ChatViewModel(
          * 相邻两次屏幕更新实际落在 50～100ms 之间抖，看着就是一跳一跳。
          * 官方只有 rAF 一把尺子，所以是连续流动的。
          *
-         * 单次提交的**重活由渲染层兜住**：`MarkdownText` 现在按帧耗时自适应
-         * 冷却（`adaptiveCooldownMs`），一帧被拖长就自动少跳几帧。
+         * 单次提交的**重活由渲染层兜住**：`rememberSmoothReveal`（`ui/markdown/SmoothReveal.kt`）按帧耗时自适应
+         * 冷却（`cooldownAfter`，上限 96ms），一帧被拖长就自动少放几个字。
          * 也就是说"提频"与"防卡"分别由两层各管一段，而不是靠一个保守的常数两头兼顾。
          *
          * ⚠️ 真机上若出现滚动掉帧，先量一次帧时间再回调这个值 ——

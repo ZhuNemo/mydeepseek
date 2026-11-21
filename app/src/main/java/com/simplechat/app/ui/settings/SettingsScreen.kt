@@ -2475,76 +2475,135 @@ private fun LicenseDetailDialog(entry: LicenseEntry, onDismiss: () -> Unit) {
 //  基础组件
 // ══════════════════════════════════════════════════════════
 
+/**
+ * 设置页的顶部：**大标题 + 填充式圆形返回键**。
+ *
+ * 按 M3 的 Large top app bar 排：返回键在上、标题在下一行、左对齐、28sp。
+ * 与"一行里塞下返回键和小标题"的老版相比，这一版的层级更清楚 ——
+ * 用户一眼知道自己在哪一页，而不是先看见一颗按钮再去找标题。
+ *
+ * 不做折叠（滚动时收缩）：二级页的滚动容器在 `AnimatedContent` 里，
+ * 每页各有一份 `ScrollState`，把折叠接进来得给每页都挂 `nestedScroll`，
+ * 换来的只是一个动效 —— 不值。
+ */
 @Composable
 fun SettingsTopBar(title: String, onBack: () -> Unit) {
-    val colors = LocalChatColors.current
-    Box(
+    Column(
         modifier = Modifier
             .fillMaxWidth()
             .statusBarsPadding()
-            .height(56.dp),
+            .padding(start = 16.dp, end = 16.dp, top = 8.dp),
     ) {
+        // 48dp 触控区包着 40dp 的色块（同顶栏那颗，见 `ChatTopBar`）
         Box(
             modifier = Modifier
-                .align(Alignment.CenterStart)
-                .padding(start = 16.dp)
-                .size(36.dp)
+                .size(48.dp)
                 .clip(CircleShape)
-                .background(colors.fieldBackground)
                 .clickable(onClick = onBack),
             contentAlignment = Alignment.Center,
         ) {
-            Icon(
-                imageVector = AppIcons.ChevronLeft,
-                contentDescription = stringResource(R.string.action_back),
-                tint = MaterialTheme.colorScheme.onSurface,
-                modifier = Modifier.size(18.dp),
-            )
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.surfaceContainerHigh),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = AppIcons.ChevronLeft,
+                    contentDescription = stringResource(R.string.action_back),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(20.dp),
+                )
+            }
         }
+
+        Spacer(Modifier.size(4.dp))
 
         Text(
             text = title,
-            style = MaterialTheme.typography.titleMedium,
+            style = MaterialTheme.typography.headlineMedium,
             color = MaterialTheme.colorScheme.onSurface,
-            modifier = Modifier.align(Alignment.Center),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            // 与返回键色块的左缘对齐
+            modifier = Modifier.padding(start = 4.dp),
         )
+
+        Spacer(Modifier.size(8.dp))
     }
 }
 
+/**
+ * 分组小标题。
+ *
+ * 用**主色**而不是灰色（`labelMedium` 13sp）：设置页里分组标题是唯一
+ * 需要"被扫到"的层级，灰色小字在一屏十几行里根本读不出来。
+ * 这也正是 M3 设置类界面的常规做法 —— 分组标题承担导航，不承担正文。
+ */
 @Composable
 fun SettingsSectionLabel(text: String) {
-    val colors = LocalChatColors.current
     Text(
         text = text,
-        style = MaterialTheme.typography.labelLarge,
-        color = colors.placeholder,
-        modifier = Modifier.padding(start = 4.dp, top = 28.dp, bottom = 12.dp),
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(start = 10.dp, top = 16.dp, bottom = 8.dp),
     )
 }
 
+/**
+ * 设置卡片：**一张 24dp 圆角的整块**，里面的行之间用小间隙隔开。
+ *
+ * 行与行的分隔由 [RowDivider] 画成"一条页面底色的缝"，而不是一条 1dp 细线 ——
+ * 于是这一块看起来是**一组相连的行**（M3 的 connected list），
+ * 而不是一张带表格线的卡。
+ */
 @Composable
 fun SettingsCard(content: @Composable () -> Unit) {
     val colors = LocalChatColors.current
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(MenuShape)
+            .clip(SettingsCardShape)
             .background(colors.card),
     ) {
         content()
     }
 }
 
+/** 卡片圆角：M3 的 large 档（24dp）。 */
+private val SettingsCardShape = RoundedCornerShape(24.dp)
+
+/**
+ * 行之间的分割。
+ *
+ * 两种形态，**同名的原因是调用点太多**（三十多处），逐个改会引入更多风险：
+ *
+ * - **不带参数**（卡片里）：一条 **2dp 的页面底色**。卡片里的每一行都被这条缝切开，
+ *   整块读起来是"几行连在一起"（M3 的 connected list），而不是一张带表格线的卡。
+ *   左侧不留白 —— 缝通到两边，连接感才成立。
+ * - **`inset = 16.dp`**（对话框、非卡片的区域）：仍然是一条 1dp 细线并缩进，
+ *   那是"M3 的列表分隔线"，与上面那种"缝"是两种东西，不该混用。
+ */
 @Composable
-private fun RowDivider(inset: androidx.compose.ui.unit.Dp = 56.dp) {
+private fun RowDivider(inset: androidx.compose.ui.unit.Dp = 0.dp) {
     val colors = LocalChatColors.current
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(start = inset)
-            .height(1.dp)
-            .background(colors.divider),
-    )
+    if (inset > 0.dp) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = inset)
+                .height(1.dp)
+                .background(colors.divider),
+        )
+    } else {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(2.dp)
+                .background(colors.settingsBackground),
+        )
+    }
 }
 
 /** 主题色菜单的宽度：七个 40dp 色块 + 8dp 间距，比默认菜单宽。 */

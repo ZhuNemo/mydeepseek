@@ -9,6 +9,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import com.simplechat.app.R
 import com.simplechat.app.data.ChatRepository
 import com.simplechat.app.data.Res
 import com.simplechat.app.db.ConversationEntity
@@ -17,6 +18,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
@@ -33,6 +35,18 @@ data class SearchPage(val hits: List<ConversationSearchHit> = emptyList(), val h
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class HistoryViewModel(private val repository: ChatRepository) : ViewModel() {
+
+    /**
+     * 操作失败的提示通道。
+     *
+     * 抽屉里的重命名 / 置顶 / 删除都是"点一下就该成功"的动作，失败时**必须有反馈**，
+     * 否则用户看到列表没变只会以为是自己没点中。显示位置交给调用方
+     * （`RootScreen` 把它转成对话页那条 banner），这里只负责把消息送出去。
+     */
+    private val _error = MutableStateFlow<String?>(null)
+    val error: StateFlow<String?> = _error.asStateFlow()
+
+    fun consumeError() { _error.value = null }
 
     private val queryFlow = MutableStateFlow("")
     private val searchLimit = MutableStateFlow(100)
@@ -106,22 +120,22 @@ class HistoryViewModel(private val repository: ChatRepository) : ViewModel() {
     // ── 单条操作 ──────────────────────────────────────────
 
     fun rename(id: String, title: String) {
-        viewModelScope.launch { repository.renameConversation(id, title) }
+        launchGuarded("rename") { repository.renameConversation(id, title) }
     }
 
     fun togglePin(conversation: ConversationEntity) {
-        viewModelScope.launch { repository.setPinned(conversation.id, !conversation.pinned) }
+        launchGuarded("togglePin") { repository.setPinned(conversation.id, !conversation.pinned) }
     }
 
     fun delete(id: String) {
-        viewModelScope.launch { repository.deleteConversations(listOf(id)) }
+        launchGuarded("delete") { repository.deleteConversations(listOf(id)) }
     }
 
     // ── 批量操作 ──────────────────────────────────────────
 
     fun pinSelected(pinned: Boolean) {
         val ids = selectedIds.toList()
-        viewModelScope.launch {
+        launchGuarded("pinSelected") {
             ids.forEach { repository.setPinned(it, pinned) }
             exitSelection()
         }
@@ -129,7 +143,7 @@ class HistoryViewModel(private val repository: ChatRepository) : ViewModel() {
 
     fun deleteSelected() {
         val ids = selectedIds.toList()
-        viewModelScope.launch {
+        launchGuarded("deleteSelected") {
             repository.deleteConversations(ids)
             exitSelection()
         }
@@ -137,7 +151,32 @@ class HistoryViewModel(private val repository: ChatRepository) : ViewModel() {
 
     /** 首次启动播种内置预设。 */
     fun seedPresets() {
-        viewModelScope.launch { repository.reconcileBuiltInPresets() }
+        launchGuarded("seedPresets") { repository.reconcileBuiltInPresets() }
+    }
+
+    /**
+     * 写库操作统一入口。
+     *
+     * `viewModelScope` 没有 `CoroutineExceptionHandler`，协程体里的异常会
+     * **直接带走进程**。抽屉里的重命名 / 置顶 / 删除都是"点一下就该成功"的动作，
+     * 一条 `SQLiteException`（磁盘满、库被锁）不该变成闪退 ——
+     * 这里把它压成日志 + 一条提示，列表照常可用。
+     *
+     * 失败不静默：抽屉底部那条提示是用户唯一的反馈渠道。
+     */
+    private fun launchGuarded(
+        tag: String,
+        block: suspend kotlinx.coroutines.CoroutineScope.() -> Unit,
+    ) = viewModelScope.launch {
+        try {
+            block()
+        } catch (cancel: kotlinx.coroutines.CancellationException) {
+            throw cancel
+        } catch (error: Exception) {
+            android.util.Log.e("SimpleChat/History", "action failed: " + tag, error)
+            // 下一次列表刷新会把真相带回来；提示只说明"这次没成功"
+            _error.value = Res.get(R.string.error_action_failed, error.userMessage())
+        }
     }
 
     companion object {

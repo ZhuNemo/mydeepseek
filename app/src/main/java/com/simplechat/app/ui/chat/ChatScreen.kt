@@ -90,10 +90,12 @@ import com.simplechat.app.ui.common.SoftShape
 import com.simplechat.app.ui.common.VoiceInputEnabled
 import com.simplechat.app.ui.common.AppConfirmDialog
 import com.simplechat.app.ui.common.AppIcons
+import com.simplechat.app.ui.common.ContainedLoading
 import com.simplechat.app.ui.common.AppShadow
 import com.simplechat.app.ui.common.IconCircleButton
 import com.simplechat.app.ui.common.MotionEasing
 import com.simplechat.app.ui.common.dismissKeyboardOnTouch
+import com.simplechat.app.ui.markdown.MarkdownInitialBlocks
 import com.simplechat.app.ui.markdown.warmMarkdownCache
 import com.simplechat.app.ui.theme.LocalChatColors
 import kotlinx.coroutines.Dispatchers
@@ -105,7 +107,6 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.material3.CircularProgressIndicator
 import kotlinx.coroutines.delay
 import androidx.compose.foundation.layout.fillMaxHeight
 
@@ -129,14 +130,6 @@ private const val HugeMessageChars = 20_000
 
 /** 换会话时，慢过这么久才显示转圈 —— 短会话不该闪一下圈圈。 */
 private const val SpinnerDelayMs = 120L
-
-/**
- * 预热 Markdown 解析时，尾部消息超过这么多字符就不预热。
- *
- * 预热的意义是"打开就能看到的那一条不用现场解析"；一条几万字的消息本身就要
- * 几百毫秒解析，替它预热只会把后台线程占满、让真正的首屏更晚。
- */
-private const val WarmTailMaxChars = 24_000
 
 /** 等新会话内容就位的兜底上限。超过就当它已经好了，不能让界面停在透明态。 */
 private const val SwitchLoadTimeoutMs = 2_000L
@@ -601,7 +594,16 @@ fun ChatScreen(
     val messageIndexEntries by produceState(
         initialValue = emptyList<MessageIndexEntry>(),
         vm.currentConversationId,
+        /*
+         * ⚠️ **条数不够，还要认版本号。**
+         *
+         * 切版本 / 重新生成 / 删除后重读路径时，条数可能**一点没变**（换的是同父的
+         * 兄弟），但每条的 id 与下标都变了。只按条数重建的话，索引里留着的是
+         * 一批已经不存在的 id —— 点一条就跳到错的位置，而且列表本身是对的，
+         * 用户只会觉得"这个索引坏了"。
+         */
         vm.messages.size,
+        vm.pathRevision,
     ) {
         value = buildMessageIndexSnapshot(vm.messages)
     }
@@ -776,12 +778,15 @@ fun ChatScreen(
      *
      * 真正需要的只有"贴底打开时立刻能看到的那一条"，其余交给惰性渲染：
      * 滚进视口才解析，解析结果进 LRU 缓存。
+     *
+     * 长消息**也预热**（只预热首帧那几块）：跳过它等于把解析推回主线程，
+     * 那正是"点开长回复卡一下"的来源。上限与取消都在 `warmMarkdownCache` 里。
      */
     LaunchedEffect(vm.currentConversationId, vm.messages.size) {
         val tail = vm.messages.lastOrNull() ?: return@LaunchedEffect
-        // 超长消息不预热：解析它本身就要几百毫秒，预热反而把后台线程占满
-        if (tail.content.length > WarmTailMaxChars) return@LaunchedEffect
-        withContext(Dispatchers.Default) { warmMarkdownCache(tail.content) }
+        withContext(Dispatchers.Default) {
+            warmMarkdownCache(tail.content, maxBlocks = MarkdownInitialBlocks)
+        }
     }
 
     /** 追加新消息后跟到底部（用户没离开时）。 */
@@ -1268,12 +1273,16 @@ fun ChatScreen(
              * 比让人看着列表自己往下滑要好。
              */
             if (showLoading) {
-                CircularProgressIndicator(
-                    modifier = Modifier
-                        .align(Alignment.Center)
-                        .size(28.dp),
-                    strokeWidth = 3.dp,
-                    color = LocalChatColors.current.processText,
+                /*
+                 * 切会话的等待用 [ContainedLoading]（会变形的容器 + 轨道点），
+                 * 与「等第一个 token」那一处同一套语言 —— 同一个应用里
+                 * "在加载"应该长一个样。
+                 *
+                 * 48dp：这是一屏中央唯一的元素，比行内的 18dp 大一档才压得住。
+                 */
+                ContainedLoading(
+                    modifier = Modifier.align(Alignment.Center),
+                    size = 48.dp,
                 )
             }
 

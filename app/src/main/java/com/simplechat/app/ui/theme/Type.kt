@@ -44,6 +44,10 @@ private fun textStyle(
 /**
  * 排版规格对齐 DeepSeek 客户端（基准值，实际渲染会再乘 [TypeScale]）：
  * 正文 17sp / 行高约 1.7，标题 22-18sp Bold，分组小标签 13sp。
+ *
+ * `headline*` 这几档是给**大标题**用的（设置页顶部、空态主文案）：
+ * Material 3 的 Large top app bar 用 28sp，比 `titleLarge` 又大一档，
+ * 页面一进来就有"这是一屏的标题"的重量。
  */
 val SimpleChatTypography = Typography(
     // 正文：AI 回复与用户气泡共用，行高宽松，长文阅读友好
@@ -51,10 +55,13 @@ val SimpleChatTypography = Typography(
     bodyMedium = textStyle(size = 15f, lineHeight = 24f),
     bodySmall = textStyle(size = 13f, lineHeight = 20f),
     // 标题
+    headlineMedium = textStyle(size = 28f, lineHeight = 36f, weight = FontWeight.Bold),
+    headlineSmall = textStyle(size = 24f, lineHeight = 32f, weight = FontWeight.SemiBold),
     titleLarge = textStyle(size = 22f, lineHeight = 30f, weight = FontWeight.Bold),
     titleMedium = textStyle(size = 17f, lineHeight = 24f, weight = FontWeight.SemiBold),
     titleSmall = textStyle(size = 15f, lineHeight = 22f, weight = FontWeight.Medium),
     // 标签：分组小标题、页脚提示
+    labelLarge = textStyle(size = 15f, lineHeight = 20f, weight = FontWeight.Medium),
     labelMedium = textStyle(size = 13f, lineHeight = 18f),
     labelSmall = textStyle(size = 12f, lineHeight = 16f),
 )
