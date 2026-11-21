@@ -46,8 +46,8 @@ android {
           * 版本从 1.0.0 起算：换包名等于换了一条发行线（com.zhunemo.mydeepseek），
           * 之前 com.simplechat.app 的 16 / 1.2.3 属于另一条线，不必延续。
           */
-        versionCode = 2
-        versionName = "1.1.0"
+        versionCode = 3
+        versionName = "1.2.0"
         testInstrumentationRunner = "com.simplechat.app.DeviceRegression"
         vectorDrawables { useSupportLibrary = true }
     }
