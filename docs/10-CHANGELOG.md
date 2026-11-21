@@ -5,6 +5,16 @@
 
 ---
 
+## v1.2.2（versionCode 5，2026-11-21）
+
+**全面换用官方 M3 组件**：滑块交给 `Slider`（`steps = intervals - 1` 换算）、`CapsuleButton` 换成 `OutlinedButton` / `FilledTonalButton`、确认弹窗主操作换成 `FilledTonalButton`、顶栏与设置返回键换成 `FilledIconButton`。
+
+**共享元素转场**：`RootScreen` 包 `SharedTransitionLayout`，页面标题用 `sharedBounds` 做成共享元素——进设置页时聊天标题被搬到设置页标题的位置。
+
+**弹簧动画**：新增 `MotionSpring` / `MotionBouncy`；页面转场改 `spring<IntOffset>`；抽屉宽度与圆角、输入栏投影与旋转、输入面板投影、回到底部淡入、分段指示器、折叠高度插值、切会话溶解全部改 `spring()`。转场里的 `fadeIn` / `scaleIn` 仍用 `tween`——透明度用弹簧会过冲出闪。
+
+详见 [`16-M3界面与流式渲染重做-2026-11-21.md`](16-M3界面与流式渲染重做-2026-11-21.md) §16.7 与 [`../RELEASE_NOTES_v1.2.2.md`](../RELEASE_NOTES_v1.2.2.md)。
+
 ## v1.2.1（versionCode 4，2026-11-21）
 
 **界面二次深化**（观感参照 June，代码按 M3 规范重写）。确认弹窗改成图标 + 标题 + **占满宽度的 52dp 实心主按钮**、取消同样占满宽度；输入栏行内按钮 40 → 48dp、容器圆角 28dp；`CapsuleButton` 基准高度 44dp。滑块放大并去掉格子感（轨道 10dp、拇指 26dp、行高 52dp，连续档不画刻度）。`ContainedLoading` 的轨道块跟着容器反相变形（圆 ↔ 圆角方），不再是"转一个看不出在转的圆点"。消息气泡圆角 18 → 22dp。
