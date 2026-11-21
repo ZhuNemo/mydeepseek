@@ -124,22 +124,7 @@ jobs:
           check "kotlin 2.4.10" "https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-gradle-plugin/2.4.10/kotlin-gradle-plugin-2.4.10.pom"
 
       - name: 单元测试
-        run: |
-          set -o pipefail
-          ./gradlew --no-daemon --stacktrace testDebugUnitTest 2>&1 | tee /tmp/unit.log
-
-      # 临时诊断（排查完删除）：把失败的输出贴成 commit 注释，
-      # 这样没有仓库权限的人也能看到编译器到底报了什么。
-      - name: 诊断：失败输出发到 commit 注释
-        if: failure()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          [ -f /tmp/unit.log ] || exit 0
-          tail -c 40000 /tmp/unit.log > /tmp/tail.txt
-          python3 -c "import json;print(json.dumps({'body':open('/tmp/tail.txt',encoding='utf-8',errors='replace').read()}))" > /tmp/payload.json
-          gh api --method POST "repos/${{ github.repository }}/commits/${{ github.sha }}/comments" --input /tmp/payload.json > /dev/null || true
+        run: ./gradlew --no-daemon --stacktrace testDebugUnitTest
 
       - name: 构建 Release APK
         run: ./gradlew --no-daemon --stacktrace assembleRelease
