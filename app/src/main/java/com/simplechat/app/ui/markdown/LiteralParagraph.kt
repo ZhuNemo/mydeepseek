@@ -4,21 +4,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.SideEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.drawWithContent
-import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.graphics.BlendMode
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Paint
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.TextLayoutResult
-import androidx.compose.ui.unit.dp
 import com.simplechat.app.data.LocaleHelper
 import com.simplechat.app.ui.theme.markdownBodyStyle
 
@@ -27,20 +15,20 @@ import com.simplechat.app.ui.theme.markdownBodyStyle
  *
  * ### 为什么值得为一段普通文字单开一条路
  *
- * 流式期间真正在变的是**尾块**，而尾块绝大多数时候就是一段普通中文/英文段落。
+ * 流式期间真正在变的是**尾块**，而尾块绝大多数时候就是一段普通中文 / 英文段落。
  * 走库的路径时，这一段每帧都要：解析成 AST → 建 `AnnotatedString` →
  * 跑 `ExtendedSpans`（行内代码胶囊、搜索高亮）→ 组件树排版。
  * 其中解析与建串是纯开销：段落里没有任何语法要解释。
  *
- * 判定通过后直接用 `Text` 排版，字形、字号、行高、对齐全部取
- * [markdownBodyStyle] —— 与库的 `paragraph` 样式**同一个来源**，
- * 所以定稿那一刻（尾块交回库渲染）像素级一致，不会"闪一下换了字体"。
+ * 判定通过后直接用 `Text` 排版，字号、行高、对齐全部取 [markdownBodyStyle] ——
+ * 与库的 `paragraph` 样式**同一个来源**，所以定稿那一刻（尾块交回库渲染）
+ * 像素级一致，不会"闪一下换了字体"。
  *
  * ### 判定必须保守
  *
  * 判错的代价是**屏幕上露出原始 Markdown 语法**（`**加粗**` 原样显示），
  * 比多花几百微秒糟得多。所以这里只认"一眼就是纯文字"的段落：
- * 单行、行首不是块级标记、行内不含任何标记字符。拿不准就返回 false。
+ * 单行、行首不是块级标记、行内不含任何标记字符、不含裸链接。拿不准就返回 false。
  */
 
 /** 行首出现即代表块级语法的字符（标题 / 引用 / 列表 / 代码 / 表格 / HTML）。 */
@@ -81,31 +69,21 @@ internal fun isPlainParagraph(text: String): Boolean {
 }
 
 /**
- * 新追加文字「淡入」的渐变高度。
+ * 纯段落渲染。
  *
- * 约两行半：再短看不出过渡，再长会把还没读完的上一段也一起洗淡。
- */
-private val AppendFadeHeight = 72.dp
-
-/**
- * 纯段落渲染 + **新追加文字的淡入**。
+ * ### 这里**不做**新追加字符的淡入（刻意）
  *
- * ### 淡入是「静态蒙版」，不是动画
+ * 上游那份策略里有一条"新追加字符淡入 150ms"。在**他们的**节奏下（一次到达一批）
+ * 那是成立的；但这一侧已经先把到达摊成了"每帧一到三个字"（见
+ * [rememberSmoothReveal]），再叠一层 150ms 的淡入会出两个问题：
  *
- * 第一版写成"每次追加都起一段 150ms 的 alpha 动画"。实测不行：流式期间
- * 每帧只追加一到三个字，动画每帧都被下一次追加打断 —— 最新的那几个字
- * 永远停在接近透明的状态，一帧之后又突然变实，看起来是**尾巴在闪**。
+ * 1. 动画每帧都被下一次追加打断 —— 最新的那几个字永远停在接近透明，一帧后又
+ *    突然变实，看起来是**尾巴在闪**（第一版实现就是这么写的，已撤掉）；
+ * 2. 若改成"按位置渐变"（新内容顶部最淡、往下恢复），最新的那几行会在整整
+ *    两三行的窗口里都是半透明的 —— 慢速流式下等于**看不见刚写出来的字**。
  *
- * 现在改成不动画：以"上一次渲染到的位置"为起点，往下 [AppendFadeHeight]
- * 铺一道 0 → 1 的透明度渐变。
- *
- * - 刚出现的字在渐变的顶部（几乎透明），随内容增长自然被推到下方、变成实色 ——
- *   全程没有动画状态，也就没有"被打断"这回事；
- * - 跨度固定，蒙版的图层高度因此有界：尾块几千像素高也只开这一小条离屏缓冲；
- * - 只改**绘制**时的 alpha，排版一次都不重做。
- *
- * 早先试过的两种做法都撤掉了：逐字改透明度要每帧重建 `AnnotatedString`
- * 并重排（整段在抖）；块底渐变遮罩会把整行洗掉（像被一条线切了）。
+ * 而逐字显示本身已经提供了"字在长出来"的观感。所以这里就老老实实用 `Text`：
+ * 省掉库的解析与建串已经是这条路的全部收益，再往上加效果只会把它变成新的抖动源。
  */
 @Composable
 internal fun LiteralParagraph(
@@ -114,74 +92,10 @@ internal fun LiteralParagraph(
     textColor: Color? = null,
 ) {
     val cjk = LocaleHelper.isCjkUi(LocalContext.current)
-    val style = markdownBodyStyle(cjk)
-    val color = textColor ?: MaterialTheme.colorScheme.onBackground
-
-    var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
-    /*
-     * 上一次渲染的文本，用来算"这次新追加的从第几个字符开始"。
-     *
-     * 存整串而不是只存长度：必须确认是**纯追加**（`text` 以前一次的文本开头），
-     * 否则换消息 / 重新生成这类整段替换也会被当成"新内容"而整体淡入一次。
-     */
-    var previous by remember { mutableStateOf("") }
-    val appendedFrom = if (previous.isNotEmpty() && text.length > previous.length &&
-        text.startsWith(previous)
-    ) {
-        previous.length
-    } else {
-        0
-    }
-    SideEffect { previous = text }
-
     Text(
         text = text,
-        modifier = modifier
-            .fillMaxWidth()
-            .drawWithContent {
-                val result = layout
-                val measuredLength = result?.layoutInput?.text?.length ?: 0
-                // 没有排版结果、没有新内容、或起点已经失效 → 正常画一遍就够
-                if (result == null || appendedFrom <= 0 ||
-                    appendedFrom >= measuredLength
-                ) {
-                    drawContent()
-                    return@drawWithContent
-                }
-
-                // 新内容从哪一行开始：这一行的顶边就是渐变的上沿
-                val line = result.getLineForOffset(appendedFrom)
-                val bandTop = result.getLineTop(line).coerceIn(0f, size.height)
-                if (bandTop >= size.height) {
-                    drawContent()
-                    return@drawWithContent
-                }
-
-                // 上半部分（已经定稿的文字）：原样画
-                clipRect(bottom = bandTop) { drawContent() }
-
-                /*
-                 * 下半部分：先画进一个**只覆盖渐变高度**的图层，再用 `DstIn`
-                 * 铺一道 0 → 1 的蒙版。图层高度受限，所以这笔开销与消息长度无关。
-                 */
-                val bandBottom = (bandTop + AppendFadeHeight.toPx()).coerceAtMost(size.height)
-                val layer = drawContext.canvas.saveLayer(
-                    Rect(0f, bandTop, size.width, bandBottom),
-                    Paint(),
-                )
-                clipRect(top = bandTop) { drawContent() }
-                drawRect(
-                    brush = Brush.verticalGradient(
-                        colors = listOf(Color.Transparent, Color.Black),
-                        startY = bandTop,
-                        endY = bandBottom,
-                    ),
-                    blendMode = BlendMode.DstIn,
-                )
-                drawContext.canvas.restoreToCount(layer)
-            },
-        color = color,
-        style = style,
-        onTextLayout = { layout = it },
+        modifier = modifier.fillMaxWidth(),
+        color = textColor ?: MaterialTheme.colorScheme.onBackground,
+        style = markdownBodyStyle(cjk),
     )
 }
