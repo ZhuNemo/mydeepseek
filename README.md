@@ -4,7 +4,7 @@
 
 **中文 | [English](README.en.md)**
 
-![Version](https://img.shields.io/badge/version-1.2.0-blue)
+![Version](https://img.shields.io/badge/version-1.2.1-blue)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 ![Platform](https://img.shields.io/badge/Android-8.0%2B%20%C2%B7%20API%2026-3ddc84)
 
