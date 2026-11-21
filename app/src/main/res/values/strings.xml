@@ -234,6 +234,8 @@
     <string name="licenses_third_party">第三方组件</string>
     <string name="licenses_reference_title">参考实现</string>
     <string name="credit_deepseek_demo">DeepSeek Chat Demo — 聊天记录导入</string>
+    <!-- 设计参考（未复制代码）：June 以 GPL-3.0 发布，本项目为 MIT，只借鉴设计观感 -->
+    <string name="credit_june">June（com.denser.june）— 界面设计参考：M3 观感、加载动画、设置页布局。仅借鉴设计，未复制源代码（June 以 GPL-3.0 发布）</string>
     <string name="license_version">版本</string>
     <string name="license_type">许可证</string>
     <string name="license_copyright">版权所有</string>

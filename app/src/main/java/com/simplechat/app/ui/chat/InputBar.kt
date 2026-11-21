@@ -431,7 +431,12 @@ fun InputBar(
 }
 
 /** 输入栏第二行的统一控件高度。 */
-private val RowButtonSize = 40.dp
+/*
+ * 行内按钮 48dp：M3 Expressive 的触控目标比 1.x 大一圈，输入栏这一行是
+ * 全应用点得最频繁的地方，值得多给 8dp。三个按钮（附件 / 语音 / 发送）
+ * 都取这个值，行高也跟着它走。
+ */
+private val RowButtonSize = 48.dp
 
 /** 按住说话时，上滑超过这个距离即视为取消。 */
 private val VoiceCancelSlop = 56.dp
@@ -641,7 +646,7 @@ private fun SendButton(
             imageVector = if (streaming) AppIcons.Stop else AppIcons.ArrowUp,
             contentDescription = if (streaming) stringResource(R.string.input_stop) else stringResource(R.string.input_send),
             tint = content,
-            modifier = Modifier.size(if (streaming) 16.dp else 19.dp),
+            modifier = Modifier.size(if (streaming) 20.dp else 24.dp),
         )
     }
 }

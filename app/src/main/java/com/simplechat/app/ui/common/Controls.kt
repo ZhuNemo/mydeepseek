@@ -114,7 +114,7 @@ object Space {
     val TouchTarget = 48.dp
 
     /** 主按钮（带文字）的高度。M3 的 filled button 就是 40dp，视觉上配 48 的触控区。 */
-    val ButtonHeight = 40.dp
+    val ButtonHeight = 44.dp
 }
 
 // ══════════════════════════════════════════════════════════
@@ -139,12 +139,12 @@ val SoftShape = RoundedCornerShape(16.dp)
 /** 大卡片与浮层菜单。M3 的 large 是 16、extra-large 是 28，取中间偏大。 */
 val MenuShape = RoundedCornerShape(20.dp)
 
-/** 多行容器（输入栏、输入面板）。 */
-val ContainerShape = RoundedCornerShape(24.dp)
+/** 多行容器（输入栏、输入面板）。M3 的 extraLarge 档：比卡片再大一级。 */
+val ContainerShape = RoundedCornerShape(28.dp)
 
 /** 消息气泡：靠近发出侧的一角收紧，给内容一个方向感。 */
-val BubbleShapeOut = RoundedCornerShape(18.dp, 18.dp, 6.dp, 18.dp)
-val BubbleShapeIn = RoundedCornerShape(18.dp, 18.dp, 18.dp, 6.dp)
+val BubbleShapeOut = RoundedCornerShape(22.dp, 22.dp, 6.dp, 22.dp)
+val BubbleShapeIn = RoundedCornerShape(22.dp, 22.dp, 22.dp, 6.dp)
 
 // ══════════════════════════════════════════════════════════
 //  滑块
@@ -196,11 +196,16 @@ fun AppSlider(
      * - 未选中轨道用 surfaceContainerHighest，选中段与拇指用 primary
      * - 刻度是小圆点（4dp），压在轨道上
      */
-    val trackHeight = with(density) { 4.dp.toPx() }
-    val thumbRadius = with(density) { 10.dp.toPx() }
-    val haloRadius = with(density) { 20.dp.toPx() }
-    val tickRadius = with(density) { 2.dp.toPx() }
-    val edge = with(density) { 20.dp.toPx() }
+    /*
+     * 尺寸再放大一档（M3 Expressive 的滑块比 1.x 那套粗一截）：
+     * 轨道 10dp、拇指 26dp、按下光晕 52dp。连续调节（`intervals = 0`）时不画刻度，
+     * 整条轨道读起来是一根"可以无级拖动的条"，而不是一串格子。
+     */
+    val trackHeight = with(density) { 10.dp.toPx() }
+    val thumbRadius = with(density) { 13.dp.toPx() }
+    val haloRadius = with(density) { 26.dp.toPx() }
+    val tickRadius = with(density) { 2.5.dp.toPx() }
+    val edge = with(density) { 26.dp.toPx() }
 
     val activeColor = MaterialTheme.colorScheme.primary
     val inactiveTrack = MaterialTheme.colorScheme.surfaceContainerHighest
@@ -221,7 +226,7 @@ fun AppSlider(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(44.dp)
+                .height(52.dp)
                 .onSizeChanged { width = it.width.toFloat() }
                 .pointerInput(enabled, valueRange, width) {
                     if (!enabled) return@pointerInput
@@ -242,7 +247,7 @@ fun AppSlider(
                 },
             contentAlignment = Alignment.Center,
         ) {
-            Canvas(modifier = Modifier.fillMaxWidth().height(44.dp)) {
+            Canvas(modifier = Modifier.fillMaxWidth().height(52.dp)) {
                 val cy = size.height / 2f
                 val startX = edge
                 val endX = size.width - edge

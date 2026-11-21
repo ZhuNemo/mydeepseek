@@ -228,6 +228,7 @@
     <string name="licenses_third_party">Third-party components</string>
     <string name="licenses_reference_title">References</string>
     <string name="credit_deepseek_demo">DeepSeek Chat Demo — chat history import</string>
+    <string name="credit_june">June (com.denser.june) — UI design reference: Material 3 look, loading animation, settings layout. Design inspiration only, no source code copied (June is GPL-3.0)</string>
     <string name="license_version">Version</string>
     <string name="license_type">License</string>
     <string name="license_copyright">Copyright</string>

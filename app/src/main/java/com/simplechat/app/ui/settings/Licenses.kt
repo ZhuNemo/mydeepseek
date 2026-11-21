@@ -43,7 +43,8 @@ internal fun licenseTextUrl(license: String): String = when (license) {
 
 /** 本应用自己的许可与版权。 */
 internal const val APP_LICENSE = "MIT"
-internal const val APP_COPYRIGHT = "Copyright © 2026 Pokanshu（Simple Chat）"
+internal const val APP_COPYRIGHT =
+    "Copyright © 2026 Nemo（myDeepSeek）· 上游 Simple Chat © Pokanshu（MIT）"
 
 /**
  * 参考实现（**未随包分发代码**，仅作署名）。
@@ -53,6 +54,7 @@ internal const val APP_COPYRIGHT = "Copyright © 2026 Pokanshu（Simple Chat）"
  */
 internal val referenceCredits: List<Int> = listOf(
     R.string.credit_deepseek_demo,
+    R.string.credit_june,
 )
 
 /**

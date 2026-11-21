@@ -108,11 +108,23 @@ fun ContainedLoading(
                 cornerRadius = CornerRadius(outerRadius, outerRadius),
             )
 
-            // 轨道点：绕中心转，半径随尺寸走（小尺寸下也留得下）
-            val orbit = side * 0.24f
-            val dot = side * 0.13f * (1f - 0.18f * morph)
+            /*
+             * 轨道上那一块：**一起跟着变形**（圆 ↔ 圆角方小方块）。
+             *
+             * 只转一个圆点的话，圆点转与不转看不出区别；让它和容器反相变形，
+             * 整个指示器才像"两块东西在互相挤"，这正是 M3 Expressive 的那股劲。
+             */
+            val orbit = side * 0.23f
+            val dotSide = side * (0.30f + 0.10f * morph)
+            // morph = 0 时是正圆（半径 = 半边），morph = 1 时收到 0.28 倍 → 圆角方
+            val dotRadius = (dotSide / 2f) * (1f - 0.44f * morph)
             rotate(degrees = angle, pivot = Offset(cx, cy)) {
-                drawCircle(color = color, radius = dot, center = Offset(cx + orbit, cy))
+                drawRoundRect(
+                    color = color,
+                    topLeft = Offset(cx + orbit - dotSide / 2f, cy - dotSide / 2f),
+                    size = Size(dotSide, dotSide),
+                    cornerRadius = CornerRadius(dotRadius, dotRadius),
+                )
             }
         }
     }

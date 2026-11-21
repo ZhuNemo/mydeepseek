@@ -2,18 +2,22 @@ package com.simplechat.app.ui.common
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -27,12 +31,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.simplechat.app.R
+import com.simplechat.app.ui.common.AppIcons
 import com.simplechat.app.ui.theme.LocalChatColors
 
 /** 通用文本输入弹窗（重命名 / 编辑等）。 */
@@ -118,7 +124,22 @@ fun AppTextInputDialog(
     }
 }
 
-/** 通用确认弹窗（删除等破坏性操作）。 */
+/**
+ * 通用确认弹窗（删除等破坏性操作）。
+ *
+ * ### 为什么不用 `AlertDialog`
+ *
+ * 早先换成 M3 的 `AlertDialog` 是为了"右下角文字按钮 + 28dp 圆角"这套规范。
+ * 但 M3 Expressive 之后，**破坏性确认**这一档的主流做法是：
+ * 图标 + 标题在上，正文在下，**两个大按钮竖着占满宽度**（主操作实心、取消是文字）。
+ * 文字按钮在拇指够得着的右下角固然克规，可"删除一条会话"是不可撤销的动作，
+ * 让人去点一个小字，本来就不合适。
+ *
+ * 所以这里自绘：形状、字号、间距都取主题 token，交互与无障碍语义保持不变
+ * （两个入口都是 `clickable`，读屏念得到）。
+ *
+ * @param extraContent 标题 / 正文与按钮之间的自定义内容（勾选框、说明等）。
+ */
 @Composable
 fun AppConfirmDialog(
     title: String,
@@ -127,64 +148,103 @@ fun AppConfirmDialog(
     onDismiss: () -> Unit,
     onConfirm: () -> Unit,
     destructive: Boolean = false,
-    /**
-     * 标题/正文与按钮之间的自定义内容（勾选框、选项列表等）。
-     *
-     * 加这个参数是为了「删除时顺便删云端」那种**带副作用的确认**：
-     * 弹窗本身不该知道业务，但也不该为了一个勾选框再写一个几乎一样的弹窗。
-     */
     extraContent: (@Composable () -> Unit)? = null,
 ) {
-    /*
-     * 用 M3 的 [AlertDialog]，不再自绘"整宽胶囊按钮"。
-     *
-     * 自绘那版是 iOS 风格的双大按钮；M3 的对话框是**右下角文字按钮**
-     * （取消在左、确认在右），形状是 28dp 的 extraLarge 圆角，
-     * 容器色是 surfaceContainerHigh。换成官方组件之后，水波纹、字号、
-     * 按钮间距、无障碍角色全都跟着系统走，不用再维护。
-     *
-     * 破坏性操作用 error 色写确认按钮 —— M3 里没有"红色填充按钮"这种做法，
-     * 用文字色表达危险性更符合规范，也不会把弹窗变成一块红。
-     */
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(title) },
-        text = {
-            Column {
-                if (message != null) {
-                    Text(
-                        text = message,
-                        style = MaterialTheme.typography.bodyMedium,
+    val colors = LocalChatColors.current
+    val accent = if (destructive) colors.danger else MaterialTheme.colorScheme.primary
+    val accentContainer = if (destructive) {
+        colors.danger.copy(alpha = 0.14f)
+    } else {
+        MaterialTheme.colorScheme.primaryContainer
+    }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(28.dp))
+                .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                .padding(24.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .background(accentContainer),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = if (destructive) AppIcons.Trash else AppIcons.Info,
+                        contentDescription = null,
+                        tint = accent,
+                        modifier = Modifier.size(20.dp),
                     )
                 }
-                extraContent?.let {
-                    Spacer(Modifier.size(12.dp))
-                    it()
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = onConfirm) {
+                Spacer(Modifier.size(14.dp))
                 Text(
-                    text = confirmText,
-                    color = if (destructive) {
-                        MaterialTheme.colorScheme.error
-                    } else {
-                        MaterialTheme.colorScheme.primary
-                    },
+                    text = title,
+                    // titleLarge 是 M3 对话框标题的档位；这里同时把行高收紧一点，
+                    // 长标题折两行时不至于把正文挤走
+                    style = MaterialTheme.typography.titleLarge,
+                    color = MaterialTheme.colorScheme.onSurface,
                 )
             }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text(stringResource(R.string.action_cancel))
+
+            if (message != null) {
+                Spacer(Modifier.size(12.dp))
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
-        },
-        shape = MaterialTheme.shapes.extraLarge,
-        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-        titleContentColor = MaterialTheme.colorScheme.onSurface,
-        textContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-    )
+
+            extraContent?.let {
+                Spacer(Modifier.size(14.dp))
+                it()
+            }
+
+            Spacer(Modifier.size(24.dp))
+
+            // 主操作：实心大按钮，占满宽度
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp)
+                    .clip(PillShape)
+                    .background(accent)
+                    .clickable(onClick = onConfirm),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = confirmText,
+                    style = MaterialTheme.typography.titleSmall,
+                    // 主色上配 onPrimary（深色模式里它不是白）；危险色是固定的红，配白
+                    color = if (destructive) Color.White else MaterialTheme.colorScheme.onPrimary,
+                    maxLines = 1,
+                )
+            }
+
+            Spacer(Modifier.size(8.dp))
+
+            // 取消：文字按钮，同样占满宽度（容易点中，又不会和主操作抢注意力）
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp)
+                    .clip(PillShape)
+                    .clickable(onClick = onDismiss),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = stringResource(R.string.action_cancel),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
 }
 
 @Composable
