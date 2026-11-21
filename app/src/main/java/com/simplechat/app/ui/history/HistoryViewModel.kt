@@ -12,6 +12,7 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import com.simplechat.app.R
 import com.simplechat.app.data.ChatRepository
 import com.simplechat.app.data.Res
+import com.simplechat.app.data.userMessage
 import com.simplechat.app.db.ConversationEntity
 import com.simplechat.app.db.ConversationSearchHit
 import kotlinx.coroutines.ExperimentalCoroutinesApi
