@@ -32,6 +32,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.ui.graphics.Color
@@ -212,6 +214,8 @@ private enum class ApiStylePreference(val labelRes: Int) {
 fun SettingsScreen(
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
+    /** 标题的共享元素修饰符（页面转场时由 `RootScreen` 注入）。 */
+    titleModifier: Modifier = Modifier,
 ) {
     val colors = LocalChatColors.current
     val context = LocalContext.current
@@ -490,6 +494,7 @@ fun SettingsScreen(
             .background(colors.settingsBackground),
     ) {
         SettingsTopBar(
+            titleModifier = titleModifier,
             title = when (page) {
                 SettingsPage.ROOT -> stringResource(R.string.settings_title)
                 SettingsPage.DATA -> stringResource(R.string.settings_data)
@@ -2487,35 +2492,31 @@ private fun LicenseDetailDialog(entry: LicenseEntry, onDismiss: () -> Unit) {
  * 换来的只是一个动效 —— 不值。
  */
 @Composable
-fun SettingsTopBar(title: String, onBack: () -> Unit) {
+fun SettingsTopBar(
+    title: String,
+    onBack: () -> Unit,
+    /** 标题的共享元素修饰符（页面转场用）。 */
+    titleModifier: Modifier = Modifier,
+) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .statusBarsPadding()
             .padding(start = 16.dp, end = 16.dp, top = 8.dp),
     ) {
-        // 48dp 触控区包着 40dp 的色块（同顶栏那颗，见 `ChatTopBar`）
-        Box(
-            modifier = Modifier
-                .size(48.dp)
-                .clip(CircleShape)
-                .clickable(onClick = onBack),
-            contentAlignment = Alignment.Center,
+        // 与对话页顶栏同一颗：官方 FilledIconButton（tonal 圆容器 + 48dp 触控区）
+        FilledIconButton(
+            onClick = onBack,
+            colors = IconButtonDefaults.filledIconButtonColors(
+                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+            ),
         ) {
-            Box(
-                modifier = Modifier
-                    .size(40.dp)
-                    .clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.surfaceContainerHigh),
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(
-                    imageVector = AppIcons.ChevronLeft,
-                    contentDescription = stringResource(R.string.action_back),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(20.dp),
-                )
-            }
+            Icon(
+                imageVector = AppIcons.ChevronLeft,
+                contentDescription = stringResource(R.string.action_back),
+                modifier = Modifier.size(20.dp),
+            )
         }
 
         Spacer(Modifier.size(4.dp))
@@ -2527,7 +2528,7 @@ fun SettingsTopBar(title: String, onBack: () -> Unit) {
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             // 与返回键色块的左缘对齐
-            modifier = Modifier.padding(start = 4.dp),
+            modifier = Modifier.padding(start = 4.dp).then(titleModifier),
         )
 
         Spacer(Modifier.size(8.dp))

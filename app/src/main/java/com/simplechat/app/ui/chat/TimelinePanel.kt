@@ -1,6 +1,8 @@
 package com.simplechat.app.ui.chat
 
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -77,7 +79,7 @@ fun TimelinePanel(
             // 流式期间禁用尺寸动画：动画追不上每几十毫秒一次的增量，会把最新内容裁掉
             .then(
                 if (running) Modifier
-                else Modifier.animateContentSize(tween(FoldAnimMs, easing = MotionEasing)),
+                else Modifier.animateContentSize(spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow)),
             ),
     ) {
         if (view.hasSteps && showHeader) {

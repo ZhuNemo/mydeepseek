@@ -19,6 +19,8 @@ import com.simplechat.app.ui.markdown.LocalSearchViewport
 import com.simplechat.app.ui.markdown.SearchViewport
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -680,9 +682,9 @@ fun UserBubble(
                                         .then(
                                             if (folded) {
                                                 Modifier.animateContentSize(
-                                                    animationSpec = tween(
-                                                        durationMillis = FoldAnimMs,
-                                                        easing = MotionEasing,
+                                                    animationSpec = spring(
+                                                        dampingRatio = Spring.DampingRatioNoBouncy,
+                                                        stiffness = Spring.StiffnessMediumLow,
                                                     ),
                                                 )
                                             } else {

@@ -83,7 +83,7 @@ fun <T> SegmentedSwitch(
         if (segmentWidthPx > 0f && !dragging) {
             indicator.animateTo(
                 targetValue = selectedIndex * segmentWidthPx,
-                animationSpec = tween(durationMillis = 220),
+                animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow),
             )
         }
     }

@@ -1,5 +1,7 @@
 package com.simplechat.app.ui.chat
 
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -163,7 +165,8 @@ fun InputBar(
     // 面板展开 → 投影淡出；收起 → 淡入。否则接缝处会同时压着两条阴影。
     val shadowElevation by animateDpAsState(
         targetValue = if (panelExpanded) 0.dp else AppShadow.PanelElevation,
-        animationSpec = tween(durationMillis = 180),
+        // 弹簧：面板展开/收起被打断时不会跳
+        animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow),
         label = "inputBarShadow",
     )
 
@@ -403,7 +406,7 @@ fun InputBar(
                 if (canAttach) {
                     val spin by animateFloatAsState(
                         targetValue = if (attachPanelOpen) 45f else 0f,
-                        animationSpec = tween(200, easing = MotionEasing),
+                        animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow),
                         label = "attachSpin",
                     )
                     IconCircleButton(

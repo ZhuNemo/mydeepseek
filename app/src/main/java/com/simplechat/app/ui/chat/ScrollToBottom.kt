@@ -1,5 +1,7 @@
 package com.simplechat.app.ui.chat
 
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.gestures.scrollBy
@@ -170,7 +172,7 @@ fun VerticalScrollBar(
     }
     val fade by animateFloatAsState(
         targetValue = if (scrolling) 1f else 0f,
-        animationSpec = tween(200),
+        animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow),
         label = "scrollBarAlpha",
     )
     val thumbColor = LocalChatColors.current.processText

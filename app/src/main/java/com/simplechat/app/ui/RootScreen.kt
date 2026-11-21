@@ -2,10 +2,14 @@ package com.simplechat.app.ui
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.ExperimentalSharedTransitionApi
+import androidx.compose.animation.SharedTransitionLayout
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -112,6 +116,7 @@ private val DrawerCorner = 16.dp
  * 而搜索本来就该是"把抽屉拉开看清楚"，不是"跳到另一个页面"：
  * 它的搜索框、它的列表，都在同一块面板上。
  */
+@OptIn(ExperimentalSharedTransitionApi::class)
 @Composable
 fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
     val container = (LocalContext.current.applicationContext as App).container
@@ -243,12 +248,19 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
     // ── 抽屉：搜索时把面板从 78% 撑满 ──────────────────────
     val sheetFraction by animateFloatAsState(
         targetValue = if (searchMode) 1f else DrawerWidthFraction,
-        animationSpec = tween(MotionDurationMs, easing = MotionEasing),
+        // 弹簧：搜索态撑满时被打断（比如中途又点返回）也不会跳
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioNoBouncy,
+            stiffness = Spring.StiffnessMediumLow,
+        ),
         label = "sheetFraction",
     )
     val sheetCorner by animateDpAsState(
         targetValue = if (searchMode) 0.dp else DrawerCorner,
-        animationSpec = tween(MotionDurationMs, easing = MotionEasing),
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioNoBouncy,
+            stiffness = Spring.StiffnessMediumLow,
+        ),
         label = "sheetCorner",
     )
     val sheetShape = RoundedCornerShape(topEnd = sheetCorner, bottomEnd = sheetCorner)
@@ -394,7 +406,23 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
              */
             val pageStates = rememberSaveableStateHolder()
 
-            AnimatedContent(
+            /*
+             * 共享元素转场。
+             *
+             * `SharedTransitionLayout` 提供"同一个元素在两个页面之间连续移动"的能力：
+             * 页面切换时，两边的同名元素不是各自退场/入场，而是**同一块内容被搬运过去**。
+             *
+             * 这里共享的是**页面标题**：从对话页进设置页时，聊天标题那一行会被
+             * 直接搬到设置页标题的位置上，而不是"旧的滑走、新的滑进来"。
+             * 这是 June 那种"M3 大标题"观感的来源 —— 标题是页面的锚，它连续，
+             * 整次切换就连续。
+             *
+             * ⚠️ 共享元素必须落在 `AnimatedContent` 的可见性范围内（`AnimatedVisibilityScope`），
+             * 否则它不知道该跟哪一次转场对齐 —— 所以修饰符是在 content lambda 里现算的。
+             */
+            SharedTransitionLayout(modifier = Modifier.fillMaxSize()) {
+                val sharedScope = this
+                AnimatedContent(
                 targetState = route,
                 transitionSpec = {
                     screenTransform(forward = targetState.depth > initialState.depth)
@@ -402,9 +430,17 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
                 label = "route",
             ) { target ->
                 pageStates.SaveableStateProvider(target) {
+                    // 标题的共享元素修饰符：两个页面用**同一个 key**，才配得上对
+                    val titleShared = with(sharedScope) {
+                        Modifier.sharedBounds(
+                            rememberSharedContentState(key = "page-title"),
+                            this@AnimatedContent,
+                        )
+                    }
                     when (target) {
                         Route.CHAT -> ChatScreen(
                             vm = chatViewModel,
+                            titleModifier = titleShared,
                             onOpenDrawer = { scope.launch { drawerState.open() } },
                             onNewConversation = {
                                 readingSearchResult = false
@@ -430,8 +466,12 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
                             },
                         )
 
-                        Route.SETTINGS -> SettingsScreen(onBack = { route = Route.CHAT })
+                        Route.SETTINGS -> SettingsScreen(
+                            onBack = { route = Route.CHAT },
+                            titleModifier = titleShared,
+                        )
                     }
+                }
                 }
             }
 

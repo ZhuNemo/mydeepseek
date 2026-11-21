@@ -17,6 +17,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -207,35 +209,48 @@ fun AppConfirmDialog(
 
             Spacer(Modifier.size(24.dp))
 
-            // 主操作：实心大按钮，占满宽度
-            Box(
+            /*
+             * 主操作：官方 [FilledTonalButton]，占满宽度、52dp 高。
+             *
+             * 用 tonal 而不是 filled：这是**确认**，不是"主行动"；tonal 的对比度
+             * 足够让人一眼找到，又不会在屏幕上抢走正文。破坏性操作把容器换成
+             * 危险色 —— 仍然走同一个组件，只是换配色，形状与尺寸完全一致。
+             */
+            FilledTonalButton(
+                onClick = onConfirm,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(52.dp)
-                    .clip(PillShape)
-                    .background(accent)
-                    .clickable(onClick = onConfirm),
-                contentAlignment = Alignment.Center,
+                    .height(52.dp),
+                shape = PillShape,
+                colors = ButtonDefaults.filledTonalButtonColors(
+                    containerColor = if (destructive) {
+                        colors.danger
+                    } else {
+                        MaterialTheme.colorScheme.secondaryContainer
+                    },
+                    contentColor = if (destructive) {
+                        Color.White
+                    } else {
+                        MaterialTheme.colorScheme.onSecondaryContainer
+                    },
+                ),
             ) {
                 Text(
                     text = confirmText,
                     style = MaterialTheme.typography.titleSmall,
-                    // 主色上配 onPrimary（深色模式里它不是白）；危险色是固定的红，配白
-                    color = if (destructive) Color.White else MaterialTheme.colorScheme.onPrimary,
                     maxLines = 1,
                 )
             }
 
             Spacer(Modifier.size(8.dp))
 
-            // 取消：文字按钮，同样占满宽度（容易点中，又不会和主操作抢注意力）
-            Box(
+            // 取消：官方 TextButton，同样占满宽度（容易点中，又不抢注意力）
+            TextButton(
+                onClick = onDismiss,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(48.dp)
-                    .clip(PillShape)
-                    .clickable(onClick = onDismiss),
-                contentAlignment = Alignment.Center,
+                    .height(48.dp),
+                shape = PillShape,
             ) {
                 Text(
                     text = stringResource(R.string.action_cancel),

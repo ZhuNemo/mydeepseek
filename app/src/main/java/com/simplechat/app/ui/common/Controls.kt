@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -28,6 +29,10 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
@@ -181,131 +186,51 @@ fun AppSlider(
     /** 高亮第几个刻度文案。 */
     selectedTick: Int = -1,
 ) {
-    val colors = LocalChatColors.current
     val density = LocalDensity.current
-
-    var pressed by remember { mutableStateOf(false) }
-    var width by remember { mutableStateOf(0f) }
-    // pointerInput 的 block 只在 key 变化时重建，直接闭包捕获会拿到旧 lambda
-    val finishedCallback by rememberUpdatedState(onValueChangeFinished)
-
-    /*
-     * 尺寸与配色取 Material 3 的 Slider 规格：
-     * - 轨道 4dp（原来 3→5dp 会随按下变粗，M3 是恒定 4dp）
-     * - 拇指直径 20dp（原来 9dp，按下放大到 13dp；M3 是拇指不变、出现 40dp 光晕）
-     * - 未选中轨道用 surfaceContainerHighest，选中段与拇指用 primary
-     * - 刻度是小圆点（4dp），压在轨道上
-     */
-    /*
-     * 尺寸再放大一档（M3 Expressive 的滑块比 1.x 那套粗一截）：
-     * 轨道 10dp、拇指 26dp、按下光晕 52dp。连续调节（`intervals = 0`）时不画刻度，
-     * 整条轨道读起来是一根"可以无级拖动的条"，而不是一串格子。
-     */
-    val trackHeight = with(density) { 10.dp.toPx() }
-    val thumbRadius = with(density) { 13.dp.toPx() }
-    val haloRadius = with(density) { 26.dp.toPx() }
-    val tickRadius = with(density) { 2.5.dp.toPx() }
-    val edge = with(density) { 26.dp.toPx() }
-
-    val activeColor = MaterialTheme.colorScheme.primary
-    val inactiveTrack = MaterialTheme.colorScheme.surfaceContainerHighest
-    val haloColor = activeColor.copy(alpha = 0.12f)
-    val tickColor = MaterialTheme.colorScheme.onSurfaceVariant
-
-    val span = (valueRange.endInclusive - valueRange.start).takeIf { it > 0f } ?: 1f
-    val fraction = ((value - valueRange.start) / span).coerceIn(0f, 1f)
-
-    fun emitAt(x: Float) {
-        if (width <= 0f) return
-        val usable = (width - edge * 2f).coerceAtLeast(1f)
-        val f = ((x - edge) / usable).coerceIn(0f, 1f)
-        onValueChange(valueRange.start + f * span)
-    }
+    val edgePx = with(density) { SliderLabelEdge.toPx() }
 
     Column(modifier = modifier.fillMaxWidth()) {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(52.dp)
-                .onSizeChanged { width = it.width.toFloat() }
-                .pointerInput(enabled, valueRange, width) {
-                    if (!enabled) return@pointerInput
-                    awaitEachGesture {
-                        val down = awaitFirstDown()
-                        pressed = true
-                        emitAt(down.position.x)
-                        while (true) {
-                            val event = awaitPointerEvent()
-                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
-                            if (!change.pressed) break
-                            emitAt(change.position.x)
-                            change.consume()
-                        }
-                        pressed = false
-                        finishedCallback?.invoke()
-                    }
-                },
-            contentAlignment = Alignment.Center,
-        ) {
-            Canvas(modifier = Modifier.fillMaxWidth().height(52.dp)) {
-                val cy = size.height / 2f
-                val startX = edge
-                val endX = size.width - edge
-                val thumbX = startX + (endX - startX) * fraction
-
-                // 未选中轨道：整条先铺一遍，选中段盖上去
-                drawLine(
-                    color = inactiveTrack,
-                    start = Offset(startX, cy),
-                    end = Offset(endX, cy),
-                    strokeWidth = trackHeight,
-                    cap = StrokeCap.Round,
-                )
-                drawLine(
-                    color = if (enabled) activeColor else inactiveTrack,
-                    start = Offset(startX, cy),
-                    end = Offset(thumbX, cy),
-                    strokeWidth = trackHeight,
-                    cap = StrokeCap.Round,
-                )
-
-                // M3 的按下反馈：拇指周围一圈 40dp 的淡淡光晕，而不是把拇指放大
-                if (pressed && enabled) {
-                    drawCircle(color = haloColor, radius = haloRadius, center = Offset(thumbX, cy))
-                }
-
-                // 刻度：小圆点压在轨道上，选中侧的用主色（M3 的 ticks 就是这个形态）
-                if (intervals > 0) {
-                    repeat(intervals + 1) { index ->
-                        val tx = startX + (endX - startX) * (index.toFloat() / intervals)
-                        drawCircle(
-                            color = if (tx <= thumbX) activeColor else tickColor,
-                            radius = tickRadius,
-                            center = Offset(tx, cy),
-                        )
-                    }
-                }
-
-                drawCircle(
-                    color = if (enabled) activeColor else inactiveTrack,
-                    radius = thumbRadius,
-                    center = Offset(thumbX, cy),
-                )
-            }
-        }
+        /*
+         * 直接用 M3 的 [Slider]。
+         *
+         * 之前这里是自绘的 Canvas：能跑，也没有 bug，但它是**照着** M3 的规格画的
+         * （4dp 轨道 / 20dp 拇指 / 40dp 光晕 / 点轨道跳转）。既然要求"全面使用
+         * 官方组件"，就没必要再维护一份复制品 —— 官方组件自带状态层、
+         * 拖动时的尺寸变化、TalkBack 的 RangeInfo 语义，以及后续版本的手感改进。
+         *
+         * `steps` 的语义要换算：M3 的 `steps` 是**中间挡位数**，而这里的
+         * [intervals] 是"间隔数"。5 个可选档 = 4 个间隔 → steps = 3。
+         */
+        Slider(
+            value = value,
+            onValueChange = onValueChange,
+            modifier = Modifier.fillMaxWidth(),
+            enabled = enabled,
+            valueRange = valueRange,
+            steps = if (intervals > 1) intervals - 1 else 0,
+            onValueChangeFinished = onValueChangeFinished,
+        )
 
         if (tickLabels != null) {
-            Spacer(Modifier.height(6.dp))
+            Spacer(Modifier.height(2.dp))
             SliderTickLabels(
                 labels = tickLabels,
                 selectedIndex = selectedTick,
-                edgePx = edge,
-                selectedColor = activeColor,
-                normalColor = tickColor,
+                edgePx = edgePx,
+                selectedColor = MaterialTheme.colorScheme.primary,
+                normalColor = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
     }
 }
+
+/**
+ * 刻度文案与滑块两端的对齐内边距。
+ *
+ * 官方 Slider 的轨道两端各留了约一个拇指半径（20dp）再加轨道内缩，
+ * 这里取 26dp 让文案中心落在实际刻度的横坐标上。
+ */
+private val SliderLabelEdge = 26.dp
 
 /**
  * 刻度文案：逐个按**刻度的实际横坐标**居中，而不是用 `Row + weight` 平分。
@@ -528,9 +453,20 @@ fun IconCircleButton(
 }
 
 /**
- * **带文字的按钮 = 胶囊。**
+ * **带文字的按钮 = 官方 M3 按钮（胶囊形）。**
  *
- * 用于「深度思考」「创作模式」这类标签，以及各处确认按钮。
+ * ### 为什么不再自绘
+ *
+ * 之前是 `Box + background + border + clickable` 拼出来的"像 M3 的胶囊"。
+ * 换成官方组件之后：状态层（按下 / hover / focus 的叠色）、禁用态、
+ * 文字与图标的内边距、触控尺寸、无障碍角色全部由框架负责；
+ * 观感也跟着 M3 的 tonal 体系走，而不是靠我们手调的一组 alpha。
+ *
+ * 三种形态一一对应：
+ * - **普通**（默认 `outlined = true`）→ [OutlinedButton]
+ * - **实心 / 已选中**（`outlined = false` 或 `selected = true`）→ [FilledTonalButton]
+ *
+ * 形状统一给 `PillShape`：全应用"带字按钮都是胶囊"这条规则没有变。
  */
 @Composable
 fun CapsuleButton(
@@ -541,66 +477,53 @@ fun CapsuleButton(
     trailingIcon: ImageVector? = null,
     selected: Boolean = false,
     enabled: Boolean = true,
-    /** true = 描边（默认）；false = 无边框的裸胶囊。 */
+    /** true = 描边（默认）；false = 实心 tonal。 */
     outlined: Boolean = true,
 ) {
     val colors = LocalChatColors.current
-    val contentColor = when {
-        !enabled -> colors.placeholder
-        selected -> MaterialTheme.colorScheme.primary
-        else -> MaterialTheme.colorScheme.onSurface
-    }
-
-    val borderColor = if (selected) MaterialTheme.colorScheme.primary else colors.outline
-
-    Row(
-        modifier = modifier
-            .clip(PillShape)
-            .background(if (selected) colors.capsuleSelected else Color.Transparent)
-            .then(
-                if (outlined) {
-                    Modifier.border(
-                        width = 1.dp,
-                        color = if (enabled) borderColor else colors.divider,
-                        shape = PillShape,
-                    )
-                } else {
-                    Modifier
-                },
-            )
-            .clickable(enabled = enabled, onClick = onClick)
-            /*
-             * 40dp 高 + 16dp 横向内边距：M3 的按钮尺度。
-             * 原来是 12/8（约 32dp 高），在 M3 的大圆角旁边显得像个小标签。
-             */
-            .defaultMinSize(minHeight = Space.ButtonHeight)
-            .padding(horizontal = 16.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
+    val content: @Composable RowScope.() -> Unit = {
         if (leadingIcon != null) {
             Icon(
                 imageVector = leadingIcon,
                 contentDescription = null,
-                tint = contentColor,
                 modifier = Modifier.size(18.dp),
             )
         }
         Text(
             text = text,
-            // labelLarge(14sp) 才是 M3 的按钮字号；labelMedium(12sp) 是"辅助标签"
             style = MaterialTheme.typography.labelLarge,
-            color = contentColor,
             maxLines = 1,
         )
         if (trailingIcon != null) {
             Icon(
                 imageVector = trailingIcon,
                 contentDescription = null,
-                tint = contentColor,
                 modifier = Modifier.size(16.dp),
             )
         }
+    }
+
+    if (outlined && !selected) {
+        OutlinedButton(
+            onClick = onClick,
+            modifier = modifier.defaultMinSize(minHeight = Space.ButtonHeight),
+            enabled = enabled,
+            shape = PillShape,
+            content = content,
+        )
+    } else {
+        FilledTonalButton(
+            onClick = onClick,
+            modifier = modifier.defaultMinSize(minHeight = Space.ButtonHeight),
+            enabled = enabled,
+            shape = PillShape,
+            colors = ButtonDefaults.filledTonalButtonColors(
+                // 选中态沿用本项目自己的"浅品牌底 + 品牌字"，与胶囊开关一致
+                containerColor = colors.capsuleSelected,
+                contentColor = MaterialTheme.colorScheme.primary,
+            ),
+            content = content,
+        )
     }
 }
 

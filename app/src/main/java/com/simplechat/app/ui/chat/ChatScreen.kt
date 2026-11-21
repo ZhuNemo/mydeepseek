@@ -10,6 +10,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloat
@@ -166,6 +168,8 @@ fun ChatScreen(
     onOpenDrawer: () -> Unit,
     onNewConversation: () -> Unit,
     modifier: Modifier = Modifier,
+    /** 顶栏标题的**共享元素**修饰符（页面转场时由 `RootScreen` 注入）。 */
+    titleModifier: Modifier = Modifier,
 ) {
     val colors = LocalChatColors.current
     val focusManager = LocalFocusManager.current
@@ -1010,7 +1014,7 @@ fun ChatScreen(
                     stable = if (listState.isAtBottom()) stable + 1 else 0
                 }
             }
-            dissolve.animateTo(1f, tween(SwitchFadeInMs, easing = MotionEasing))
+            dissolve.animateTo(1f, spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow))
         } finally {
             switchingConversation = false
             loadingConversation = false
@@ -1113,6 +1117,7 @@ fun ChatScreen(
     ) {
         ChatTopBar(
             title = vm.conversationTitle(),
+            titleModifier = titleModifier,
             autoReadAloud = vm.autoReadAloud,
             readAloudAvailable = ReadAloudEnabled && readAloudAvailable,
             onToggleAutoReadAloud = {

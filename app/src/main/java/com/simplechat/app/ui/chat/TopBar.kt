@@ -10,6 +10,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -48,6 +50,8 @@ fun ChatTopBar(
     autoReadAloud: Boolean = false,
     readAloudAvailable: Boolean = true,
     onToggleAutoReadAloud: () -> Unit = {},
+    /** 标题的共享元素修饰符（页面转场用）。 */
+    titleModifier: Modifier = Modifier,
 ) {
     Row(
         modifier = modifier
@@ -64,7 +68,8 @@ fun ChatTopBar(
             color = MaterialTheme.colorScheme.onBackground,
             modifier = Modifier
                 .weight(1f)
-                .padding(horizontal = 6.dp),
+                .padding(horizontal = 6.dp)
+                .then(titleModifier),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
@@ -104,28 +109,24 @@ private fun TopBarAction(
     tint: Color = MaterialTheme.colorScheme.onSurfaceVariant,
     state: String? = null,
 ) {
-    Box(
-        modifier = Modifier
-            .size(48.dp)
-            .clip(CircleShape)
-            .semantics { if (state != null) stateDescription = state }
-            .clickable(onClick = onClick),
-        contentAlignment = Alignment.Center,
+    /*
+     * 用官方的 [FilledIconButton]（40dp 圆形 tonal 容器 + 48dp 触控区）。
+     *
+     * 之前是 `Box(48) > Box(40) > Icon` 手拼的：形状一样，但少了官方组件的
+     * 状态层（按下 / 焦点的叠色）、禁用态与"最小触控尺寸"的自动处理。
+     */
+    FilledIconButton(
+        onClick = onClick,
+        modifier = Modifier.semantics { if (state != null) stateDescription = state },
+        colors = IconButtonDefaults.filledIconButtonColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+            contentColor = tint,
+        ),
     ) {
-        Box(
-            modifier = Modifier
-                .size(40.dp)
-                .clip(CircleShape)
-                // surfaceContainerHigh：浅色下是浅灰、深色下比页面亮一档，两套主题都看得见
-                .background(MaterialTheme.colorScheme.surfaceContainerHigh),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(
-                imageVector = icon,
-                contentDescription = contentDescription,
-                tint = tint,
-                modifier = Modifier.size(22.dp),
-            )
-        }
+        Icon(
+            imageVector = icon,
+            contentDescription = contentDescription,
+            modifier = Modifier.size(22.dp),
+        )
     }
 }

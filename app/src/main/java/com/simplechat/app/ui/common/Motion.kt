@@ -4,6 +4,9 @@ import androidx.compose.animation.AnimatedContentTransitionScope
 import androidx.compose.animation.ContentTransform
 import androidx.compose.animation.core.Easing
 import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.SpringSpec
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
@@ -36,8 +39,30 @@ const val MotionDurationMs = 300
  */
 const val FoldAnimMs = 220
 
-/** 缓动：平台标准的先快后慢。 */
+/** 缓动：平台标准的先快后慢。仍用于「无限循环」那类动画（转圈、呼吸）。 */
 val MotionEasing: Easing = FastOutSlowInEasing
+
+/**
+ * 全局弹簧规格。
+ *
+ * M3 Expressive 把"状态变化"的默认曲线从 tween 换成了 spring —— 位移与尺寸
+ * 不再是"在固定时间里走完"，而是"受力和阻尼决定何时停"。手感上的差别是
+ * **起步更果断、收尾更自然**，而且被打断时不会跳（弹簧从当前速度接着算，
+ * tween 会从零重来）—— 拖动到一半松手、连点两下这类交互全靠这一点。
+ *
+ * 阻尼取 [Spring.DampingRatioNoBouncy]：过冲在移动端很容易看起来像"没对齐"，
+ * 只在需要强调"弹一下"的地方（见 [MotionBouncy]）才放开。
+ */
+val MotionSpring: SpringSpec<Float> = spring(
+    dampingRatio = Spring.DampingRatioNoBouncy,
+    stiffness = Spring.StiffnessMediumLow,
+)
+
+/** 允许轻微过冲的弹簧，用于"被点中"这类需要一点回弹的反馈。 */
+val MotionBouncy: SpringSpec<Float> = spring(
+    dampingRatio = Spring.DampingRatioLowBouncy,
+    stiffness = Spring.StiffnessMedium,
+)
 
 /**
  * 页面转场。
@@ -60,7 +85,11 @@ val MotionEasing: Easing = FastOutSlowInEasing
  *   同级之间互不跳转，所以只判深度就够。
  */
 fun AnimatedContentTransitionScope<*>.screenTransform(forward: Boolean): ContentTransform {
-    val slide = tween<IntOffset>(MotionDurationMs, easing = MotionEasing)
+    // 页面转场用弹簧：被打断时从当前速度接着走，不会"跳回去重来"
+    val slide = spring<IntOffset>(
+        dampingRatio = Spring.DampingRatioNoBouncy,
+        stiffness = Spring.StiffnessMediumLow,
+    )
 
     val enter = slideInHorizontally(slide) { width -> if (forward) width else -width }
     val exit = slideOutHorizontally(slide) { width -> if (forward) -width else width }

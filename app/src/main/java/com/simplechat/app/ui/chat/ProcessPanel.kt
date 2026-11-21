@@ -1,6 +1,8 @@
 package com.simplechat.app.ui.chat
 
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -95,7 +97,7 @@ fun ProcessPanel(
                 if (reasoningStreaming) {
                     Modifier
                 } else {
-                    Modifier.animateContentSize(tween(FoldAnimMs, easing = MotionEasing))
+                    Modifier.animateContentSize(spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow))
                 },
             ),
     ) {

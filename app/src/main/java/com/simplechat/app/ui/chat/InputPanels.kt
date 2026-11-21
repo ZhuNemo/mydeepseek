@@ -1,6 +1,8 @@
 package com.simplechat.app.ui.chat
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
@@ -79,7 +81,7 @@ fun InputPanel(
     // 面板自己的投影也做淡入，和输入栏投影的淡出对得上
     val elevation by animateDpAsState(
         targetValue = if (visible) AppShadow.PanelElevation else 0.dp,
-        animationSpec = tween(durationMillis = 220),
+        animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow),
         label = "inputPanelShadow",
     )
 
