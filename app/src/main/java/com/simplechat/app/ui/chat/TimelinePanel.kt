@@ -1,5 +1,6 @@
 package com.simplechat.app.ui.chat
 
+import com.simplechat.app.ui.markdown.rememberSearchTextDecoration
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.Spring
@@ -124,15 +125,14 @@ fun TimelinePanel(
 @Composable
 private fun timelineHeader(view: TimelineView, streaming: Boolean): String? {
     if (view.hasAnswer) {
+        // 只有真实思考文本才显示标题。网关可在正文之后才送来摘要，此时没有思考时长。
+        if (view.steps.none { it is TimelineStep.Thinking }) return null
         val seconds = view.thinkingSeconds()
-        /*
-         * 有正文了：只有**真的思考过**才写「已思考（用时 N 秒）」。
-         *
-         * 这一轮可能压根没开思考（只有搜索），以前这里会退回"正在思考" ——
-         * 于是正文都写完了，标题还挂着"正在思考"，纯属谎报。
-         * 没思考过就返回 null：不显示标题，让下面的搜索/浏览行自己说话。
-         */
-        return seconds?.let { stringResource(R.string.thinking_done_seconds, it) }
+        return if (seconds != null) {
+            stringResource(R.string.thinking_done_seconds, seconds)
+        } else {
+            stringResource(R.string.thinking_done)
+        }
     }
     if (!streaming) return stringResource(R.string.thinking_stopped)
     val last = view.steps.lastOrNull()
@@ -161,37 +161,32 @@ private fun timelineHeader(view: TimelineView, streaming: Boolean): String? {
     }
 }
 
-/** 思考片段：左侧圆点 + 竖线，小号正文。 */
+/**
+ * 思考片段：左侧圆点 + 竖线，小号正文。
+ *
+ * **进行中与已思考共用同一个引导列**（[ThinkingGutter]）：流式期间走尾巴模式
+ * （只排版最后几行、底部对齐、不跳动），写完就是完整正文 —— 但两种状态的
+ * 左缘、线宽、线色、圆点位置完全一致，切换时不会跳版。
+ */
 @Composable
 private fun ThinkingStep(step: TimelineStep.Thinking) {
+    if (step.active) {
+        TailContent(step.text, gutter = true)
+        return
+    }
     val colors = LocalChatColors.current
+    val (searchDecoration, onTextLayout) = rememberSearchTextDecoration(step.text)
     Row(modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
-        Column(
-            modifier = Modifier.width(16.dp).fillMaxHeight(),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Box(
-                modifier = Modifier
-                    .padding(top = 6.dp)
-                    .size(7.dp)
-                    .clip(CircleShape)
-                    .background(if (step.active) colors.processBar else colors.processText.copy(alpha = 0.5f)),
-            )
-            Box(
-                modifier = Modifier
-                    .width(2.dp)
-                    .fillMaxHeight()
-                    .padding(vertical = 4.dp)
-                    .clip(RoundedCornerShape(1.dp))
-                    .background(colors.processBar.copy(alpha = 0.45f)),
-            )
-        }
-        Spacer(Modifier.width(10.dp))
+        ThinkingGutter(
+            modifier = Modifier.width(ThinkingGutterWidth).fillMaxHeight(),
+        )
+        Spacer(Modifier.width(ThinkingGutterGap))
         Text(
             text = step.text,
             style = ProcessTextStyle,
             color = colors.processText,
-            modifier = Modifier.weight(1f),
+            modifier = Modifier.weight(1f).then(searchDecoration),
+            onTextLayout = onTextLayout,
         )
     }
 }
@@ -247,7 +242,7 @@ private fun SearchStep(step: TimelineStep.Search, onOpenSources: (List<SourceRef
 @Composable
 private fun searchSummary(step: TimelineStep.Search): String {
     val count = step.sources.size
-    return if (isDeepSearchKind(step.kind)) {
+    return if (isDeepSearchKind(step.kind) || step.kind == com.simplechat.app.net.IndependentSearchKind) {
         stringResource(if (count == 1) R.string.search_found_one else R.string.search_found_many, count)
     } else {
         stringResource(if (count == 1) R.string.search_read_one else R.string.search_read_many, count)

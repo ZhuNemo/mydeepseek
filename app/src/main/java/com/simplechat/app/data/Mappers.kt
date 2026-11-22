@@ -56,6 +56,11 @@ fun MessageEntity.toUi(): UiMessage = UiMessage(
     tps = tps,
     timeline = ReplyBlocks.decode(timeline),
     stopReason = stopReason,
+    tokensIn = tokensIn,
+    tokensOut = tokensOut,
+    cacheHitTokens = cacheHitTokens,
+    imageGeneration = imageGeneration,
+    imageRequest = ImageRequest.decode(imageRequest),
 )
 
 fun MessageStatus.toStorage(): String = name
@@ -73,6 +78,8 @@ fun newMessageEntity(
     status: MessageStatus = MessageStatus.DONE,
     active: Boolean = true,
     model: String? = null,
+    imageGeneration: Boolean = false,
+    imageRequest: ImageRequest? = null,
     now: Long = System.currentTimeMillis(),
 ): MessageEntity = MessageEntity(
     id = id,
@@ -86,5 +93,7 @@ fun newMessageEntity(
     reasoning = reasoning,
     status = status.toStorage(),
     model = model,
+    imageGeneration = imageGeneration,
+    imageRequest = imageRequest?.encode(),
     createdAt = now,
 )

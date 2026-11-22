@@ -47,17 +47,21 @@ enum class MessageStatus { DONE, STREAMING, STOPPED, ERROR }
  * 思考档位。**开关与强度合并为一个滑块**，3 档：
  *
  * ```
- * 关闭  ────  high  ────  max
+ * 关闭  ────  low  ────  high  ────  max
  *  ↑ 最左即关闭
  * ```
  *
- * 滑到最左即关闭思考（发 `thinking.type = disabled`，不带 `reasoning_effort`）；
- * 其余档位发送对应的 `reasoning_effort`。
+ * 支持关闭的模型才提供关闭档。必须思考的模型从其支持的最低档开始。
  */
 enum class ReasoningLevel(val apiValue: String?, @StringRes private val labelRes: Int) {
     OFF(null, R.string.reasoning_off),
+    MINIMAL("minimal", R.string.reasoning_minimal),
+    LOW("low", R.string.reasoning_low),
+    MEDIUM("medium", R.string.reasoning_medium),
     HIGH("high", R.string.reasoning_high),
+    XHIGH("xhigh", R.string.reasoning_xhigh),
     MAX("max", R.string.reasoning_max),
+    ULTRA("ultra", R.string.reasoning_ultra),
     ;
 
     /** 档位名。OFF 随界面语言，high / max 是发给 API 的字面值本身。 */
@@ -67,7 +71,12 @@ enum class ReasoningLevel(val apiValue: String?, @StringRes private val labelRes
 
     companion object {
         /** 滑块档位顺序，索引即滑块位置。 */
-        val sliderOrder: List<ReasoningLevel> = listOf(OFF, HIGH, MAX)
+        val sliderOrder: List<ReasoningLevel> = listOf(OFF, LOW, HIGH, MAX)
+
+        fun forModel(model: ModelInfo): List<ReasoningLevel> {
+            val advertised = model.effortLevels ?: return sliderOrder
+            return listOf(OFF) + entries.filter { it.apiValue != null && it.apiValue in advertised }
+        }
 
         fun fromSliderPosition(position: Int): ReasoningLevel =
             sliderOrder[position.coerceIn(0, sliderOrder.lastIndex)]
@@ -111,10 +120,11 @@ data class ConversationSettings(
     val maxTokens: Int? = null,
 ) {
     /** 实际是否开启思考：模型支持且档位非 OFF。 */
-    val thinkingEnabled: Boolean get() = model.supportsThinking && reasoningLevel.enabled
+    val thinkingEnabled: Boolean
+        get() = model.supportsThinking && (reasoningLevel.enabled || model.minimumRequiredEffort() != null)
 
     val reasoningEffort: String?
-        get() = if (thinkingEnabled) reasoningLevel.apiValue else null
+        get() = if (thinkingEnabled) reasoningLevel.apiValue ?: model.minimumRequiredEffort() else null
 
     /** 最终系统提示词：预设按序拼接 + 会话补充。用于预览，避免黑盒。 */
     fun composedSystemPrompt(presets: List<Preset>): String {
@@ -179,6 +189,14 @@ data class ContextStats(
     /** 累计思考时长（秒）。 */
     val totalThinkingSeconds: Long?,
     val hasCompaction: Boolean,
+    /** 服务端回报过用量的回复条数（老数据没有用量，不计入）。 */
+    val usageReplies: Int = 0,
+    /** 这些回复累计的输入 token（每轮请求的 prompt 都算，含重复的上下文）。 */
+    val usagePromptTokens: Int = 0,
+    /** 累计输出 token。 */
+    val usageCompletionTokens: Int = 0,
+    /** 输入里命中缓存的部分。 */
+    val usageCacheHitTokens: Int = 0,
 ) {
     /** 占用比例，0f..1f。 */
     val ratio: Float
@@ -186,6 +204,14 @@ data class ContextStats(
 
     /** 占用百分比，整数。 */
     val percent: Int get() = (ratio * 100).toInt()
+
+    /** 本会话累计用量的估算费用（元）。 */
+    val usageCost: Double
+        get() = com.simplechat.app.data.Pricing.cost(
+            promptTokens = usagePromptTokens,
+            completionTokens = usageCompletionTokens,
+            cacheHitTokens = usageCacheHitTokens.takeIf { it > 0 },
+        )
 }
 
 /** 展示模型；M4 接入 Room 后由实体映射而来。 */
@@ -240,8 +266,20 @@ data class UiMessage(
      * （唯一用到它的是 `max_tokens`：表示"被上限截断"，可以续写。）
      */
     val stopReason: String? = null,
+    /**
+     * 服务端回报的用量（该条回复那一轮请求）。
+     *
+     * null = 老数据或服务端没报 —— 用量统计里按"未上报"处理，不按 0 计。
+     */
+    val tokensIn: Int? = null,
+    val tokensOut: Int? = null,
+    /** 输入里命中 prompt 缓存的部分。 */
+    val cacheHitTokens: Int? = null,
+    val imageGeneration: Boolean = false,
+    val imageRequest: com.simplechat.app.data.ImageRequest? = null,
 ) {
     val streaming: Boolean get() = status == MessageStatus.STREAMING
+    internal val hasReasoning: Boolean get() = !reasoning.isNullOrBlank()
 
     /**
      * 思维链是否**还在**生成。
@@ -250,5 +288,5 @@ data class UiMessage(
      * 而思维链结束得早得多。用错的后果：正文都快写完了，思考栏还挂在
      * 「正在思考」的尾巴模式上，看起来模型还在想。
      */
-    val reasoningStreaming: Boolean get() = streaming && !reasoningDone
+    val reasoningStreaming: Boolean get() = hasReasoning && streaming && !reasoningDone
 }

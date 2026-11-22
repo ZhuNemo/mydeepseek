@@ -2,16 +2,20 @@ package com.simplechat.app.net.anthropic
 
 import com.simplechat.app.net.cancelWithCoroutine
 import com.simplechat.app.net.readErrorText
+import com.simplechat.app.net.LargeRequestBytes
+import com.simplechat.app.net.StreamingRequestBody
+import com.simplechat.app.net.estimatedInputTokens
+import com.simplechat.app.net.validateRequestBudget
 
 import com.simplechat.app.net.ChatStreamLogTag
 import com.simplechat.app.net.StreamEvent
 import com.simplechat.app.net.StreamMaxAttempts
 import com.simplechat.app.net.StreamRetryDelayMs
 import com.simplechat.app.net.httpErrorText
+import com.simplechat.app.net.isEmptyMessagesRejection
 import com.simplechat.app.net.networkText
 import java.io.IOException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -20,11 +24,9 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.isActive
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.encodeToStream
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 
 /**
  * Anthropic 兼容通道的流式客户端（`POST /anthropic/v1/messages`）。
@@ -43,19 +45,33 @@ class AnthropicApi(
     private val json: Json,
 ) {
 
-    private val parser = AnthropicStreamParser(json)
-
     fun streamMessage(
         url: String,
         apiKey: String,
         request: AnthropicRequest,
         extraHeaders: Map<String, String> = emptyMap(),
+        contextWindow: Int? = null,
+        retryBeforeContent: Boolean = true,
     ): Flow<StreamEvent> = flow {
-        val body = StreamingAnthropicRequestBody(json, request)
+        val parser = AnthropicStreamParser(json, request.tools.any { it.name == "generate_image" })
+        validateRequestBudget(estimatedInputTokens(request), request.maxTokens, contextWindow)
+        val nativeVersion = claudeVersionFor(url)
+        val wireRequest = if (nativeVersion != null) request.copy(temperature = null, topP = null) else request
+        val body = StreamingAnthropicRequestBody(json, wireRequest)
+        val largeRequest = body.contentLength() >= LargeRequestBytes
 
         val builder = Request.Builder().url(url).post(body)
-        anthropicHeaders(apiKey, extraHeaders).forEach { (name, value) -> builder.header(name, value) }
+        val versionHeaders = nativeVersion?.let { mapOf("anthropic-version" to it) }.orEmpty()
+        anthropicHeaders(apiKey, versionHeaders + extraHeaders).forEach { (name, value) -> builder.header(name, value) }
         val httpRequest = builder.build()
+
+        fun logEmptyMessagesRejection(message: String?) {
+            if (!isEmptyMessagesRejection(message)) return
+            android.util.Log.w(ChatStreamLogTag, "Messages rejected: count=${request.messages.size} " +
+                "users=${request.messages.count { it.role == AnthropicMessageParam.RoleUser }} " +
+                "firstRole=${request.messages.firstOrNull()?.role} systemChars=${request.system.length} " +
+                "requestBytes=${body.contentLength()}")
+        }
 
         var attempt = 0
         var emittedAny = false
@@ -63,46 +79,59 @@ class AnthropicApi(
             attempt++
             val call = client.newCall(httpRequest)
             val handle = call.cancelWithCoroutine()
+            var receivedHeaders = false
             var retryHttp = false
             try {
                 call.execute().use { response ->
+                    receivedHeaders = true
                     val source = response.body?.source()
                     if (!response.isSuccessful || source == null) {
                         val raw = runCatching { response.body.readErrorText() }.getOrNull()
                         val serverMessage = parser.parseErrorMessage(raw)
+                        logEmptyMessagesRejection(serverMessage)
                         android.util.Log.w(ChatStreamLogTag, "HTTP ${response.code}")
                         /*
                          * 429 / 5xx 且**一个字都还没发出去** → 重发一次。
                          * 与 OpenAI 通道同一条规则：已经收到内容再重发会出现两份回答。
                          */
-                        if (!emittedAny && attempt < StreamMaxAttempts && isRetryableStatus(response.code)) {
+                        if (retryBeforeContent && !emittedAny && attempt < StreamMaxAttempts && isRetryableStatus(response.code)) {
                             android.util.Log.w(ChatStreamLogTag, "HTTP ${response.code}; retrying")
                             retryHttp = true
                             return@use
                         }
                         emit(
                             StreamEvent.Error(
-                                message = httpErrorText(response.code, serverMessage),
+                                message = httpErrorText(response.code, serverMessage, largeRequest),
                                 code = response.code,
                                 retryable = isRetryableStatus(response.code),
+                                rawMessage = serverMessage,
                             ),
                         )
                         return@use
                     }
 
                     var finished = false
+                    var receivedStop = false
                     while (!finished) {
                         currentCoroutineContext().ensureActive()
 
                         val line = source.readUtf8Line()
                         if (line == null) {
+                            if (!receivedStop) throw java.io.EOFException("Stream ended before completion")
                             finished = true
                         } else {
                             when (val result = parser.parse(line)) {
                                 is AnthropicStreamParser.Result.Events ->
                                     result.events.forEach {
+                                        if (it is StreamEvent.Error) logEmptyMessagesRejection(it.message)
                                         emit(it)
                                         emittedAny = true
+                                        if (it is StreamEvent.Error) {
+                                            receivedStop = true
+                                            finished = true
+                                        } else if (it is StreamEvent.Stopped) {
+                                            receivedStop = true
+                                        }
                                     }
 
                                 AnthropicStreamParser.Result.Done -> finished = true
@@ -123,13 +152,13 @@ class AnthropicApi(
                 // 用户主动取消造成的 IOException 不应报告为错误
                 if (!currentCoroutineContext().isActive) return@flow
                 // 一个字都还没发出去 → 重发是安全的（与 SseClient 同一条规则，见那里的说明）
-                if (!emittedAny && attempt < StreamMaxAttempts) {
+                if (retryBeforeContent && !emittedAny && attempt < StreamMaxAttempts && body.canReplayOnDisconnect()) {
                     android.util.Log.w(ChatStreamLogTag, "stream reset before any event; retrying", e)
                     delay(StreamRetryDelayMs)
                     continue
                 }
                 android.util.Log.w(ChatStreamLogTag, "stream interrupted", e)
-                emit(StreamEvent.Error(e.networkText(), retryable = true))
+                emit(StreamEvent.Error(e.networkText(largeRequest && !emittedAny, receivedHeaders), retryable = true))
                 return@flow
             } finally {
                 handle.cancel()
@@ -137,25 +166,15 @@ class AnthropicApi(
         }
     }.flowOn(Dispatchers.IO)
 
-    private companion object {
-        val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
-    }
 }
 
 /** Anthropic 协议版本。原版会校验这个头；DeepSeek 的兼容端点也收。 */
 internal const val AnthropicVersion = "2023-06-01"
 
-@OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
 internal class StreamingAnthropicRequestBody(
-    private val json: Json,
-    private val request: AnthropicRequest,
-) : okhttp3.RequestBody() {
-    override fun contentType() = "application/json; charset=utf-8".toMediaType()
-    override fun isOneShot() = true
-    override fun writeTo(sink: okio.BufferedSink) {
-        json.encodeToStream(AnthropicRequest.serializer(), request, sink.outputStream())
-    }
-}
+    json: Json,
+    request: AnthropicRequest,
+) : StreamingRequestBody<AnthropicRequest>(json, AnthropicRequest.serializer(), request)
 
 /**
  * 请求头。
@@ -213,6 +232,9 @@ internal fun isRetryableStatus(code: Int): Boolean =
  * `/anthropic` 前缀下；其余 Anthropic 兼容端点走标准 `/v1/messages`。
  * 纯函数，有单测：这一层错了只表现为 404，从界面上看不出是哪一环。
  */
+internal fun claudeVersionFor(baseUrl: String): String? =
+    "2026-10-21".takeIf { baseUrl.trim().toHttpUrlOrNull()?.host == "api.anthropic.com" }
+
 fun anthropicMessagesUrl(baseUrl: String): String {
     val base = baseUrl.trim().trimEnd('/')
     if (base.isEmpty()) return base
@@ -221,7 +243,8 @@ fun anthropicMessagesUrl(baseUrl: String): String {
         base.endsWith("/anthropic/v1") -> "$base/messages"
         base.endsWith("/anthropic") -> "$base/v1/messages"
         // DeepSeek 官方：扩展协议挂在 /anthropic 前缀下
-        base.contains("api.deepseek.com") -> "$base/anthropic/v1/messages"
+        com.simplechat.app.net.isOfficialDeepSeekEndpoint(base) ->
+            "${com.simplechat.app.net.officialChatRoot(base)?.removeSuffix("/v1") ?: base}/anthropic/v1/messages"
         // 其余 Anthropic 兼容端点（自建网关 / Claude 中转）：标准路径
         base.endsWith("/v1") -> "$base/messages"
         else -> "$base/v1/messages"

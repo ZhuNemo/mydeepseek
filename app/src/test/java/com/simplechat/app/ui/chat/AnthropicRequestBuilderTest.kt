@@ -1,10 +1,12 @@
 package com.simplechat.app.ui.chat
 
 import com.simplechat.app.data.Attachment
+import com.simplechat.app.net.ChatApi
 import com.simplechat.app.net.ReplyBlock
 import com.simplechat.app.net.anthropic.AnthropicMessageParam
 import com.simplechat.app.net.anthropic.AnthropicTool
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonArray
@@ -53,6 +55,7 @@ class AnthropicRequestBuilderTest {
         maxTokens: Int? = null,
         prefix: UiMessage? = null,
         system: String = "",
+        reasoningEffort: String? = null,
     ) = buildAnthropicRequest(
         model = "deepseek-flash",
         systemPrompt = system,
@@ -63,9 +66,45 @@ class AnthropicRequestBuilderTest {
         latestReminder = reminder,
         maxTokens = maxTokens,
         prefix = prefix,
+        reasoningEffort = reasoningEffort,
     )
 
     // ── 系统提示词与工具 ──────────────────────────────────
+
+    @Test
+    fun `recovery retry keeps text history but omits attachments and server tools`() {
+        val history = listOf(
+            user("Earlier question", listOf(Attachment(Attachment.Kind.TEXT, "notes.txt", "text/plain", "", fileId = "file-api-1"))),
+            assistant("Earlier answer", timeline = listOf(
+                ReplyBlock.ToolUse("tool-1", "deepseek_read_url", "read_link", "read_link", url = "https://example.org"),
+                ReplyBlock.FetchResult("tool-1", "read_link", "https://example.org", signature = "signed-payload"),
+            )),
+            user("Please continue"),
+        )
+
+        val request = buildAnthropicRequest(
+            model = "deepseek-flash",
+            systemPrompt = "",
+            path = history,
+            searchEnabled = true,
+            thinkingEnabled = true,
+            requestTitle = true,
+            latestReminder = null,
+            allowServerTools = false,
+            includeAttachments = false,
+        )
+        val encoded = ChatApi.defaultJson().encodeToString(
+            com.simplechat.app.net.anthropic.AnthropicRequest.serializer(), request,
+        )
+
+        assertTrue(encoded.contains("Earlier question"))
+        assertTrue(encoded.contains("Earlier answer"))
+        assertTrue(encoded.contains("Please continue"))
+        assertTrue(request.tools.isEmpty())
+        assertNull(request.title)
+        assertTrue(!encoded.contains("file-api-1"))
+        assertTrue(!encoded.contains("signed-payload"))
+    }
 
     @Test
     fun `系统提示词为空时用身份说明兜底`() {
@@ -80,12 +119,26 @@ class AnthropicRequestBuilderTest {
     }
 
     @Test
-    fun `读链接始终声明，搜索受开关控制`() {
-        assertEquals(listOf(AnthropicTool.ReadUrl), build(listOf(user("你好"))).tools)
-        assertEquals(
-            listOf(AnthropicTool.ReadUrl, AnthropicTool.WebSearch),
-            build(listOf(user("你好")), search = true).tools,
+    fun `读链接按当前消息声明，搜索受开关控制`() {
+        val link = user("看看 https://example.com/page")
+        val plain = user("你好")
+        assertTrue(build(listOf(link, assistant("好的"), plain)).tools.isEmpty())
+        assertEquals(listOf(AnthropicTool.ReadUrl), build(listOf(link)).tools)
+        assertEquals(listOf(AnthropicTool.WebSearch), build(listOf(plain), search = true).tools)
+        assertEquals(listOf(AnthropicTool.ReadUrl, AnthropicTool.WebSearch), build(listOf(link), search = true).tools)
+    }
+
+    @Test
+    fun `official Flash combines the image function only with thinking search`() {
+        fun request(thinking: Boolean, search: Boolean) = buildAnthropicRequest(
+            model = "deepseek-flash", systemPrompt = "", path = listOf(user("Draw https://example.com/reference")),
+            searchEnabled = search, thinkingEnabled = thinking, requestTitle = false,
+            latestReminder = null, generateImageTool = true,
         )
+        assertEquals(listOf("generate_image"), request(false, true).tools.map { it.name })
+        assertEquals(listOf("deepseek_web_search", "generate_image"), request(true, true).tools.map { it.name })
+        assertEquals(listOf("generate_image"), request(true, false).tools.map { it.name })
+        assertTrue(request(true, true).system.contains("Never say an image was generated"))
     }
 
     @Test
@@ -95,8 +148,26 @@ class AnthropicRequestBuilderTest {
     }
 
     @Test
-    fun `安全审核档位始终为 high（扩展模式的开关）`() {
-        assertEquals("high", build(listOf(user("你好"))).safetyCheck!!.level)
+    fun `DeepSeek Anthropic 扩展通道传递 low 思考强度`() {
+        val request = build(listOf(user("你好")), thinking = true, reasoningEffort = "low")
+        assertEquals("low", request.outputConfig?.effort)
+    }
+
+    @Test
+    fun `长文本和文件引用不附加额外请求选项`() {
+        val text = " apple".repeat(36_000).trimStart()
+        val file = Attachment(Attachment.Kind.TEXT, "large.json", "application/json", "", fileId = "file-test")
+        val json = ChatApi.defaultJson()
+        val inline = json.encodeToJsonElement(build(listOf(user(text)), title = true)).jsonObject
+        val attached = json.encodeToJsonElement(build(listOf(user("继续讨论", listOf(file))), title = true)).jsonObject
+        for (request in listOf(inline, attached)) {
+            assertTrue("safety_check" !in request)
+            assertTrue("tools" !in request)
+            assertTrue("title" !in request)
+        }
+        assertEquals(text, inline.getValue("messages").jsonArray.single().jsonObject.getValue("content").jsonPrimitive.content)
+        val blocks = attached.getValue("messages").jsonArray.single().jsonObject.getValue("content").jsonArray
+        assertEquals("file-test", blocks.first().jsonObject.getValue("source").jsonObject.getValue("file_id").jsonPrimitive.content)
     }
 
     @Test
@@ -141,17 +212,18 @@ class AnthropicRequestBuilderTest {
      * 于是提醒后面跟的是 assistant，服务端直接拒。
      */
     @Test
-    fun `路径以 assistant 结尾时提醒仍然紧跟 user`() {
+    fun `只有一轮问答时提醒放入系统提示`() {
         val request = build(
             listOf(user("问"), assistant("被改过的回答")),
             reminder = "2026-11-14,星期六,杭州,Android,中文",
         )
         val roles = request.messages.map { it.role }
-        assertEquals(listOf(AnthropicMessageParam.RoleReminder, "user", "assistant"), roles)
+        assertEquals(listOf("user", "assistant"), roles)
+        assertTrue(request.system.contains("2026-11-14,星期六,杭州"))
     }
 
     @Test
-    fun `续写时提醒落在最后一条 user 前面`() {
+    fun `续写时提醒不会挤到第一条用户消息前`() {
         val prefix = assistant("写到一半", timeline = listOf(ReplyBlock.Text("写到一半")))
         val request = build(
             listOf(user("写故事")),
@@ -159,7 +231,8 @@ class AnthropicRequestBuilderTest {
             prefix = prefix,
         )
         val roles = request.messages.map { it.role }
-        assertEquals(listOf(AnthropicMessageParam.RoleReminder, "user", "assistant"), roles)
+        assertEquals(listOf("user", "assistant"), roles)
+        assertTrue(request.system.contains("2026-11-14,星期六,杭州"))
     }
 
     @Test
@@ -454,7 +527,6 @@ class AnthropicRequestBuilderTest {
     fun `原版目标不带 DeepSeek 专有字段`() {
         val request = buildVanilla(listOf(user("你好")))
         // 这些字段原版不认识，带上就是 400
-        assertNull(request.safetyCheck)
         assertNull(request.title)
         assertTrue(request.tools.isEmpty())
         // 空系统提示词不再塞 DeepSeek 身份说明

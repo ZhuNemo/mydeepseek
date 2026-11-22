@@ -16,9 +16,20 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+=======
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.res.stringArrayResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.simplechat.app.R
@@ -67,7 +78,7 @@ internal fun ThinkingHeader(
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Icon(
-            imageVector = AppIcons.Brain,
+            imageVector = AppIcons.Sparkles,
             contentDescription = null,
             tint = colors.processText,
             modifier = Modifier.size(15.dp),
@@ -103,8 +114,16 @@ internal fun ThinkingHeader(
  * 而不是凭空冒出一个新控件。
  */
 @Composable
-internal fun WaitingIndicator(modifier: Modifier = Modifier) {
-    val colors = LocalChatColors.current
+internal fun WaitingIndicator(
+    selectedPhrase: String?,
+    useThemeColor: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val color = if (useThemeColor) MaterialTheme.colorScheme.primary else LocalChatColors.current.processText
+    val phrase = (selectedPhrase ?: stringArrayResource(R.array.reply_waiting_phrases).let { defaults ->
+        val index = rememberSaveable { defaults.indices.random() }
+        defaults[index]
+    }).trimEnd('.', '…').trimEnd()
     val transition = rememberInfiniteTransition(label = "waitingFirstToken")
     val dots by transition.animateFloat(
         initialValue = 0f,
@@ -134,9 +153,9 @@ internal fun WaitingIndicator(modifier: Modifier = Modifier) {
         )
         Text(
             // 省略号按秒循环出现：三个点，一格一个
-            text = Res.get(R.string.reply_waiting) + ".".repeat(dots.toInt().coerceIn(0, 3)),
+            text = phrase + ".".repeat(dots.toInt().coerceIn(0, 3)),
             style = MaterialTheme.typography.titleSmall,
-            color = colors.processText,
+            color = color,
         )
     }
 }

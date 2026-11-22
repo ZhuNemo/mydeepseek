@@ -17,6 +17,18 @@ import org.junit.Test
 class RequestOrderingTest {
 
     @Test
+    fun `model switch notice compares against last completed assistant`() {
+        val path = listOf(
+            msg("u1", "", MessageRole.USER, "question"),
+            msg("a1", "u1", MessageRole.ASSISTANT, "Flash answer").copy(model = "deepseek-flash"),
+            msg("u2", "a1", MessageRole.USER, "follow up"),
+            msg("a2", "u2", MessageRole.ASSISTANT, "", MessageStatus.STREAMING).copy(model = "deepseek-v4-pro"),
+        )
+        assertEquals("deepseek-flash", modelSwitchedFrom(path, "deepseek-v4-pro"))
+        assertEquals(null, modelSwitchedFrom(path, "deepseek-flash"))
+    }
+
+    @Test
     fun `compaction with blank historical replies must retain the newly sent user message`() {
         val path = listOf(
             msg("u1", "", MessageRole.USER, "old question"),
@@ -180,6 +192,17 @@ class RequestOrderingTest {
 
         // 覆盖到 m2，剩 m3（assistant）→ 首条不是 user → 全丢
         assertTrue(orderedOutgoingMessages(path, compaction("m2")).isEmpty())
+    }
+
+    @Test
+    fun `editing any message covered by compaction invalidates its summary`() {
+        val path = chain(6)
+        val summary = compaction("m3")
+
+        assertTrue(compactionInvalidatedByEdit(path, summary, "m1"))
+        assertTrue(compactionInvalidatedByEdit(path, summary, "m3"))
+        assertTrue(!compactionInvalidatedByEdit(path, summary, "m4"))
+        assertTrue(!compactionInvalidatedByEdit(path, compaction("other-branch"), "m1"))
     }
 
     @Test

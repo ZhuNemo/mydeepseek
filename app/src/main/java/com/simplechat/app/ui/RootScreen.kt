@@ -1,41 +1,41 @@
 package com.simplechat.app.ui
 
 import androidx.activity.compose.BackHandler
-import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.ExperimentalSharedTransitionApi
 import androidx.compose.animation.SharedTransitionLayout
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.shrinkHorizontally
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Checkbox
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -53,12 +53,12 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.simplechat.app.data.StoredSettings
 import com.simplechat.app.App
 import com.simplechat.app.R
 import com.simplechat.app.db.ConversationEntity
@@ -75,8 +75,10 @@ import com.simplechat.app.ui.history.ConversationSearchPage
 import com.simplechat.app.ui.history.HistoryDrawerContent
 import com.simplechat.app.ui.history.HistoryViewModel
 import com.simplechat.app.ui.history.searchResultKey
-import com.simplechat.app.ui.vault.VaultScreen
 import com.simplechat.app.ui.settings.SettingsScreen
+import com.simplechat.app.ui.vault.VaultScreen
+import com.simplechat.app.data.StoredSettings
+import com.simplechat.app.ui.onboarding.OnboardingScreen
 import com.simplechat.app.ui.theme.LocalChatColors
 import kotlinx.coroutines.launch
 
@@ -90,13 +92,16 @@ import kotlinx.coroutines.launch
  */
 private enum class Route(val depth: Int) {
     CHAT(0),
-    SETTINGS(1),
+    SETTINGS(1), IMAGE_SETTINGS(1), API_SETTINGS(1),
     /** 保险箱（解锁后是列表）。 */
     VAULT(1),
 }
 
 /** 抽屉平时的宽度。 */
 private const val DrawerWidthFraction = 0.78f
+private const val WideChatMinWidthDp = 720
+private val WideSidebarWidth = 256.dp
+private val WideChatMaxWidth = 800.dp
 
 /** 抽屉圆角。撑满时必须收成 0，否则全屏面板会在四角露出底下的内容。 */
 private val DrawerCorner = 16.dp
@@ -118,8 +123,23 @@ private val DrawerCorner = 16.dp
  */
 @OptIn(ExperimentalSharedTransitionApi::class)
 @Composable
-fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
+fun RootScreen(
+    chat: ChatViewModel? = null,
+    history: HistoryViewModel? = null,
+    /** 整机应用锁当前是否已解开（由 `AppLockGate` 传入）。 */
+    appLockUnlocked: Boolean = false,
+) {
     val container = (LocalContext.current.applicationContext as App).container
+    val onboarding by container.settingsStore.flow.collectAsStateWithLifecycle(initialValue = null)
+    if (onboarding == null) return
+    if (onboarding?.onboardingComplete == false) {
+        OnboardingScreen(
+            settingsStore = container.settingsStore,
+            chatApi = container.chatApi,
+            repository = container.chatRepository,
+        )
+        return
+    }
     val scope = rememberCoroutineScope()
 
     val chatViewModel: ChatViewModel = chat ?: viewModel(
@@ -131,28 +151,41 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
         ),
     )
     val historyViewModel: HistoryViewModel = history ?: viewModel(
-        factory = HistoryViewModel.factory(container.chatRepository),
+        factory = HistoryViewModel.factory(container.chatRepository, container.settingsStore),
     )
 
     val conversations by historyViewModel.conversations.collectAsStateWithLifecycle()
-    val syncState by container.syncManager.state.collectAsStateWithLifecycle()
-    // 上游把搜索改成了分页模型（searchPage）；我们这侧原来的 searchHits 已随之消失
-    val searchPage by historyViewModel.searchPage.collectAsStateWithLifecycle()
     /*
      * 抽屉里的写库操作失败了 → 走对话页那条 banner。
      *
-     * 这些动作（重命名 / 置顶 / 删除）原本是裸 `launch`：一条数据库异常就会
-     * 让进程直接死掉（`viewModelScope` 没有异常处理器）。现在 HistoryViewModel
+     * 这些动作（重命名 / 置顶 / 删除）如果裸 `launch`，一条数据库异常就会
+     * 让进程直接死掉（`viewModelScope` 没有异常处理器）。HistoryViewModel
      * 把异常收成一条消息送到这里，用户至少知道"这次没成功"。
      */
     val historyError by historyViewModel.error.collectAsStateWithLifecycle()
-    LaunchedEffect(historyError) {
+    androidx.compose.runtime.LaunchedEffect(historyError) {
         historyError?.let {
             chatViewModel.showBanner(it)
             historyViewModel.consumeError()
         }
     }
+    // 云同步状态：抽屉下拉刷新直接读它（"转圈"与"真的在同步"必须是同一件事）
+    val syncState by container.syncManager.state.collectAsStateWithLifecycle()
+    val storedSettings by container.settingsStore.flow
+        .collectAsStateWithLifecycle(initialValue = StoredSettings())
+    val vaultConversations by remember(container.chatRepository) {
+        container.chatRepository.observeHiddenConversations()
+    }.collectAsStateWithLifecycle(initialValue = emptyList())
+    val searchPage by historyViewModel.searchPage.collectAsStateWithLifecycle()
     val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val configuration = LocalConfiguration.current
+    val wideChatLayout = configuration.screenWidthDp >= WideChatMinWidthDp &&
+        configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+    var wideSidebarVisible by rememberSaveable { mutableStateOf(true) }
+    var searchWasDocked by remember { mutableStateOf(false) }
+    androidx.compose.runtime.LaunchedEffect(wideChatLayout) {
+        if (wideChatLayout && drawerState.targetValue == DrawerValue.Open) drawerState.close()
+    }
 
     /*
      * `rememberSaveable` 而不是 `remember`：换语言是 `recreate()` 整页重建，
@@ -163,6 +196,8 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
 
     /** 抽屉是否处于搜索态。见类注释：它是抽屉的状态，不是一条路由。 */
     var searchMode by rememberSaveable { mutableStateOf(false) }
+    // 搜索切换会移除普通抽屉列表，折叠状态留在根界面。
+    var pinnedGroupExpanded by rememberSaveable { mutableStateOf(true) }
     var readingSearchResult by rememberSaveable { mutableStateOf(false) }
     var openingSearchResult by remember { mutableStateOf(false) }
     var selectedSearchResultKey by rememberSaveable { mutableStateOf<String?>(null) }
@@ -172,33 +207,21 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
 
     var renameTarget by remember { mutableStateOf<ConversationEntity?>(null) }
     var deleteTarget by remember { mutableStateOf<ConversationEntity?>(null) }
-    /** 删除时是否连云端一起删。默认勾选 —— 只删本地的话下次同步就回来了。 */
-    var deleteFromCloud by remember { mutableStateOf(true) }
-    var hideTarget by remember { mutableStateOf<ConversationEntity?>(null) }
-    val vaultCoroutine = rememberCoroutineScope()
-    val storedSettings by container.settingsStore.flow
-        .collectAsStateWithLifecycle(initialValue = StoredSettings())
-    val vaultConversations by remember { container.chatRepository.observeHiddenConversations() }
-        .collectAsStateWithLifecycle(initialValue = emptyList())
     var confirmBatchDelete by remember { mutableStateOf(false) }
+    var hideTarget by remember { mutableStateOf<ConversationEntity?>(null) }
 
     // 首次进入播种内置预设
-    remember { historyViewModel.seedPresets(); Unit }
+    androidx.compose.runtime.LaunchedEffect(historyViewModel) { historyViewModel.seedPresets() }
 
-    /*
-     * 启动时自动同步一次（设置里默认关闭）。
-     *
-     * 放在 `remember` 里而不是 `LaunchedEffect`：配置页往返会让组合重新进入，
-     * `LaunchedEffect(Unit)` 在那时也会重跑 —— 一次启动只该同步一次。
-     */
-    remember { container.syncManager.syncOnLaunchIfEnabled(); Unit }
+    // 启动时按设置决定要不要拉一次云端（只读设置，不做网络以外的判断）
+    remember(container) { container.syncManager.syncOnLaunchIfEnabled(); Unit }
 
     /*
      * 同步把某些会话换成了远端版本 → 当前打开的那条可能也在其中。
      * 这时内存里的消息树已经过期（消息 id 来自旧版本），必须从库里重读，
-     * 否则接下来的发送会挂在一串库里不存在的父消息上。
+     * 否则界面上还挂着旧内容，而一发消息就按新 id 报"消息不存在"。
      */
-    LaunchedEffect(syncState.pulled) {
+    androidx.compose.runtime.LaunchedEffect(syncState.pulled) {
         if (syncState.pulled > 0) chatViewModel.refreshFromStorage()
     }
 
@@ -221,46 +244,118 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
         route = Route.CHAT
     }
 
-    // Android's edge-back gesture and the back button return to the same search session.
-    BackHandler(enabled = route == Route.CHAT && readingSearchResult && !drawerState.isOpen) {
-        scope.launch { drawerState.open() }
-    }
-
-    /*
-     * ⚠️ 这条不能省，而且**不是** Material3 帮我们做的。
-     *
-     * 实测：抽屉打开时按返回键，`ModalNavigationDrawer` 不消费、上面那条也
-     * 是 disabled，事件一路落空到 Activity → 直接 `finish()`，用户被丢出 App。
-     * （旧版本同样如此，只是没人从抽屉里按过返回键。）
-     */
-    BackHandler(enabled = drawerState.isOpen) {
-        closeDrawer()
-    }
-
-    // 搜索态按返回 → 回抽屉列表。抽屉**保持打开** —— 用户本来就是从那儿进来的。
-    BackHandler(enabled = searchMode && drawerState.isOpen) {
+    fun exitSearch() {
         historyViewModel.updateQuery("")
         searchMode = false
         readingSearchResult = false
         selectedSearchResultKey = null
+        if (searchWasDocked) wideSidebarVisible = true
+        searchWasDocked = false
+    }
+
+    BackHandler(enabled = !wideChatLayout && route == Route.CHAT && readingSearchResult && !drawerState.isOpen) {
+        scope.launch { drawerState.open() }
+    }
+    BackHandler(enabled = !wideChatLayout && drawerState.isOpen) { closeDrawer() }
+    BackHandler(enabled = wideChatLayout && route == Route.CHAT && wideSidebarVisible && historyViewModel.selectionMode) {
+        historyViewModel.exitSelection()
+    }
+    BackHandler(enabled = route == Route.CHAT && searchMode &&
+        (if (wideChatLayout) (wideSidebarVisible || searchWasDocked) else drawerState.isOpen)) {
+        exitSearch()
+    }
+
+    val sidebarContent: @Composable (Boolean) -> Unit = { docked ->
+        Crossfade(
+            targetState = searchMode,
+            modifier = Modifier.fillMaxSize(),
+            animationSpec = tween(MotionDurationMs, easing = MotionEasing),
+            label = "historySearch",
+        ) { searching ->
+            if (searching) {
+                val displayedPage = searchPage
+                ConversationSearchPage(
+                    hits = displayedPage.hits,
+                    isLoading = displayedPage.isLoading,
+                    hasMore = displayedPage.hasMore,
+                    onLoadMore = historyViewModel::loadMoreSearchResults,
+                    listState = searchListState,
+                    autoFocus = !readingSearchResult && (docked || drawerState.targetValue == DrawerValue.Open),
+                    selectedResultKey = selectedSearchResultKey,
+                    query = displayedPage.query,
+                    onQueryChange = { selectedSearchResultKey = null; historyViewModel.updateQuery(it) },
+                    onBack = { exitSearch() },
+                    onClick = { hit ->
+                        if (!openingSearchResult && displayedPage.query == historyViewModel.query) {
+                            openingSearchResult = true
+                            selectedSearchResultKey = hit.searchResultKey
+                            readingSearchResult = true
+                            historyViewModel.exitSelection()
+                            scope.launch {
+                                try {
+                                    if (!docked) drawerState.close()
+                                    chatViewModel.openConversation(hit.conversation.id, hit.messageId, displayedPage.query.trim(), hit.reasoningMatch)
+                                } finally {
+                                    openingSearchResult = false
+                                }
+                            }
+                        }
+                    },
+                    onRename = { renameTarget = it },
+                    onTogglePin = historyViewModel::togglePin,
+                    onDelete = { deleteTarget = it },
+                )
+            } else {
+                HistoryDrawerContent(
+                    conversations = conversations,
+                    currentConversationId = chatViewModel.currentConversationId,
+                    selectionMode = historyViewModel.selectionMode,
+                    selectedIds = historyViewModel.selectedIds.toList(),
+                    pinnedGroupExpanded = pinnedGroupExpanded,
+                    onTogglePinnedGroup = { pinnedGroupExpanded = !pinnedGroupExpanded },
+                    onSearchClick = {
+                        readingSearchResult = false
+                        searchWasDocked = docked
+                        searchMode = true
+                    },
+                    onClick = { conversation ->
+                        if (!docked) closeDrawer()
+                        else if (searchMode) exitSearch()
+                        chatViewModel.openConversation(conversation.id)
+                    },
+                    onEnterSelection = { historyViewModel.enterSelection(it.id) },
+                    onToggleSelection = historyViewModel::toggleSelection,
+                    onRename = { renameTarget = it },
+                    onTogglePin = historyViewModel::togglePin,
+                    onDelete = { deleteTarget = it },
+                    onExitSelection = historyViewModel::exitSelection,
+                    onPinSelected = historyViewModel::pinSelected,
+                    onDeleteSelected = { confirmBatchDelete = true },
+                    onOpenSettings = {
+                        closeDrawer()
+                        route = Route.SETTINGS
+                    },
+                    onOpenVault = {
+                        closeDrawer()
+                        route = Route.VAULT
+                    },
+                    onHide = { hideTarget = it },
+                    onRefresh = { container.syncManager.startSync() },
+                    refreshing = syncState.running,
+                )
+            }
+        }
     }
 
     // ── 抽屉：搜索时把面板从 78% 撑满 ──────────────────────
     val sheetFraction by animateFloatAsState(
         targetValue = if (searchMode) 1f else DrawerWidthFraction,
-        // 弹簧：搜索态撑满时被打断（比如中途又点返回）也不会跳
-        animationSpec = spring(
-            dampingRatio = Spring.DampingRatioNoBouncy,
-            stiffness = Spring.StiffnessMediumLow,
-        ),
+        animationSpec = tween(MotionDurationMs, easing = MotionEasing),
         label = "sheetFraction",
     )
     val sheetCorner by animateDpAsState(
         targetValue = if (searchMode) 0.dp else DrawerCorner,
-        animationSpec = spring(
-            dampingRatio = Spring.DampingRatioNoBouncy,
-            stiffness = Spring.StiffnessMediumLow,
-        ),
+        animationSpec = tween(MotionDurationMs, easing = MotionEasing),
         label = "sheetCorner",
     )
     val sheetShape = RoundedCornerShape(topEnd = sheetCorner, bottomEnd = sheetCorner)
@@ -279,13 +374,13 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
             },
         drawerState = drawerState,
         // 撑满时禁止拖动：那时它已经不是"抽屉"了，往左拖会把它拖成一个奇怪的宽度
-        gesturesEnabled = !horizontalRegionPressed && route == Route.CHAT && (!searchMode || (readingSearchResult && !drawerState.isOpen)),
+        gesturesEnabled = !wideChatLayout && !horizontalRegionPressed && route == Route.CHAT && (!searchMode || (readingSearchResult && !drawerState.isOpen)),
         // 遮罩由下面 content 里的显式 scrim 画，内置 scrim 关掉，避免双层遮罩。
         scrimColor = Color.Transparent,
         drawerContent = {
             ModalDrawerSheet(
                 modifier = Modifier
-                    .fillMaxWidth(sheetFraction)
+                    .fillMaxWidth(if (wideChatLayout) 0f else sheetFraction)
                     .fillMaxHeight()
                     // 抽屉自己也要"浮起来"，否则右边缘是一道生硬的白灰交界
                     .shadow(
@@ -306,92 +401,7 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
                  */
                 windowInsets = WindowInsets(0, 0, 0, 0),
             ) {
-                /*
-                 * 列表 ↔ 搜索交叉淡入。
-                 *
-                 * 宽度正在变，内容如果硬切会像"闪一下"；
-                 * 叠一层淡入淡出，视觉上就是"同一块面板换了个内容"。
-                 */
-                Crossfade(
-                    targetState = searchMode,
-                    modifier = Modifier.fillMaxSize(),
-                    animationSpec = tween(MotionDurationMs, easing = MotionEasing),
-                    label = "drawerContent",
-                ) { searching ->
-                    if (searching) {
-                        ConversationSearchPage(
-                            hits = searchPage.hits,
-                            hasMore = searchPage.hasMore,
-                            onLoadMore = historyViewModel::loadMoreSearchResults,
-                            listState = searchListState,
-                            autoFocus = !readingSearchResult && drawerState.targetValue == DrawerValue.Open,
-                            selectedResultKey = selectedSearchResultKey,
-                            query = historyViewModel.query,
-                            onQueryChange = { selectedSearchResultKey = null; historyViewModel.updateQuery(it) },
-                            onBack = {
-                                historyViewModel.updateQuery("")
-                                searchMode = false
-                                readingSearchResult = false
-                                selectedSearchResultKey = null
-                            },
-                            onClick = { hit ->
-                                val keyword = historyViewModel.query.trim()
-                                if (!openingSearchResult) {
-                                    openingSearchResult = true
-                                    selectedSearchResultKey = hit.searchResultKey
-                                    readingSearchResult = true
-                                    historyViewModel.exitSelection()
-                                    scope.launch {
-                                        try {
-                                            // Let the drawer and keyboard leave before locating visible text.
-                                            drawerState.close()
-                                            chatViewModel.openConversation(hit.conversation.id, hit.messageId, keyword)
-                                        } finally { openingSearchResult = false }
-                                    }
-                                }
-                            },
-                            onRename = { renameTarget = it },
-                            onTogglePin = { historyViewModel.togglePin(it) },
-                            onDelete = { deleteTarget = it },
-                        )
-                    } else {
-                        HistoryDrawerContent(
-                            conversations = conversations,
-                            currentConversationId = chatViewModel.currentConversationId,
-                            selectionMode = historyViewModel.selectionMode,
-                            selectedIds = historyViewModel.selectedIds.toList(),
-                            onSearchClick = { readingSearchResult = false; searchMode = true },
-                            onClick = { conversation ->
-                                closeDrawer()
-                                chatViewModel.openConversation(conversation.id)
-                            },
-                            onEnterSelection = { historyViewModel.enterSelection(it.id) },
-                            onToggleSelection = { historyViewModel.toggleSelection(it) },
-                            onRename = { renameTarget = it },
-                            onTogglePin = { historyViewModel.togglePin(it) },
-                            onDelete = { deleteTarget = it },
-                            onExitSelection = { historyViewModel.exitSelection() },
-                            onPinSelected = { pinned -> historyViewModel.pinSelected(pinned) },
-                            onDeleteSelected = { confirmBatchDelete = true },
-                            onOpenSettings = {
-                                closeDrawer()
-                                route = Route.SETTINGS
-                            },
-                            /*
-                             * 下拉即同步。指示器直接读同步自己的状态：同步还在跑时
-                             * 再下拉也不会叠第二次（SyncManager 用 Mutex 拦住），
-                             * 于是"转圈"与"真的在同步"始终是同一件事。
-                             */
-                            onRefresh = { container.syncManager.startSync() },
-                            refreshing = syncState.running,
-                            onOpenVault = {
-                                closeDrawer()
-                                route = Route.VAULT
-                            },
-                            onHide = { hideTarget = it },
-                        )
-                    }
-                }
+                if (!wideChatLayout) sidebarContent(false)
             }
         },
     ) {
@@ -405,51 +415,93 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
              * 存档本来就是导航组件该管的事，我们不引导航组件，就得自己接上。
              */
             val pageStates = rememberSaveableStateHolder()
-
             /*
-             * 共享元素转场。
-             *
-             * `SharedTransitionLayout` 提供"同一个元素在两个页面之间连续移动"的能力：
-             * 页面切换时，两边的同名元素不是各自退场/入场，而是**同一块内容被搬运过去**。
-             *
-             * 这里共享的是**页面标题**：从对话页进设置页时，聊天标题那一行会被
-             * 直接搬到设置页标题的位置上，而不是"旧的滑走、新的滑进来"。
-             * 这是 June 那种"M3 大标题"观感的来源 —— 标题是页面的锚，它连续，
-             * 整次切换就连续。
-             *
-             * ⚠️ 共享元素必须落在 `AnimatedContent` 的可见性范围内（`AnimatedVisibilityScope`），
-             * 否则它不知道该跟哪一次转场对齐 —— 所以修饰符是在 content lambda 里现算的。
+             * 共享元素转场：页面标题在两个页面之间"搬过去"，而不是旧的滑走、新的滑进来。
+             * 标题是页面的锚 —— 它连续，整次切换就连续。
              */
             SharedTransitionLayout(modifier = Modifier.fillMaxSize()) {
                 val sharedScope = this
-                AnimatedContent(
+
+            AnimatedContent(
                 targetState = route,
                 transitionSpec = {
                     screenTransform(forward = targetState.depth > initialState.depth)
                 },
                 label = "route",
             ) { target ->
+                // 两端用**同一个 key**，才配得上对
+                val titleShared = with(sharedScope) {
+                    Modifier.sharedBounds(
+                        rememberSharedContentState(key = "page-title"),
+                        this@AnimatedContent,
+                    )
+                }
                 pageStates.SaveableStateProvider(target) {
-                    // 标题的共享元素修饰符：两个页面用**同一个 key**，才配得上对
-                    val titleShared = with(sharedScope) {
-                        Modifier.sharedBounds(
-                            rememberSharedContentState(key = "page-title"),
-                            this@AnimatedContent,
-                        )
-                    }
                     when (target) {
-                        Route.CHAT -> ChatScreen(
-                            vm = chatViewModel,
-                            titleModifier = titleShared,
-                            onOpenDrawer = { scope.launch { drawerState.open() } },
-                            onNewConversation = {
-                                readingSearchResult = false
-                                selectedSearchResultKey = null
-                                searchMode = false
-                                historyViewModel.updateQuery("")
-                                chatViewModel.newConversation()
-                            },
-                        )
+                        Route.CHAT -> Row(
+                            modifier = Modifier.fillMaxSize().then(
+                                if (wideChatLayout) Modifier.windowInsetsPadding(
+                                    WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal)
+                                ) else Modifier
+                            ),
+                        ) {
+                            AnimatedVisibility(
+                                visible = wideChatLayout && (wideSidebarVisible || searchWasDocked),
+                                enter = expandHorizontally(tween(MotionDurationMs, easing = MotionEasing), Alignment.Start) + fadeIn(),
+                                exit = shrinkHorizontally(tween(MotionDurationMs, easing = MotionEasing), Alignment.Start) + fadeOut(),
+                            ) {
+                                Row(Modifier.width(WideSidebarWidth).fillMaxHeight()) {
+                                    Box(Modifier.weight(1f).fillMaxHeight().background(LocalChatColors.current.card)) {
+                                        if (searchMode) {
+                                            SearchContent(
+                                                searchPage = searchPage,
+                                                listState = searchListState,
+                                                autoFocus = true,
+                                                selectedSearchResultKey = selectedSearchResultKey,
+                                                historyViewModel = historyViewModel,
+                                                onBack = { exitSearch() },
+                                                onOpenSearchResult = { hit, keyword ->
+                                                    if (!openingSearchResult) {
+                                                        openingSearchResult = true
+                                                        selectedSearchResultKey = hit.searchResultKey
+                                                        readingSearchResult = true
+                                                        scope.launch {
+                                                            try {
+                                                                chatViewModel.openConversation(hit.conversation.id, hit.messageId, keyword, hit.reasoningMatch)
+                                                                if (!searchWasDocked) exitSearch()
+                                                            } finally { openingSearchResult = false }
+                                                        }
+                                                    }
+                                                },
+                                                onRename = { renameTarget = it },
+                                                onTogglePin = historyViewModel::togglePin,
+                                                onDelete = { deleteTarget = it },
+                                            )
+                                        } else sidebarContent(true)
+                                    }
+                                    Box(Modifier.width(1.dp).fillMaxHeight().background(LocalChatColors.current.outline))
+                                }
+                            }
+                            Box(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.TopCenter) {
+                                ChatScreen(
+                                    vm = chatViewModel,
+                                    titleModifier = titleShared,
+                                    onOpenDrawer = {
+                                        if (wideChatLayout) {
+                                            if (wideSidebarVisible) historyViewModel.exitSelection()
+                                            wideSidebarVisible = !wideSidebarVisible
+                                        } else scope.launch { drawerState.open() }
+                                    },
+                                    onConfigureApi = { route = Route.API_SETTINGS },
+                                    onConfigureImageApi = { route = Route.IMAGE_SETTINGS },
+                                    onNewConversation = {
+                                        exitSearch()
+                                        chatViewModel.newConversation()
+                                    },
+                                    modifier = if (wideChatLayout) Modifier.widthIn(max = WideChatMaxWidth).fillMaxWidth() else Modifier,
+                                )
+                            }
+                        }
 
                         Route.VAULT -> VaultScreen(
                             stored = storedSettings,
@@ -461,18 +513,19 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
                             },
                             onVerifyPin = { pin -> container.settingsStore.verifyVaultPin(pin) },
                             onSetPin = { pin -> container.settingsStore.setVaultPin(pin) },
-                            onVerifyAnswer = { answer ->
-                                container.settingsStore.verifyVaultAnswer(answer)
-                            },
+                            onVerifyAnswer = { answer -> container.settingsStore.verifyVaultAnswer(answer) },
+                            preUnlocked = appLockUnlocked,
                         )
 
-                        Route.SETTINGS -> SettingsScreen(
-                            onBack = { route = Route.CHAT },
+                        Route.SETTINGS, Route.IMAGE_SETTINGS, Route.API_SETTINGS -> SettingsScreen(
+                            onBack = { route = Route.CHAT }, startAtImageApi = target == Route.IMAGE_SETTINGS,
+                            startAtApiProfiles = target == Route.API_SETTINGS,
+                            onOpenVault = { route = Route.VAULT },
                             titleModifier = titleShared,
                         )
                     }
                 }
-                }
+            }
             }
 
             /*
@@ -487,7 +540,7 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
                 derivedStateOf { drawerState.targetValue != DrawerValue.Closed }
             }
             AnimatedVisibility(
-                visible = drawerShown,
+                visible = !wideChatLayout && drawerShown,
                 enter = fadeIn(tween(MotionDurationMs, easing = MotionEasing)),
                 exit = fadeOut(tween(MotionDurationMs, easing = MotionEasing)),
             ) {
@@ -505,18 +558,6 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
 
     // ── 弹窗 ─────────────────────────────────────────────
 
-    renameTarget?.let { target ->
-        AppTextInputDialog(
-            title = stringResource(R.string.hist_rename_title),
-            initial = target.title,
-            onDismiss = { renameTarget = null },
-            onConfirm = { value ->
-                historyViewModel.rename(target.id, value)
-                renameTarget = null
-            },
-        )
-    }
-
     hideTarget?.let { target ->
         AppConfirmDialog(
             title = stringResource(R.string.vault_hide_title),
@@ -531,47 +572,29 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
                 hideTarget = null
                 // 藏起来的正是当前会话 → 先回空态，否则对话页会挂着一条从列表里消失的会话
                 if (chatViewModel.currentConversationId == id) chatViewModel.newConversation()
-                vaultCoroutine.launch { container.chatRepository.setConversationHidden(id, true) }
+                scope.launch { container.chatRepository.setConversationHidden(id, true) }
+            },
+        )
+    }
+
+    renameTarget?.let { target ->
+        AppTextInputDialog(
+            title = stringResource(R.string.hist_rename_title),
+            initial = target.title,
+            onDismiss = { renameTarget = null },
+            onConfirm = { value ->
+                historyViewModel.rename(target.id, value)
+                renameTarget = null
             },
         )
     }
 
     deleteTarget?.let { target ->
-        // 每次打开都回到"勾选"：上一次的取消不该成为下一次的默认
-        LaunchedEffect(target.id) { deleteFromCloud = true }
-
         AppConfirmDialog(
             title = stringResource(R.string.hist_delete_title),
             message = stringResource(R.string.hist_delete_body),
             confirmText = stringResource(R.string.hist_delete_confirm),
             destructive = true,
-            /*
-             * 只有配了同步的人才看到这个勾选框。
-             *
-             * 没配 WebDAV 的用户看到"同时删除云端记录"只会困惑：什么云端？
-             * 他从没设过。所以这一项跟着 [StoredSettings.syncConfigured] 显隐。
-             */
-            extraContent = if (storedSettings.syncConfigured) {
-                {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Checkbox(
-                            checked = deleteFromCloud,
-                            onCheckedChange = { deleteFromCloud = it },
-                        )
-                        Text(
-                            text = stringResource(R.string.hist_delete_cloud),
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(start = 4.dp),
-                        )
-                    }
-                }
-            } else {
-                null
-            },
             onDismiss = { deleteTarget = null },
             onConfirm = {
                 // 删的正是当前正在看的会话 → 立刻回到空态，
@@ -580,15 +603,6 @@ fun RootScreen(chat: ChatViewModel? = null, history: HistoryViewModel? = null) {
                     chatViewModel.newConversation()
                 }
                 historyViewModel.delete(target.id)
-                /*
-                 * 云端删除走后台：它是网络操作，不该让"删除"这个动作等它。
-                 * 失败也只是下次同步又出现（见 deleteRemoteConversations 的说明）。
-                 */
-                if (storedSettings.syncConfigured && deleteFromCloud) {
-                    vaultCoroutine.launch {
-                        container.syncManager.deleteRemoteConversations(setOf(target.id))
-                    }
-                }
                 deleteTarget = null
             },
         )

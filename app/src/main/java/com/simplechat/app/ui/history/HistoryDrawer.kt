@@ -18,14 +18,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -37,13 +36,16 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import com.simplechat.app.R
-import com.simplechat.app.data.Res
 import com.simplechat.app.db.ConversationEntity
 import com.simplechat.app.ui.common.AppIcons
 import com.simplechat.app.ui.common.AppMenu
@@ -56,10 +58,6 @@ import com.simplechat.app.ui.common.SoftShape
 import com.simplechat.app.ui.common.Space
 import com.simplechat.app.ui.common.rememberPressPosition
 import com.simplechat.app.ui.theme.LocalChatColors
-import java.time.Instant
-import java.time.YearMonth
-import java.time.ZoneId
-import java.util.Locale
 
 /**
  * 抽屉内**所有全宽元素**共用的左右内边距。
@@ -86,13 +84,14 @@ private val DrawerTextInset = Space.Screen + Space.Inline
  * [ ⚙ 设置 ]                 ← 总设置入口固定在底部
  * ```
  */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HistoryDrawerContent(
     conversations: List<ConversationEntity>,
     currentConversationId: String?,
     selectionMode: Boolean,
     selectedIds: List<String>,
+    pinnedGroupExpanded: Boolean,
+    onTogglePinnedGroup: () -> Unit,
     onSearchClick: () -> Unit,
     onClick: (ConversationEntity) -> Unit,
     onEnterSelection: (ConversationEntity) -> Unit,
@@ -104,18 +103,12 @@ fun HistoryDrawerContent(
     onPinSelected: (Boolean) -> Unit,
     onDeleteSelected: () -> Unit,
     onOpenSettings: () -> Unit,
-    /** 打开保险箱（解锁界面）。 */
+    /** 打开保险箱（解锁后是列表）。 */
     onOpenVault: () -> Unit = {},
-    /** 把某条会话移入保险箱；确认弹窗由调用方负责。 */
+    /** 把某条会话放进保险箱。 */
     onHide: (ConversationEntity) -> Unit = {},
-    /**
-     * 下拉刷新：触发一次云同步。
-     *
-     * 放在历史列表上而不是顶栏按钮，是因为"我想确认其它设备上的改动有没有过来"
-     * 这个动作，人的第一反应就是往下拉 —— 和几乎所有列表应用一致。
-     */
+    /** 下拉同步（WebDAV）。 */
     onRefresh: () -> Unit = {},
-    /** 同步进行中。驱动下拉指示器，与同步本身的状态是同一个来源。 */
     refreshing: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
@@ -152,6 +145,11 @@ fun HistoryDrawerContent(
                 )
             }
         } else {
+            /*
+             * 下拉即同步。指示器直接读同步自己的状态：同步还在跑时再下拉也不会
+             * 叠第二次（SyncManager 用 Mutex 拦住），于是"转圈"与"真的在同步"
+             * 始终是同一件事。
+             */
             PullToRefreshBox(
                 isRefreshing = refreshing,
                 onRefresh = onRefresh,
@@ -159,39 +157,48 @@ fun HistoryDrawerContent(
                     .fillMaxWidth()
                     .weight(1f),
             ) {
-                LazyColumn(
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                        top = 2.dp,
-                        bottom = 8.dp,
-                    ),
-                ) {
-                    grouped.forEach { (group, items) ->
-                        item(key = group.key) {
-                            GroupHeader(label = group.label())
-                        }
-                        items(items = items, key = { it.id }) { conversation ->
-                            ConversationRow(
-                                conversation = conversation,
-                                current = conversation.id == currentConversationId,
-                                selectionMode = selectionMode,
-                                selected = conversation.id in selectedIds,
-                                onClick = {
-                                    if (selectionMode) {
-                                        onToggleSelection(conversation.id)
-                                    } else {
-                                        onClick(conversation)
-                                    }
-                                },
-                                onEnterSelection = { onEnterSelection(conversation) },
-                                onRename = { onRename(conversation) },
-                                onTogglePin = { onTogglePin(conversation) },
-                                onDelete = { onDelete(conversation) },
-                            onHide = { onHide(conversation) },
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                    top = 2.dp,
+                    bottom = 8.dp,
+                ),
+            ) {
+                grouped.forEach { (group, items) ->
+                    val isPinnedGroup = group == HistoryGroup.PINNED
+                    item(key = "header-${group.name}") {
+                        if (isPinnedGroup) {
+                            PinnedGroupHeader(
+                                expanded = pinnedGroupExpanded,
+                                onClick = onTogglePinnedGroup,
                             )
+                        } else {
+                            GroupHeader(label = group.label)
                         }
                     }
+                    if (isPinnedGroup && !pinnedGroupExpanded) return@forEach
+                    items(items = items, key = { it.id }) { conversation ->
+                        ConversationRow(
+                            conversation = conversation,
+                            current = conversation.id == currentConversationId,
+                            selectionMode = selectionMode,
+                            selected = conversation.id in selectedIds,
+                            onClick = {
+                                if (selectionMode) {
+                                    onToggleSelection(conversation.id)
+                                } else {
+                                    onClick(conversation)
+                                }
+                            },
+                            onEnterSelection = { onEnterSelection(conversation) },
+                            onRename = { onRename(conversation) },
+                            onTogglePin = { onTogglePin(conversation) },
+                            onDelete = { onDelete(conversation) },
+                            onHide = { onHide(conversation) },
+                        )
+                    }
                 }
+            }
             }
         }
 
@@ -215,20 +222,22 @@ fun HistoryDrawerContent(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable(onClick = onOpenVault)
-                    .padding(horizontal = DrawerInset, vertical = 16.dp),
+                    .heightIn(min = Space.Row)
+                    .padding(horizontal = Space.Screen, vertical = Space.RowPadY),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                horizontalArrangement = Arrangement.spacedBy(Space.IconGap),
             ) {
                 Icon(
                     imageVector = AppIcons.Lock,
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.onSurface,
-                    modifier = Modifier.size(22.dp),
+                    modifier = Modifier.size(Space.Icon),
                 )
                 Text(
                     text = stringResource(R.string.vault_open),
                     style = MaterialTheme.typography.titleSmall,
                     color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.weight(1f),
                 )
             }
 
@@ -236,15 +245,16 @@ fun HistoryDrawerContent(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable(onClick = onOpenSettings)
-                    .padding(horizontal = DrawerInset, vertical = 16.dp),
+                    .heightIn(min = Space.Row)
+                    .padding(horizontal = Space.Screen, vertical = Space.RowPadY),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                horizontalArrangement = Arrangement.spacedBy(Space.IconGap),
             ) {
                 Icon(
                     imageVector = AppIcons.Settings,
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.onSurface,
-                    modifier = Modifier.size(22.dp),
+                    modifier = Modifier.size(Space.Icon),
                 )
                 Text(
                     text = stringResource(R.string.settings_title),
@@ -349,7 +359,7 @@ private fun SearchBox(onClick: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = DrawerInset, vertical = 10.dp)
+            .padding(horizontal = DrawerInset, vertical = 8.dp)
             .clip(PillShape)
             .background(colors.fieldBackground)
             .clickable(onClick = onClick)
@@ -399,6 +409,45 @@ private fun GroupHeader(label: String) {
     )
 }
 
+@Composable
+private fun PinnedGroupHeader(expanded: Boolean, onClick: () -> Unit) {
+    val contentColor = MaterialTheme.colorScheme.onSurfaceVariant
+    val stateLabel = stringResource(
+        if (expanded) R.string.hist_pinned_expanded else R.string.hist_pinned_collapsed,
+    )
+    val actionLabel = stringResource(
+        if (expanded) R.string.hist_pinned_collapse else R.string.hist_pinned_expand,
+    )
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = DrawerInset)
+            .clip(SoftShape)
+            .clickable(role = Role.Button, onClickLabel = actionLabel, onClick = onClick)
+            .semantics {
+                heading()
+                stateDescription = stateLabel
+            }
+            .heightIn(min = Space.Row)
+            .padding(horizontal = Space.Inline),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(Space.IconGap),
+    ) {
+        Text(
+            text = stringResource(R.string.group_pinned),
+            style = MaterialTheme.typography.labelMedium,
+            color = contentColor,
+            modifier = Modifier.weight(1f),
+        )
+        Icon(
+            imageVector = if (expanded) AppIcons.ChevronUp else AppIcons.ChevronDown,
+            contentDescription = null,
+            tint = contentColor,
+            modifier = Modifier.size(Space.Icon),
+        )
+    }
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 internal fun ConversationRow(
@@ -411,7 +460,7 @@ internal fun ConversationRow(
     onRename: () -> Unit,
     onTogglePin: () -> Unit,
     onDelete: () -> Unit,
-    /** 移入保险箱。搜索页不给这个动作 —— 那里是"找东西"，不是"整理"。 */
+    /** 放进保险箱（仅主列表；搜索页不给这一项）。 */
     onHide: () -> Unit = {},
     highlightQuery: String = "",
     /** 搜索命中正文时的一行片段；仅标题命中时为 null。 */
@@ -423,6 +472,7 @@ internal fun ConversationRow(
     searchVariant: String? = null,
 ) {
     val colors = LocalChatColors.current
+    val locale = androidx.compose.ui.platform.LocalConfiguration.current.locales[0]
     // 高亮跟着主题色（Material 的 primary 就是设置页里选的品牌色）
     val highlightColor = MaterialTheme.colorScheme.primary
     var menuOpen by remember { mutableStateOf(false) }
@@ -444,7 +494,8 @@ internal fun ConversationRow(
                 .clip(SoftShape)
                 .background(
                     when {
-                        selected || current -> colors.fieldBackground
+                        current -> colors.capsuleSelected
+                        selected -> colors.fieldBackground
                         else -> colors.card
                     },
                 )
@@ -455,9 +506,9 @@ internal fun ConversationRow(
                         if (selectionMode) onClick() else menuOpen = true
                     },
                 )
-                .padding(horizontal = 12.dp, vertical = 2.dp)
-                // 单行时保持 46dp 的节奏；带片段时（搜索页）让它长高
-                .heightIn(min = 46.dp),
+                .padding(horizontal = 12.dp)
+                // 行高与设置页、菜单共用同一个刻度（`Space.Row`）；带片段时（搜索页）由内容撑高
+                .heightIn(min = Space.Row),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
@@ -466,7 +517,7 @@ internal fun ConversationRow(
                     imageVector = if (selected) AppIcons.CircleCheck else AppIcons.Circle,
                     contentDescription = null,
                     tint = if (selected) MaterialTheme.colorScheme.primary else colors.placeholder,
-                    modifier = Modifier.size(19.dp),
+                    modifier = Modifier.size(Space.Icon),
                 )
             }
             Column(modifier = Modifier.weight(1f).padding(vertical = if (searchDate != null) 10.dp else 0.dp)) {
@@ -480,16 +531,18 @@ internal fun ConversationRow(
                             }) + (searchVariant?.let { " · $it" } ?: ""),
                             style = MaterialTheme.typography.labelSmall, color = colors.placeholder,
                         )
-                        Text(remember(searchDate, java.util.Locale.getDefault()) {
-                            java.text.DateFormat.getDateInstance(java.text.DateFormat.MEDIUM).format(java.util.Date(searchDate))
+                        Text(remember(searchDate, locale) {
+                            java.text.DateFormat.getDateInstance(java.text.DateFormat.MEDIUM, locale).format(java.util.Date(searchDate))
                         }, style = MaterialTheme.typography.labelSmall, color = colors.placeholder)
                     }
                     Spacer(Modifier.size(4.dp))
                 }
                 Text(
                     text = highlightedTitle(conversation.title, highlightQuery, highlightColor),
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.onSurface,
+                    // 抽屉里的标题是"索引"，不是正文：用 bodyMedium（15sp）。
+                    // bodyLarge（17.3sp）原本是给聊天正文的，放进 40dp 的行里明显发福。
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (current) highlightColor else MaterialTheme.colorScheme.onSurface,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -533,13 +586,14 @@ internal fun ConversationRow(
                     onEnterSelection()
                 }
             }
+            if (showMultiSelect) {
+                AppMenuItem(stringResource(R.string.vault_hide_action), AppIcons.Lock) {
+                    menuOpen = false
+                    onHide()
+                }
+            }
             // 分隔线固定接在危险操作之前 —— 结构不随数据变化
             AppMenuDivider()
-            AppMenuItem(stringResource(R.string.vault_hide_action), AppIcons.Lock) {
-                menuOpen = false
-                onHide()
-            }
-
             AppMenuItem(stringResource(R.string.action_delete), AppIcons.Trash, destructive = true) {
                 menuOpen = false
                 onDelete()
@@ -568,82 +622,10 @@ private fun highlightedTitle(
     }
 }
 
-/**
- * 抽屉分组：**置顶 + 按月**。
- *
- * 原先按「今天 / 昨天 / 7 天内 / 更早」分桶，问题是**桶太少、跨度太粗**：
- * 一个写了两个月的会话列表，最后 90% 全被压在「更早」一格里，等于没分组。
- * 官方客户端的做法是按月归档 —— 时间是均匀的，月份是天然的、也是用户自己
- * 记事情的单位（"上个月那个方案"）。
- */
-sealed interface HistoryGroup {
-    /** 置顶恒在最前，不参与月份分组。 */
-    data object Pinned : HistoryGroup
-
-    /** 某个月。会话按 `updatedAt` 归入。 */
-    data class Month(val year: Int, val month: Int) : HistoryGroup
-}
-
-/** LazyColumn 的稳定 key（`at most one header per group`）。 */
-internal val HistoryGroup.key: String
-    get() = when (this) {
-        HistoryGroup.Pinned -> "group-pinned"
-        is HistoryGroup.Month -> "group-month-$year-$month"
-    }
-
-/** 分组标题：置顶 / 2026年11月（英文 November 2026）。 */
-@Composable
-private fun HistoryGroup.label(): String = when (this) {
-    HistoryGroup.Pinned -> stringResource(R.string.group_pinned)
-    is HistoryGroup.Month -> monthLabel(year, month)
-}
-
-/**
- * 月份标题。
- *
- * 中文用「2026年11月」：短、且与系统日历的写法一致；英文用完整的月份名
- * （"November 2026"）—— 数字格式在英语里是 `11/2026`，容易被当成日期。
- */
-private fun monthLabel(year: Int, month: Int): String =
-    if (Res.bool(R.bool.ui_is_cjk)) {
-        Res.get(R.string.hist_month_format, year, month)
-    } else {
-        val name = java.time.Month.of(month)
-            .getDisplayName(java.time.format.TextStyle.FULL, Locale.ENGLISH)
-        "$name $year"
-    }
-
-/**
- * 按时间分组：置顶在最前，其余**每月一组**、组内按最近更新排序。
- *
- * 输入已经是 `updatedAt DESC`（DAO 排好的），这里仍显式排一遍：
- * 置顶项混在中间时，靠输入顺序推不出"哪个月在前"这件事。
- */
-fun groupConversations(
-    conversations: List<ConversationEntity>,
-): List<Pair<HistoryGroup, List<ConversationEntity>>> {
-    val pinned = conversations.filter { it.pinned }
-        .sortedByDescending { it.pinnedAt ?: it.updatedAt }
-
-    val months = conversations.asSequence()
-        .filterNot { it.pinned }
-        .groupBy { yearMonthOf(it.updatedAt) }
-        .toList()
-        .sortedByDescending { (month, _) -> month }
-        .map { (month, items) ->
-            HistoryGroup.Month(month.year, month.monthValue) to
-                items.sortedByDescending { it.updatedAt }
-        }
-
-    return buildList {
-        if (pinned.isNotEmpty()) add(HistoryGroup.Pinned to pinned)
-        addAll(months)
-    }
-}
-
-/** 时间戳 → 本地时区的年月（`java.time` 在 minSdk 26 上可用，无需 desugaring）。 */
-private fun yearMonthOf(millis: Long): YearMonth =
-    Instant.ofEpochMilli(millis)
-        .atZone(ZoneId.systemDefault())
-        .toLocalDate()
-        .let(YearMonth::from)
+/** 按时间分组。置顶恒在最前。 */
+fun groupConversations(    conversations: List<ConversationEntity>,
+    now: Long = System.currentTimeMillis(),
+): List<Pair<HistoryGroup, List<ConversationEntity>>> =
+    HistoryGroup.entries
+        .map { group -> group to conversations.filter { groupOf(it, now) == group } }
+        .filter { it.second.isNotEmpty() }

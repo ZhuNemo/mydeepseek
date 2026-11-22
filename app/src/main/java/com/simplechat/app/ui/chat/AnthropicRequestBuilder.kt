@@ -2,10 +2,12 @@ package com.simplechat.app.ui.chat
 
 import com.simplechat.app.data.ApiImage
 import com.simplechat.app.data.Attachment
+import com.simplechat.app.net.DEEPSEEK_FLASH
 import com.simplechat.app.net.ReplyBlock
+import com.simplechat.app.net.imageToolDefinition
+import com.simplechat.app.net.imageToolInstruction
 import com.simplechat.app.net.anthropic.AnthropicMessageParam
 import com.simplechat.app.net.anthropic.AnthropicRequestDefaults
-import com.simplechat.app.net.anthropic.AnthropicSafetyCheck
 import com.simplechat.app.net.anthropic.AnthropicRequest
 import com.simplechat.app.net.anthropic.AnthropicThinking
 import com.simplechat.app.net.anthropic.AnthropicTitle
@@ -54,7 +56,7 @@ internal fun buildAnthropicRequest(
     /**
      * 目标是不是 **DeepSeek 官方**的扩展协议。
      *
-     * 同一条协议两边要求不同：`safety_check` / `title` / `deepseek_*` 工具 /
+     * 同一条协议两边要求不同：`title` / `deepseek_*` 工具 /
      * `latest_reminder` 角色 / `thinking.type=disabled` 只有 DeepSeek 收；
      * 原版 Anthropic（含 Claude 兼容网关）遇到这些是 **400**，而它又强制要求
      * `max_tokens` 与（开启思考时）`budget_tokens`。详见 `AnthropicRequest` 的表格。
@@ -62,20 +64,26 @@ internal fun buildAnthropicRequest(
      * 由装配层按「服务商 + Base URL」判定（见 `isOfficialDeepSeekEndpoint`）。
      */
     deepSeekExtensions: Boolean = true,
+    allowServerTools: Boolean = true,
+    includeAttachments: Boolean = true,
     /** 采样参数。原版 Anthropic 在开启思考时不允许设置温度，装配层会置空。 */
     temperature: Double? = null,
     topP: Double? = null,
+    reasoningEffort: String? = null,
+    outputLimit: Int? = null,
+    generateImageTool: Boolean = false,
 ): AnthropicRequest {
+    val flashExtensions = deepSeekExtensions && allowServerTools && model == DEEPSEEK_FLASH
     val messages = mutableListOf<AnthropicMessageParam>()
 
     path.forEach { message ->
         if (message.role == MessageRole.USER) {
-            messages += userParam(message)
+            messages += userParam(message, includeAttachments)
         } else {
             val content = assistantContent(
                 message,
                 keepThinking = deepSeekExtensions && thinkingEnabled,
-                deepSeekBlocks = deepSeekExtensions,
+                deepSeekBlocks = flashExtensions && (message.model == null || message.model == model),
             )
             // 一条既没正文也没工具痕迹的 assistant 发出去就是空块，服务端会 400
             if (isSendable(content)) {
@@ -91,40 +99,12 @@ internal fun buildAnthropicRequest(
         val content = assistantContent(
             tail,
             keepThinking = deepSeekExtensions && thinkingEnabled,
-            deepSeekBlocks = deepSeekExtensions,
+            deepSeekBlocks = flashExtensions && (tail.model == null || tail.model == model),
         )
         if (isSendable(content)) {
             messages += AnthropicMessageParam(
                 role = AnthropicMessageParam.RoleAssistant,
                 content = JsonArray(content),
-            )
-        }
-    }
-
-    /*
-     * ★ **提醒必须紧挨着一条 `user`，而且要在它前面。**
-     *
-     * 服务端对 `latest_reminder` 有一条硬校验（真机 400 原文）：
-     * `messages.N: a 'latest_reminder' message must be immediately followed by a 'user' message`。
-     *
-     * 先前是"插在路径最后一条之前" —— 只要最后一条是 assistant 就踩线：
-     * 「编辑 AI 回复 → 保存并发送」正是这种形状（新回复是流式的、不在路径里，
-     * 路径以被编辑的那条 assistant 结尾），于是这条路径上必 400。
-     *
-     * 也不能简单地"插到最末"：末尾是 assistant 时，提醒后面还是没有 user。
-     * 唯一对所有形状都成立的位置是：**最后一条 user 前面**。
-     * 一条 user 都没有（理论上到不了这里，前面会抛 `error_no_sendable_messages`）
-     * 就不发提醒 —— 少一条时间信息远好过整轮 400。
-     */
-    if (deepSeekExtensions && latestReminder != null) {
-        val anchor = messages.indexOfLast { it.role == AnthropicMessageParam.RoleUser }
-        if (anchor >= 0) {
-            messages.add(
-                anchor,
-                AnthropicMessageParam(
-                    role = AnthropicMessageParam.RoleReminder,
-                    content = JsonPrimitive(latestReminder),
-                ),
             )
         }
     }
@@ -140,13 +120,17 @@ internal fun buildAnthropicRequest(
     } else {
         maxTokens?.takeIf { it > 0 } ?: AnthropicRequestDefaults.MaxTokens
     }
-    val vanillaThinking = !deepSeekExtensions && thinkingEnabled
+    effectiveMaxTokens = effectiveMaxTokens?.let { minOf(it, outputLimit ?: it) }
+    val claudeAdaptive = if (deepSeekExtensions) null else com.simplechat.app.net.claudeAdaptiveModel(model)
+    val vanillaThinking = !deepSeekExtensions && claudeAdaptive == null && thinkingEnabled &&
+        (outputLimit == null || outputLimit > AnthropicRequestDefaults.MinThinkingBudgetTokens)
+    var thinkingBudget = AnthropicRequestDefaults.MaxThinkingBudgetTokens
     if (vanillaThinking) {
-        val budget = AnthropicRequestDefaults.MaxThinkingBudgetTokens
+        thinkingBudget = minOf(thinkingBudget, outputLimit?.minus(1) ?: thinkingBudget)
         // 给正文留出空间：max_tokens 至少要比预算多 1024
         effectiveMaxTokens = maxOf(
             effectiveMaxTokens ?: 0,
-            budget + AnthropicRequestDefaults.MinThinkingBudgetTokens,
+            minOf(thinkingBudget + AnthropicRequestDefaults.MinThinkingBudgetTokens, outputLimit ?: Int.MAX_VALUE),
         )
     }
 
@@ -164,40 +148,76 @@ internal fun buildAnthropicRequest(
      * 所以发之前按严格规则整理一遍：同角色合并（正文用空行连接）、丢掉开头的
      * assistant、丢掉空消息。**只改发给服务端的这一份，本地消息一条不动。**
      */
-    val sanitizedMessages = sanitizeTurns(messages)
+    val outgoingMessages = sanitizeTurns(messages).toMutableList()
+    // Add metadata after merging consecutive user turns. Otherwise a reminder would
+    // split them when the previous send failed, preventing the merge.
+    val reminder = latestReminder?.takeIf { deepSeekExtensions && it.isNotBlank() }
+    val reminderAnchor = if (reminder == null) -1 else outgoingMessages.indexOfLast {
+        it.role == AnthropicMessageParam.RoleUser
+    }
+    // A compacted history may start with the current question. Keep its first role standard.
+    if (flashExtensions && reminderAnchor > 0 && reminder != null) {
+        outgoingMessages.add(reminderAnchor, AnthropicMessageParam(
+            role = AnthropicMessageParam.RoleReminder,
+            content = JsonPrimitive(reminder),
+        ))
+    }
+    val effectiveSystem = buildString {
+        val configured = systemPrompt.trim()
+        append(if (deepSeekExtensions && configured.isBlank()) DefaultSystemPrompt else configured)
+        if (reminder != null && (reminderAnchor == 0 || !flashExtensions)) {
+            append("\n\nCurrent chat metadata (date, weekday, location, platform, language): ")
+            append(reminder)
+        }
+    }
 
+    val tools = buildList {
+        if (flashExtensions) {
+            // Flash rejects mixing the URL reader with client tools. Search may coexist in thinking mode.
+            val latestUser = path.lastOrNull { it.role == MessageRole.USER }
+            if (!generateImageTool && latestUser != null && HttpLink.containsMatchIn(latestUser.content)) add(AnthropicTool.ReadUrl)
+            if (searchEnabled && (!generateImageTool || thinkingEnabled)) add(AnthropicTool.WebSearch)
+        }
+        if (generateImageTool) add(AnthropicTool(name = imageToolDefinition.name,
+            description = imageToolDefinition.description, inputSchema = imageToolDefinition.parameters))
+    }
+    val title = if (flashExtensions && requestTitle && titleFitsInline(effectiveSystem, outgoingMessages)) AnthropicTitle() else null
+    val serverSampling = tools.any { it.type != null } || title != null
     return AnthropicRequest(
         model = model,
-        system = if (deepSeekExtensions) {
-            systemPrompt.trim().ifBlank { DefaultSystemPrompt }
-        } else {
-            systemPrompt.trim()
-        },
-        messages = sanitizedMessages,
+        system = if (generateImageTool) "$effectiveSystem\n\n$imageToolInstruction".trim() else effectiveSystem,
+        messages = outgoingMessages,
         thinking = when {
             deepSeekExtensions && thinkingEnabled -> AnthropicThinking.Enabled
             deepSeekExtensions -> AnthropicThinking.Disabled
+            claudeAdaptive != null && (thinkingEnabled || !claudeAdaptive.canDisableThinking) -> AnthropicThinking(
+                "adaptive", display = "summarized".takeIf { claudeAdaptive.explicitDisplay },
+            )
+            claudeAdaptive != null -> AnthropicThinking.Disabled
             vanillaThinking -> AnthropicThinking.enabledWithBudget(
-                AnthropicRequestDefaults.MaxThinkingBudgetTokens,
+                thinkingBudget,
             )
             // 原版：关闭思考 = **省略这个字段**（不接受 type=disabled）
             else -> null
         },
-        safetyCheck = if (deepSeekExtensions) AnthropicSafetyCheck() else null,
-        tools = if (deepSeekExtensions) {
-            buildList {
-                // 读链接始终开着（用户贴了 URL 就该被读），搜索才受开关控制
-                add(AnthropicTool.ReadUrl)
-                if (searchEnabled) add(AnthropicTool.WebSearch)
-            }
-        } else {
-            emptyList()
-        },
-        title = if (deepSeekExtensions && requestTitle) AnthropicTitle() else null,
+        tools = tools,
+        title = title,
         maxTokens = effectiveMaxTokens,
         // 原版 Anthropic 不允许同时改 temperature 与 top_p；这里只发 temperature
-        temperature = if (!deepSeekExtensions && !thinkingEnabled) temperature ?: 1.0 else null,
-        topP = if (deepSeekExtensions) topP else null,
+        temperature = when {
+            serverSampling -> null
+            deepSeekExtensions -> temperature.takeUnless { thinkingEnabled }
+            claudeAdaptive != null && (!claudeAdaptive.acceptsTemperature || thinkingEnabled) -> null
+            !vanillaThinking -> temperature ?: 1.0
+            else -> null
+        },
+        topP = topP.takeIf { deepSeekExtensions && !serverSampling && com.simplechat.app.net.adjustableTopP(model, thinkingEnabled) },
+        outputConfig = when {
+            !thinkingEnabled -> null
+            deepSeekExtensions -> reasoningEffort
+            claudeAdaptive != null -> reasoningEffort
+            else -> null
+        }?.let { com.simplechat.app.net.anthropic.AnthropicOutputConfig(it) },
     )
 }
 
@@ -206,6 +226,18 @@ internal fun buildAnthropicRequest(
  * 此时用一句助手身份说明兜底 —— 与官方 Chat Demo 发给服务端的同一句。
  */
 internal const val DefaultSystemPrompt = "该助手为DeepSeek，由深度求索公司创造。"
+internal val HttpLink = Regex("https?://[^\\s<>]+", RegexOption.IGNORE_CASE)
+
+// 含附件的输入无法从请求体估算；这类会话和长正文交给独立标题流程。
+private fun titleFitsInline(system: String, messages: List<AnthropicMessageParam>): Boolean {
+    var remaining = 8_000 - system.length
+    for (message in messages) {
+        val text = message.content as? JsonPrimitive ?: return false
+        remaining -= text.content.length + 32
+        if (remaining < 0) return false
+    }
+    return remaining >= 0
+}
 
 /**
  * 一条 user 消息的 `content`。
@@ -221,7 +253,13 @@ internal const val DefaultSystemPrompt = "该助手为DeepSeek，由深度求索
  * 图片走 `source.type = base64`（不是 OpenAI 的 `image_url` + data URL）：
  * 这是 Anthropic 协议的写法，也是本项目不引入 Files API 上传链路时唯一的选择。
  */
-private fun userParam(message: UiMessage): AnthropicMessageParam {
+private fun userParam(message: UiMessage, includeAttachments: Boolean = true): AnthropicMessageParam {
+    if (!includeAttachments) {
+        return AnthropicMessageParam(
+            role = AnthropicMessageParam.RoleUser,
+            content = JsonPrimitive(message.content),
+        )
+    }
     val text = bodyText(message)
     /*
      * 只发**有内容**的图片。
@@ -232,7 +270,8 @@ private fun userParam(message: UiMessage): AnthropicMessageParam {
      * 少一张图 < 整个会话发不出去。
      */
     val images = message.attachments.filter { it.isImage && it.data.isNotBlank() }
-    if (images.isEmpty()) {
+    val files = message.attachments.filter { !it.fileId.isNullOrBlank() }
+    if (images.isEmpty() && files.isEmpty()) {
         return AnthropicMessageParam(
             role = AnthropicMessageParam.RoleUser,
             content = JsonPrimitive(text),
@@ -241,6 +280,10 @@ private fun userParam(message: UiMessage): AnthropicMessageParam {
     return AnthropicMessageParam(
         role = AnthropicMessageParam.RoleUser,
         content = buildJsonArray {
+            files.forEach { file -> addJsonObject {
+                put("type", if (file.remoteImage) "image" else "document")
+                put("source", buildJsonObject { put("type", "file"); put("file_id", file.fileId) })
+            } }
             // 先图后文：块数组是有序的，图片放在问题前面才符合"这是我看的资料"的语序
             images.forEach { image ->
                 addJsonObject {
@@ -268,7 +311,7 @@ private fun userParam(message: UiMessage): AnthropicMessageParam {
 
 /** 正文 + 文本附件拼成的一段话（附件用定界块，模型才分得清哪段是资料）。 */
 private fun bodyText(message: UiMessage): String {
-    val textFiles = message.attachments.filter { it.kind == Attachment.Kind.TEXT }
+    val textFiles = message.attachments.filter { it.kind == Attachment.Kind.TEXT && it.fileId == null }
     if (textFiles.isEmpty()) return message.content
     return buildString {
         append(message.content)

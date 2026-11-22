@@ -24,6 +24,15 @@ val keystoreProperties = Properties().apply {
 }
 val hasReleaseSigning = keystorePropertiesFile.exists()
 
+/**
+ * 版本号只写在这一处：`defaultConfig` 从这里取值。
+ *
+ * 本仓库从上游 v1.2.4 合并而来，功能线自己的版本号从这里继续往上走 ——
+ * 上游的 48 / 1.2.4 属于另一条发行线（包名 com.simplechat.app），
+ * 我们这一条是 com.zhunemo.mydeepseek，不必与之对齐。
+ */
+val appVersionCode = 6
+val appVersionName = "1.3.0"
 android {
     namespace = "com.simplechat.app"
     compileSdk = 37
@@ -46,8 +55,8 @@ android {
           * 版本从 1.0.0 起算：换包名等于换了一条发行线（com.zhunemo.mydeepseek），
           * 之前 com.simplechat.app 的 16 / 1.2.3 属于另一条线，不必延续。
           */
-        versionCode = 5
-        versionName = "1.2.2"
+        versionCode = appVersionCode
+        versionName = appVersionName
         testInstrumentationRunner = "com.simplechat.app.DeviceRegression"
         vectorDrawables { useSupportLibrary = true }
     }

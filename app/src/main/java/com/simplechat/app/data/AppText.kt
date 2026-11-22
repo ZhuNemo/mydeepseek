@@ -1,6 +1,7 @@
 package com.simplechat.app.data
 
 import android.app.Application
+import androidx.annotation.ArrayRes
 import androidx.annotation.BoolRes
 import androidx.annotation.StringRes
 import com.simplechat.app.R
@@ -36,6 +37,11 @@ object Res {
         val context = LocaleHelper.localizedContext(app)
         return if (args.isEmpty()) context.getString(resId) else context.getString(resId, *args)
     }
+
+    internal fun strings(@ArrayRes resId: Int): Array<String> =
+        checkNotNull(app).resources.getStringArray(resId)
+
+    internal fun nameOrNull(@StringRes id: Int?) = id?.let { app?.resources?.getResourceEntryName(it) }
 
     /** 读布尔资源（目前只有 `ui_is_cjk`：界面语言是不是中文）。 */
     fun bool(@BoolRes resId: Int): Boolean {
@@ -80,6 +86,7 @@ class AppTextException(val text: AppText) : IllegalArgumentException("AppText(#$
  * 本来就是英文系统文案，原样透出，总比空着强。
  */
 fun Throwable.userMessage(): String = when (this) {
+    is com.simplechat.app.net.ServiceApi.HttpFailure -> com.simplechat.app.net.httpErrorText(status, detail)
     is AppTextException -> text.resolve()
     /*
      * OkHttp 对非法请求头抛的是 `IllegalArgumentException`：

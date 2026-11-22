@@ -10,8 +10,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloat
@@ -61,6 +59,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
+import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -72,16 +71,25 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.Layout
+import androidx.compose.foundation.layout.offset
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
+import androidx.compose.foundation.text.input.TextFieldState
+import androidx.compose.foundation.text.input.setTextAndPlaceCursorAtEnd
 import androidx.core.content.ContextCompat
 import androidx.compose.ui.unit.dp
 import com.simplechat.app.R
+import com.simplechat.app.data.nativeImageAdapter
+import com.simplechat.app.data.imageAspectRatios
+import com.simplechat.app.ui.common.CapsuleButton
 import com.simplechat.app.data.Attachment
 import com.simplechat.app.data.AttachmentImport
 import com.simplechat.app.data.Res
@@ -89,16 +97,12 @@ import com.simplechat.app.data.userMessage
 import com.simplechat.app.net.ApiStyle
 import com.simplechat.app.ui.common.ReadAloudEnabled
 import com.simplechat.app.ui.common.SoftShape
-import com.simplechat.app.ui.common.VoiceInputEnabled
 import com.simplechat.app.ui.common.AppConfirmDialog
 import com.simplechat.app.ui.common.AppIcons
-import com.simplechat.app.ui.common.ContainedLoading
 import com.simplechat.app.ui.common.AppShadow
 import com.simplechat.app.ui.common.IconCircleButton
 import com.simplechat.app.ui.common.MotionEasing
 import com.simplechat.app.ui.common.dismissKeyboardOnTouch
-import com.simplechat.app.ui.markdown.MarkdownInitialBlocks
-import com.simplechat.app.ui.markdown.warmMarkdownCache
 import com.simplechat.app.ui.theme.LocalChatColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.filter
@@ -109,11 +113,12 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.material3.CircularProgressIndicator
 import kotlinx.coroutines.delay
 import androidx.compose.foundation.layout.fillMaxHeight
 
 /** 输入栏下方最多同时展开一个面板。 */
-private enum class InputPanelState { NONE, THINKING, STATS, SETTINGS, ATTACH }
+private enum class InputPanelState { NONE, THINKING, STATS, SETTINGS, ATTACH, IMAGE_MODELS, IMAGE_RATIOS }
 
 /** 切换会话的淡入时长。**快** —— 慢一点就从"过渡"变成"等待"了。 */
 private const val SwitchFadeInMs = 160
@@ -168,7 +173,13 @@ fun ChatScreen(
     onOpenDrawer: () -> Unit,
     onNewConversation: () -> Unit,
     modifier: Modifier = Modifier,
-    /** 顶栏标题的**共享元素**修饰符（页面转场时由 `RootScreen` 注入）。 */
+    onConfigureImageApi: () -> Unit = {},
+    onConfigureApi: () -> Unit = {},
+    /**
+     * 顶栏标题的**共享元素**修饰符（页面转场时由 `RootScreen` 注入）。
+     *
+     * 默认 `Modifier`：单独预览或测试时不需要转场，也就不必造一个假的 scope。
+     */
     titleModifier: Modifier = Modifier,
 ) {
     val colors = LocalChatColors.current
@@ -178,7 +189,11 @@ fun ChatScreen(
     val context = LocalContext.current
 
     var panel by remember { mutableStateOf(InputPanelState.NONE) }
-    var input by remember { mutableStateOf("") }
+    val inputState = remember { TextFieldState() }
+    val input by remember { derivedStateOf { inputState.text.toString() } }
+    fun replaceInput(text: String) {
+        inputState.setTextAndPlaceCursorAtEnd(text)
+    }
     var deleteTarget by remember { mutableStateOf<UiMessage?>(null) }
 
     /**
@@ -198,17 +213,19 @@ fun ChatScreen(
 
     /** 附件相关的报错。与网络错误分开 —— 后者是 vm.banner，语义不同。 */
     var attachError by remember { mutableStateOf<String?>(null) }
+    var fileUploads by remember { mutableStateOf(0) }
 
-    /*
-     * ── 语音输入 / 朗读 ──────────────────────────────────
-     *
-     * `voiceBase` 记住"按下麦克风之前输入框里已经有什么"：系统的中间结果是
-     * **累计全文**（不是增量），所以每次都用 base + 最新结果重写，
-     * 而不是往上追加 —— 否则说到第三个字时输入框里会出现三份前两个字。
-     */
-    var voiceBase by remember { mutableStateOf("") }
     var speechError by remember { mutableStateOf<String?>(null) }
-    val voice = rememberVoiceInput(onText = { text -> input = voiceBase + text })
+    var voiceCancelling by remember { mutableStateOf(false) }
+    var voiceTapMode by remember { mutableStateOf(false) }
+    val voice = rememberVoiceInput()
+    val officialAsr = vm.officialAsr
+    val haptics = LocalHapticFeedback.current
+    LaunchedEffect(officialAsr) {
+        voice.cancel()
+        voiceCancelling = false
+        voiceTapMode = false
+    }
     // 音色来自设置：设置里换一个，回到对话页立即生效（见 SpeechOutput 的 applyVoice）
     val speaker = rememberSpeechOutput(vm.ttsVoiceName, vm.officialTts)
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -217,72 +234,18 @@ fun ChatScreen(
      * 官方域提供）。不可用时**整颗按钮不出现** —— 用户要求：不支持的 API 直接隐藏。
      */
     val readAloudAvailable =
-        !com.simplechat.app.net.DeepSeekTts.isOfficialVoice(vm.ttsVoiceName) || vm.officialTts != null
+        ReadAloudEnabled && vm.readAloudEnabled &&
+            (!com.simplechat.app.net.DeepSeekTts.isOfficialVoice(vm.ttsVoiceName) || vm.officialTts != null)
 
-    AutoReadAloudEffect(vm, ReadAloudEnabled && readAloudAvailable, speaker::read, speaker::stop)
+    LaunchedEffect(readAloudAvailable) { if (!readAloudAvailable) speaker.stop() }
+    AutoReadAloudEffect(vm, readAloudAvailable, speaker::read, speaker::stop)
 
-    /*
-     * 麦克风权限的当前状态。
-     *
-     * 要**可观察**：用户可能在系统设置里刚授权完回来，这时"长按说话"应该立刻可用，
-     * 而不是等下一次重组才悄悄生效。授权回调里也主动刷一次。
-     */
-    /** 松手后是否要直接发送；以及驱动发送的信号值。 */
-    var sendAfterVoice by remember { mutableStateOf(false) }
-    var voiceSendSignal by remember { mutableStateOf(0) }
-
-    var hasMicrophonePermission by remember {
-        mutableStateOf(
-            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
-                PackageManager.PERMISSION_GRANTED,
-        )
-    }
     val microphonePermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
-        hasMicrophonePermission = granted
-        if (granted) {
-            voiceBase = input
-            voice.start()
-        } else {
-            speechError = Res.get(R.string.voice_permission_denied)
-        }
+        if (!granted) speechError = Res.get(R.string.voice_permission_denied)
     }
 
-    // 松手后：识别一结束就发送；没识别到字则提示，不弹键盘
-    LaunchedEffect(voice.state.listening) {
-        if (!voice.state.listening && sendAfterVoice) {
-            sendAfterVoice = false
-            if (input.isBlank()) {
-                speechError = Res.get(R.string.voice_empty)
-            } else {
-                voiceSendSignal++
-            }
-        }
-    }
-
-    /** 点麦克风：没在录 → 先确认权限再开录；正在录 → 收尾并出结果。 */
-    fun toggleVoice() {
-        if (voice.state.listening) {
-            voice.stop()
-            return
-        }
-        // 用可观察的那份状态，避免"设置里刚授权过、这里还认为没权限"
-        if (hasMicrophonePermission) {
-            voiceBase = input
-            voice.start()
-        } else {
-            microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
-        }
-    }
-
-    // 识别失败 / 朗读失败都以 banner 告知：与附件报错同一套呈现
-    LaunchedEffect(voice.state.error) {
-        voice.state.error?.let {
-            speechError = it
-            voice.consumeError()
-        }
-    }
     LaunchedEffect(speaker.error) {
         speaker.error?.let {
             speechError = it
@@ -291,7 +254,7 @@ fun ChatScreen(
     }
 
     /** 全屏查看的图片：本条的全部图片 + 当前点开的那张。 */
-    var viewingImage by remember { mutableStateOf<Pair<List<Attachment>, Attachment>?>(null) }
+    var viewingImage by remember { mutableStateOf<Triple<List<Attachment>, Attachment, Int>?>(null) }
 
     /*
      * ⚠️⚠️ **输入状态必须按会话分开。**
@@ -307,9 +270,17 @@ fun ChatScreen(
      * 输入状态在溶解动画开始前就已经换好了。
      */
     val composerKey = vm.currentConversationId.orEmpty()
+    var composerExpanded by remember(composerKey) { mutableStateOf(false) }
     val pendingByConversation = remember { mutableStateMapOf<String, List<Attachment>>() }
-    val editingByConversation = remember { mutableStateMapOf<String, UiMessage?>() }
-    val draftBeforeEditByConversation = remember { mutableStateMapOf<String, String>() }
+    val imagePromptByConversation = vm.imageDrafts
+    val imageFieldState = remember { TextFieldState() }
+    var imageMode by rememberSaveable(composerKey) { mutableStateOf(false) }
+    var imageAspectRatio by rememberSaveable(composerKey) { mutableStateOf<String?>(null) }
+    var pickedImageModel by rememberSaveable(composerKey) { mutableStateOf<String?>(null) }
+    val referenceImages = remember(vm) { mutableStateMapOf<String, List<Attachment>>() }
+    var referencePickerOwner by rememberSaveable { mutableStateOf<String?>(null) }
+    data class ComposerEditDraft(val target: UiMessage, val text: String, val previousDraft: String)
+    val editingByConversation = remember { mutableStateMapOf<String, ComposerEditDraft>() }
     var composerOwner by remember { mutableStateOf<String?>(null) }
 
     /*
@@ -321,18 +292,29 @@ fun ChatScreen(
     fun draftToPersist(): String = if (editingMessage != null) inputBeforeEdit else input
 
     LaunchedEffect(vm.currentConversationId) {
+        voice.cancel()
+        voiceCancelling = false
+        voiceTapMode = false
         // ① 把上一份存回它自己的会话
         composerOwner?.let { previous ->
-            vm.saveDraft(previous, draftToPersist())
+            val draft = draftToPersist()
             pendingByConversation[previous] = pending
-            editingByConversation[previous] = editingMessage
-            draftBeforeEditByConversation[previous] = inputBeforeEdit
+            imagePromptByConversation[previous] = imageFieldState.text.toString()
+            val target = editingMessage
+            if (target != null) {
+                editingByConversation[previous] = ComposerEditDraft(target, input, inputBeforeEdit)
+            } else {
+                editingByConversation.remove(previous)
+            }
+            vm.saveDraft(previous, draft)
         }
-        // ② 取来这一份：草稿走库（进程被杀也还在），其余是瞬时状态、留在内存
-        input = vm.loadDraft(composerKey).orEmpty()
+        // ② 普通草稿走库，修改中的文字和它的目标一起留在内存。
+        val edit = editingByConversation[composerKey]
+        replaceInput(edit?.text ?: vm.loadDraft(composerKey).orEmpty())
         pending = pendingByConversation[composerKey].orEmpty()
-        editingMessage = editingByConversation[composerKey]
-        inputBeforeEdit = draftBeforeEditByConversation[composerKey].orEmpty()
+        imageFieldState.setTextAndPlaceCursorAtEnd(imagePromptByConversation[composerKey].orEmpty())
+        editingMessage = edit?.target
+        inputBeforeEdit = edit?.previousDraft.orEmpty()
         composerOwner = composerKey
 
         // ③ 这些是"指向某条消息"的瞬时状态 —— 跨会话留着是危险的，一律清掉
@@ -341,6 +323,15 @@ fun ChatScreen(
         viewingImage = null
         attachError = null
         panel = InputPanelState.NONE
+    }
+
+    LaunchedEffect(composerKey) {
+        snapshotFlow { composerOwner to imageFieldState.text.toString() }.collect { (owner, draft) ->
+            if (owner == composerKey) {
+                if (draft.isBlank()) imagePromptByConversation.remove(composerKey)
+                else imagePromptByConversation[composerKey] = draft
+            }
+        }
     }
 
     /*
@@ -372,7 +363,13 @@ fun ChatScreen(
             draftScope.launch { composerOwner?.let { vm.saveDraft(it, draftToPersist()) } }
         }
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) flush()
+            if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
+                voice.cancel()
+                voiceCancelling = false
+                voiceTapMode = false
+                flush()
+            }
+            if (event == Lifecycle.Event.ON_RESUME) voice.refreshAvailability()
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
@@ -384,7 +381,7 @@ fun ChatScreen(
     /** 收起「修改输入」并还原编辑前的草稿。 */
     fun cancelEdit() {
         editingMessage = null
-        input = inputBeforeEdit
+        replaceInput(inputBeforeEdit)
         pending = emptyList()
     }
 
@@ -400,10 +397,17 @@ fun ChatScreen(
      */
     /** 消息索引的手势状态（§34）—— 左滑跟手，从右侧滑出。 */
     val messageIndex = rememberMessageIndexDragState()
+    BackHandler(enabled = imageMode && panel == InputPanelState.NONE && !composerExpanded) { imageMode = false }
     BackHandler(enabled = panel != InputPanelState.NONE) { panel = InputPanelState.NONE }
     BackHandler(enabled = messageIndex.isOpen) { messageIndex.collapse() }
     BackHandler(enabled = editingMessage != null) { cancelEdit() }
+    BackHandler(enabled = composerExpanded && panel == InputPanelState.NONE) { composerExpanded = false }
     BackHandler(enabled = aiEditTarget != null) { aiEditTarget = null }
+    BackHandler(enabled = voice.state.active) {
+        voice.cancel()
+        voiceCancelling = false
+        voiceTapMode = false
+    }
 
 
 
@@ -469,14 +473,72 @@ fun ChatScreen(
     //
     // 三个入口都用系统能力，且**都不需要申请任何权限**：
     // - 拍照走 ACTION_IMAGE_CAPTURE + FileProvider（相机 App 自己持有相机权限）
-    // - 图片走 PickVisualMedia（系统相册选择器）
-    // - 文件走 OpenDocument
+    // - 图片走 PickMultipleVisualMedia（系统相册选择器，可多选）
+    // - 文件走 OpenMultipleDocuments（可多选）
     // 刻意不申请 READ_MEDIA_IMAGES 之类的权限 —— 为了一个附件功能
     // 弹一堆系统授权，性价比太差。
 
     /** 附件读取失败/超限时的统一反馈。 */
     fun onImportFailed(message: String?) {
         attachError = message ?: Res.get(R.string.attach_read_failed)
+    }
+
+    /*
+     * 多选之后，"一次选择"不再等于"一个附件"，于是有三件事要在这里说清楚：
+     *
+     * ① **读到一个就贴一个**：十几张图等整批读完才出现，会让人以为没反应；
+     * ② **一个失败不影响其余**：失败的攒到最后报一句，成功的照常留在待发区
+     *    （"选错了 20 个里的 1 个"不该让另外 19 个白读）；
+     * ③ **归属是发起那一刻的会话**：读 PDF 要好几秒，期间完全可能切走 ——
+     *    直接写 `pending` 会把附件塞进**新会话**的待发区。
+     */
+    fun addPending(owner: String, added: List<Attachment>) {
+        if (added.isEmpty()) return
+        if (composerOwner == owner) {
+            pending = pending + added
+        } else {
+            pendingByConversation[owner] = pendingByConversation[owner].orEmpty() + added
+        }
+    }
+
+    /**
+     * 逐条读一批 URI。
+     *
+     * [read] 统一成 `(附件列表, 有损说明)`：图片产出一条、PDF 一页一条、
+     * docx 产出一条 —— 调用方不必为每种来源各写一遍循环与报错。
+     */
+    suspend fun importBatch(
+        owner: String,
+        uris: List<Uri>,
+        read: suspend (Uri) -> Result<Pair<List<Attachment>, String?>>,
+    ) {
+        var failed = 0
+        var firstFailure: Throwable? = null
+        var note: String? = null
+
+        for (uri in uris) {
+            read(uri).onSuccess { (attachments, resultNote) ->
+                addPending(owner, attachments)
+                // 有损提示（如 PDF 只带了前 12 页）留第一条就够了
+                if (note == null) note = resultNote
+            }.onFailure {
+                failed++
+                if (firstFailure == null) firstFailure = it
+            }
+        }
+
+        // 已经切去别的会话就不再打扰：这是"那一批"的事，不该弹到别人头上
+        if (composerOwner != owner) return
+
+        if (failed == 0) {
+            note?.let { attachError = it }
+            return
+        }
+        attachError = if (uris.size == 1) {
+            firstFailure?.userMessage()
+        } else {
+            Res.get(R.string.attach_import_partial, failed, firstFailure?.userMessage().orEmpty())
+        }
     }
 
     /*
@@ -498,7 +560,7 @@ fun ChatScreen(
         }
         scope.launch {
             AttachmentImport.image(context, uri)
-                .onSuccess { pending = pending + it }
+                .onSuccess { addPending(composerKey, listOf(it)) }
                 .onFailure { onImportFailed(it.userMessage()) }
             AttachmentImport.discardCapture(context, uri)
         }
@@ -515,36 +577,56 @@ fun ChatScreen(
     }
 
     val imagePicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.PickVisualMedia(),
-    ) { uri ->
-        if (uri == null) return@rememberLauncherForActivityResult
+        ActivityResultContracts.PickMultipleVisualMedia(),
+    ) { uris ->
+        if (uris.isEmpty()) return@rememberLauncherForActivityResult
+        val owner = composerKey
         scope.launch {
-            AttachmentImport.image(context, uri)
-                .onSuccess { pending = pending + it }
-                .onFailure { onImportFailed(it.userMessage()) }
+            importBatch(owner, uris) { uri ->
+                AttachmentImport.image(context, uri)
+                    .map { listOf(it) to (null as String?) }
+            }
+        }
+    }
+
+    val referencePicker = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(3)) { uris ->
+        val owner = referencePickerOwner
+        referencePickerOwner = null
+        if (owner == null || uris.isEmpty()) return@rememberLauncherForActivityResult
+        scope.launch {
+            for (uri in uris) {
+                if (referenceImages[owner].orEmpty().size >= 3) break
+                AttachmentImport.image(context, uri).onSuccess { image ->
+                    val current = referenceImages[owner].orEmpty()
+                    if (current.size < 3) referenceImages[owner] = current + image
+                }.onFailure { error -> onImportFailed(error.userMessage()) }
+            }
         }
     }
 
     val filePicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument(),
-    ) { uri ->
-        if (uri == null) return@rememberLauncherForActivityResult
+        ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris ->
+        if (uris.isEmpty()) return@rememberLauncherForActivityResult
+        val owner = composerKey
+        val source = vm.attachmentSettings
         scope.launch {
+            if (source.useRemoteFiles) fileUploads++
+            try {
             /*
              * 一个入口认三种东西：PDF（渲染成图）、docx（抽文本）、
              * 以及其余一律按纯文本试。格式按**文件头**判定，不看扩展名。
              */
-            AttachmentImport.document(context, uri)
-                .onSuccess { result ->
-                    pending = pending + result.attachments
-                    // 有损的地方要说出来（比如 PDF 只带了前 12 页）
-                    result.note?.let { attachError = it }
-                }
-                .onFailure { onImportFailed(it.userMessage()) }
+            importBatch(owner, uris) { uri ->
+                val imported = if (source.useRemoteFiles) com.simplechat.app.data.RemoteFileImport.document(context, uri, source)
+                    else AttachmentImport.document(context, uri)
+                imported.map { it.attachments to it.note }
+            }
+            } finally { if (source.useRemoteFiles) fileUploads-- }
         }
     }
 
-    /** 打开文件选择器。MIME 过滤刻意放到最宽，真正的把关在 `AttachmentImport.text`。 */
+    /** 打开文件选择器（可多选）。MIME 过滤刻意放到最宽，真正的把关在 `AttachmentImport`。 */
     fun pickFile() {
         /*
          * ⚠️ 这里刻意不用 MIME 过滤（传通配），而不是只挑 `text` 那一类。
@@ -598,24 +680,18 @@ fun ChatScreen(
     val messageIndexEntries by produceState(
         initialValue = emptyList<MessageIndexEntry>(),
         vm.currentConversationId,
-        /*
-         * ⚠️ **条数不够，还要认版本号。**
-         *
-         * 切版本 / 重新生成 / 删除后重读路径时，条数可能**一点没变**（换的是同父的
-         * 兄弟），但每条的 id 与下标都变了。只按条数重建的话，索引里留着的是
-         * 一批已经不存在的 id —— 点一条就跳到错的位置，而且列表本身是对的，
-         * 用户只会觉得"这个索引坏了"。
-         */
         vm.messages.size,
-        vm.pathRevision,
     ) {
         value = buildMessageIndexSnapshot(vm.messages)
     }
 
     val density = LocalDensity.current
-    /** 输入区实测高度（含系统栏内边距）—— 消息列表据此让出底部空间。 */
-    var inputAreaHeight by remember { mutableStateOf(0) }
-    val inputAreaPadding = with(density) { inputAreaHeight.toDp() }
+    val inputAreaHeight = remember { mutableStateOf(0) }
+    val messagePadding = remember(density, inputAreaHeight) {
+        object : PaddingValues by PaddingValues(horizontal = 16.dp, vertical = 12.dp) {
+            override fun calculateBottomPadding() = with(density) { inputAreaHeight.value.toDp() } + 12.dp
+        }
+    }
 
     /** 正在切换会话。此时列表被整份替换，禁止切换逻辑之外的打扰（见下方切换 LaunchedEffect）。 */
     var switchingConversation by remember { mutableStateOf(false) }
@@ -748,48 +824,15 @@ fun ChatScreen(
      * `ScrollToBottom.followBottom`。
      */
     LaunchedEffect(listState) {
+        fun needsFollow() = !detached && vm.searchTarget == null && !vm.switching && !pathRebuilding &&
+            !switchingConversation && !listState.isScrollInProgress && listState.canScrollForward
         while (true) {
-            /*
-             * 「贴底就粘住」：只要用户没主动上翻（`!detached`）、没在滚动、
-             * 且下面真的还有内容（`canScrollForward`），就把它钉在末尾。
-             *
-             * 不只在流式时跑 —— 长消息的文字布局要好几帧才排出真实高度，
-             * 只在流式时跑会漏掉"加载完但还在长"的那几帧（实测：第一次
-             * atBottom=true 之后高度又长了一截，就再也没人跟了）。
-             *
-             * `pathRebuilding` / `switchingConversation` 期间让位 ——
-             * 那两种是**故意**要把视口挪到别处去的，别和它们抢。
-             */
-            if (!detached && vm.searchTarget == null && !vm.switching && !pathRebuilding && !switchingConversation &&
-                !listState.isScrollInProgress && listState.canScrollForward
-            ) {
-                // 向底部**逼近**一帧，不是一把跳过去 —— 见 ScrollToBottom.followBottom
+            // Wake on layout growth or resumed following, not on every frame spent reading history.
+            if (!needsFollow()) snapshotFlow { needsFollow() }.first { it }
+            while (needsFollow()) {
                 listState.followBottom()
+                withFrameNanos { }
             }
-            withFrameNanos { }
-        }
-    }
-
-    /*
-     * 预热 Markdown 解析缓存（**后台线程**）。
-     *
-     * ⚠️ **只预热末尾这一条**，不是整个会话。
-     *
-     * 早先这里是 `vm.messages.asReversed().map { it.content }.forEach { warm(it) }` ——
-     * 而 effect 的 key 是 `messages.size`：**每来一条新消息，就把全部历史重新解析一遍**。
-     * 一千条的会话里，每轮回复都要在后台把上百万字重新解析一次，解析结果还因为缓存
-     * 容量被反复冲刷（见 `MarkdownStateCache`）。这正是"长会话越聊越卡"的直接原因之一。
-     *
-     * 真正需要的只有"贴底打开时立刻能看到的那一条"，其余交给惰性渲染：
-     * 滚进视口才解析，解析结果进 LRU 缓存。
-     *
-     * 长消息**也预热**（只预热首帧那几块）：跳过它等于把解析推回主线程，
-     * 那正是"点开长回复卡一下"的来源。上限与取消都在 `warmMarkdownCache` 里。
-     */
-    LaunchedEffect(vm.currentConversationId, vm.messages.size) {
-        val tail = vm.messages.lastOrNull() ?: return@LaunchedEffect
-        withContext(Dispatchers.Default) {
-            warmMarkdownCache(tail.content, maxBlocks = MarkdownInitialBlocks)
         }
     }
 
@@ -810,48 +853,6 @@ fun ChatScreen(
          */
         if (pathRebuilding) return@LaunchedEffect
         listState.scrollToBottom()
-    }
-
-    /*
-     * 键盘弹起会抬高输入栏 → 列表底部留白跟着变大 → 整块正文被顶上去。
-     *
-     * **贴底时这是想要的**（最后一条要让出输入栏的位置）；但用户上翻读上文时
-     * 不该被顶 —— 对齐官方：非贴底状态下正文不随键盘抬高。
-     *
-     * ⚠️ **补偿必须和留白变化落在同一帧**，否则会闪一下：
-     * 留白变大那一帧内容先被顶上去、下一帧才被拉回来 —— 一帧的整屏位移，
-     * 看起来就是闪。
-     *
-     * 所以用 `SideEffect` + `requestScrollToItem` 这一对：
-     * - `SideEffect` 在**组合之后、布局之前**跑（`LaunchedEffect` 要等下一帧）
-     * - `requestScrollToItem` 在**同一次测量**里生效，且不是动画
-     *
-     * 于是"被顶上去"的那一帧压根不会被画出来。
-     */
-    val padPx = inputAreaHeight
-    var lastPadPx by remember { mutableStateOf(-1) }
-    val padDelta = if (lastPadPx >= 0) padPx - lastPadPx else 0
-    SideEffect {
-        lastPadPx = padPx
-        // 首次测量只记基线（0 → 实测值那一跳不是键盘引起的）
-        if (padDelta == 0 || detached || vm.searchTarget != null || vm.switching || switchingConversation) return@SideEffect
-        /*
-         * ★ 顶部为原点：底部留白变化**不推**内容。
-         *
-         * 锚点是"最上面那条可见项的顶边"，它和底部留白无关 —— 非贴底时什么都不用做。
-         * 只有贴底时要主动跟：留白变大 = 内容末尾离视口底更远 = 最后一条会被输入栏盖住，
-         * 得重新贴到新的末尾。
-         *
-         * `isAtBottom()` 在这里读到的是**上一次布局**的结果 = 变化前的状态，正是要的。
-         */
-        if (listState.isAtBottom()) {
-            val owner = vm.currentConversationId
-            scope.launch {
-                if (owner == vm.currentConversationId && !detached && vm.searchTarget == null && !vm.switching) {
-                    listState.scrollToBottom()
-                }
-            }
-        }
     }
 
     /*
@@ -1014,7 +1015,7 @@ fun ChatScreen(
                     stable = if (listState.isAtBottom()) stable + 1 else 0
                 }
             }
-            dissolve.animateTo(1f, spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow))
+            dissolve.animateTo(1f, tween(SwitchFadeInMs, easing = MotionEasing))
         } finally {
             switchingConversation = false
             loadingConversation = false
@@ -1106,20 +1107,33 @@ fun ChatScreen(
 
     /** 展开面板时收起键盘 —— 键盘与面板同时占屏会让输入区几乎没有空间。 */
     fun openPanel(target: InputPanelState) {
+        composerExpanded = false
         dismissInput()
         panel = if (panel == target) InputPanelState.NONE else target
     }
 
+    val textSelection = remember(vm) { MessageTextSelection() }
+    val shareSelection = remember(vm) { MessageShareSelection() }
+    var excerpt by remember(vm.currentConversationId) { mutableStateOf<MessageShareDocument?>(null) }
+    val shareMessages = vm.messages.toList()
+    val shareGroups = remember(shareMessages) { messageShareGroups(shareMessages) }
+    LaunchedEffect(vm.currentConversationId) { textSelection.dismiss(); shareSelection.close() }
+    LaunchedEffect(shareGroups) { if (shareSelection.active) shareSelection.reconcile(shareGroups) }
+    BackHandler(enabled = shareSelection.active) { shareSelection.close() }
+
     Column(
         modifier = modifier
             .fillMaxSize()
-            .background(colors.pageBackground),
+            .background(colors.pageBackground)
+            .dismissMessageSelectionOnTap(textSelection),
     ) {
-        ChatTopBar(
+        if (shareSelection.active) {
+            MessageShareTopBar(shareSelection, shareGroups, onClose = { shareSelection.close() })
+        } else ChatTopBar(
             title = vm.conversationTitle(),
             titleModifier = titleModifier,
             autoReadAloud = vm.autoReadAloud,
-            readAloudAvailable = ReadAloudEnabled && readAloudAvailable,
+            readAloudAvailable = readAloudAvailable,
             onToggleAutoReadAloud = {
                 if (vm.autoReadAloud) speaker.stop()
                 vm.toggleAutoReadAloud()
@@ -1135,265 +1149,295 @@ fun ChatScreen(
                 // 新对话 = "我要看新的"，恢复跟随
                 resumeFollowing()
             },
+            onDoubleTap = {
+                detached = true
+                scope.launch { listState.scrollToItem(0) }
+            },
             // 点顶栏任意处也收键盘
-            modifier = Modifier.dismissKeyboardOnTouch(),
+            modifier = Modifier.dismissKeyboardOnTouch(clearFocus = { !textSelection.isActive }),
         )
 
-        /*
-         * 消息区 + **浮在它上面的**输入区。
-         *
-         * 输入栏不占列表的位，而是盖在列表上方 —— 长文滚动时正文会从输入栏
-         * 底下穿过去，而不是被一道硬边界截断。列表底部用等高的 contentPadding
-         * 让出空间，最后一条仍然滚得出来。
-         */
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .messageIndexDrag(messageIndex),
-        ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .graphicsLayer { alpha = dissolve.value }
-                    // 点消息区空白处收键盘；不消费事件，气泡照常可点
-                    .dismissKeyboardOnTouch()
-            ) {
-                if (vm.messages.isEmpty()) {
-                    // 空态也要避开输入栏，否则"一起创作吧"会压在输入框上
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(bottom = inputAreaPadding),
-                    ) {
-                        EmptyState(modifier = Modifier.align(Alignment.Center))
-                    }
-                } else {
-                    MessageList(
-                        messages = vm.messages,
-                        searchTarget = vm.searchTarget,
-                        searchBottomObstructionPx = inputAreaHeight,
-                        searchPlacementReset = searchPlacementReset,
-                        onDismissSearch = vm::dismissSearch,
-                        listState = listState,
-                        /*
-                         * 展开 / 收起**任何**折叠块（思考面板、超长用户气泡）时，
-                         * 立刻停止自动跟底。
-                         *
-                         * 折叠块都在视口**下方**：跟底会马上把这一屏往上推，
-                         * 于是"展开"这个动作先把**被点的那个按钮**顶走了 ——
-                         * 用户点的就是它、视线也在它上面，它必须原地不动。
-                         * 停下来之后新长出来的内容往**下**长，正是"掀开"的观感。
-                         *
-                         * 而且停下来是**持续的**：`detached` 只在用户重新滚回底部时
-                         * 才被清掉（见跟底循环里那条恢复条件），所以展开后可以
-                         * 慢慢往下读，不会被反复拽走。
-                         *
-                         * 反过来说，这也是"点开来看"与"等新内容"两种意图的分界：
-                         * 点折叠 = 我在读已经有的东西；跟底只在流式那种
-                         * "我在等新字"的场合才对。
-                         */
-                        onFoldToggle = { detached = true },
-                        modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(
-                            start = 16.dp,
-                            end = 16.dp,
-                            top = 12.dp,
-                            bottom = inputAreaPadding + 12.dp,
-                        ),
-                        onCopy = { message -> copyToClipboard(context, message.content) },
-                        onRegenerate = { message ->
-                            /*
-                             * ⚠️ **重新生成不锚**，交给跟底。
-                             *
-                             * 它把这条换成一条**空的**流式回复 —— 高度会先塌到十几像素
-                             * （实测 18355px → 12px），此时"原来的阅读位置"在新内容里
-                             * 根本不存在，锚不住；硬锚只会把视口钳到内容末尾 = 往上跳。
-                             *
-                             * 而用户按「重新生成」就是想**看新回复**，跟到底部才对。
-                             * （对照：「切版本」是看已完成的兄弟版本，那里才锚。）
-                             */
-                            resumeFollowing()
-                            vm.regenerate(message)
-                        },
-                        onContinue = { message ->
-                            /*
-                             * 续写**跟底**：新内容接在这条末尾，用户按它就是想看接下来写什么。
-                             * 与「重新生成」同一个判断（那条把内容清空，锚不住）。
-                             */
-                            resumeFollowing()
-                            vm.continueMessage(message)
-                        },
-                        // 朗读暂时下线（见 ReadAloudEnabled）：开关关着时按钮不出现、
-                        // TTS 引擎也不会被初始化
-                        speakingId = if (ReadAloudEnabled && readAloudAvailable) speaker.speakingId else null,
-                        readAloudAvailable = ReadAloudEnabled && readAloudAvailable,
-                        autoCollapseThinking = vm.autoCollapseThinking,
-                        onSpeak = { message ->
-                            // 朗读正文（不是时间线里的过程文字）：用户要听的是回答本身
-                            if (ReadAloudEnabled) speaker.toggle(message.id, message.content)
-                        },
-                        onEdit = { message ->
-                            if (message.role == MessageRole.USER) {
-                                if (editingMessage == null) inputBeforeEdit = input
-                                editingMessage = message
-                                input = message.content
-                                // 附件跟着进输入栏 —— 改错别字不该顺手把图丢了
-                                pending = message.attachments
-                                panel = InputPanelState.NONE
-                            } else {
-                                aiEditTarget = message
-                            }
-                        },
-                        onDelete = { message -> deleteTarget = message },
-                        onFork = { message -> vm.forkFrom(message) },
-                        onVariantChange = { message, index ->
-                            // 切版本也重建路径（旧分支下游让位）—— 锚住操作栏那一行，
-                            // 换完视口不动，连点 `‹ ›` 才点得准。详见 anchorOnPathChange。
-                            anchorOnPathChange(message)
-                            vm.switchVariant(message, index)
-                        },
-                        onOpenImage = { message, attachment ->
-                            viewingImage = message.attachments.filter { it.isImage } to attachment
-                        },
-                        onRetry = { message ->
-                            // 同「重新生成」：换成一条空的流式回复 → 不锚，跟到底部看它写
-                            resumeFollowing()
-                            vm.retryMessage(message)
-                        },
-                    )
-                }
-            }
-
-            /*
-             * 回到底部。
-             *
-             * 只在离开底部时出现 —— 一直挂着会平白挡住正文，而它贴底时毫无用处。
-             * 点它会**恢复自动跟随**：用户的意图显然是"我要看最新的"。
-             */
-            /*
-             * 换会话时的白屏转圈。
-             *
-             * 只在"切换会话"且**等了一小会儿还没就位**时出现：短会话一闪而过，
-             * 没必要闪个圈；长消息排版慢，这时给个明确的"在加载"，
-             * 比让人看着列表自己往下滑要好。
-             */
-            if (showLoading) {
-                /*
-                 * 切会话的等待用 [ContainedLoading]（会变形的容器 + 轨道点），
-                 * 与「等第一个 token」那一处同一套语言 —— 同一个应用里
-                 * "在加载"应该长一个样。
-                 *
-                 * 48dp：这是一屏中央唯一的元素，比行内的 18dp 大一档才压得住。
-                 */
-                ContainedLoading(
-                    modifier = Modifier.align(Alignment.Center),
-                    size = 48.dp,
-                )
-            }
-
-            /*
-             * 安卓原生的那种细滚动条：滚动时出现、停手淡出。
-             *
-             * 放在消息区这一层、贴右缘；输入栏浮在它上面，淡出后也不碍事。
-             */
-            VerticalScrollBar(
-                state = listState,
-                modifier = Modifier
-                    .align(Alignment.CenterEnd)
-                    .fillMaxHeight(),
-            )
-
-            val atBottom by rememberIsAtBottom(listState)
-            BackToBottomButton(
-                /*
-                 * ★ 显隐判据里必须有 `detached`（用户主动离开底部），**不能只有 `!atBottom`**。
-                 *
-                 * `!atBottom` 在**跟随过程中**会以内容到达的节奏来回翻：每来一批字
-                 * `canScrollForward` 变真 → 按钮冒出来；跟底把它吃掉 → 又变假 → 按钮消失。
-                 * 表现就是"一触发跟底，按钮就不停闪烁"。
-                 *
-                 * `detached` 是**意图**而不是**位置**：跟随期间它一直是假，
-                 * 所以跟底时这个按钮压根不存在 —— 正是要的。
-                 * 留 `!atBottom` 只是为了避免"明明已经在底部还挂着一个回到底部"。
-                 */
-                visible = vm.messages.isNotEmpty() && detached && !atBottom,
-                // 生成中在按钮外圈转一圈进度环；生成完自动消失
-                generating = vm.isStreaming,
-                onClick = {
-                    // 用户显式要"看最新的" —— 这是少数几个该主动滚动的地方之一
-                    resumeFollowing()
-                    scope.launch {
-                        // Remove the search-only padding before computing the normal content bottom.
-                        withFrameNanos { }
-                        listState.scrollToBottom()
-                    }
-                },
-                modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .padding(end = 16.dp, bottom = inputAreaPadding + 12.dp),
-            )
-
-            /*
-             * 面板展开时，点消息区任意处即可关闭。
-             *
-             * 这层是**透明**的、只在面板展开时存在，并且会吃掉这一击 ——
-             * 否则用户点空白处关面板，顺手还点开了底下那条消息。
-             */
-            if (panel != InputPanelState.NONE) {
+        val backdrop: @Composable () -> Unit = {
+            Box(Modifier.fillMaxSize()) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .clickable(
-                            interactionSource = remember { MutableInteractionSource() },
-                            indication = null,
-                        ) {
-                            dismissInput()
-                            panel = InputPanelState.NONE
-                        },
-                )
-            }
-
-            /*
-             * 输入栏**下面**那一层渐变：只铺屏幕最底部的一条，正文滚到这里就化开。
-             *
-             * 输入栏以上**一律不铺** —— 之前那层从输入栏顶边往上羽化的带子，
-             * 会把正在读的那行字从中间洗掉，比硬边还难看。正文应该一直清晰到
-             * 输入栏的边，然后被输入栏自己盖住。
-             */
-            if (inputAreaHeight > 0) {
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .fillMaxWidth()
-                        .height(BottomFadeHeight)
-                        .background(
-                            Brush.verticalGradient(
+                        .graphicsLayer { alpha = dissolve.value }
+                        // 点消息区空白处收键盘；不消费事件，气泡照常可点
+                        .dismissKeyboardOnTouch(clearFocus = { !textSelection.isActive })
+                ) {
+                    if (vm.messages.isEmpty()) {
+                        // 空态也要避开输入栏，否则"一起创作吧"会压在输入框上
+                        EmptyState(
+                            modifier = Modifier.fillMaxSize(),
+                            bottomObstruction = { inputAreaHeight.value },
+                        )
+                    } else {
+                        MessageList(
+                            messages = vm.messages,
+                            loadingLabelFor = vm::loadingLabelFor,
+                            onStopImage = vm::stop,
+                            loadingWordsUseThemeColor = vm.loadingWordsUseThemeColor,
+                            textSelection = textSelection,
+                            shareSelection = shareSelection,
+                            onShareExcerpt = { message, selectedText ->
+                                textSelection.dismiss()
+                                dismissInput()
+                                val quote = UiMessage(message.id, message.role, selectedText)
+                                val footnote = buildList {
+                                    add(Res.get(R.string.share_excerpt_date, java.time.LocalDate.now().toString()))
+                                    if (message.role == MessageRole.ASSISTANT) add(Res.get(R.string.share_excerpt_ai))
+                                }
+                                excerpt = MessageShareDocument(
+                                    Res.get(R.string.share_excerpt),
+                                    listOf(MessageShareGroup(quote.id, listOf(quote))),
+                                    footnote,
+                                )
+                            },
+                            onShare = { message ->
+                                textSelection.dismiss()
+                                dismissInput()
+                                panel = InputPanelState.NONE
+                                messageIndex.collapse()
+                                detached = true
+                                vm.dismissSearch()
+                                shareSelection.begin(message.id, shareGroups)
+                            },
+                            searchTarget = vm.searchTarget,
+                            searchBottomObstructionPx = { inputAreaHeight.value },
+                            searchPlacementReset = searchPlacementReset,
+                            onDismissSearch = vm::dismissSearch,
+                            listState = listState,
+                            /*
+                             * 展开 / 收起**任何**折叠块（思考面板、超长用户气泡）时，
+                             * 立刻停止自动跟底。
+                             *
+                             * 折叠块都在视口**下方**：跟底会马上把这一屏往上推，
+                             * 于是"展开"这个动作先把**被点的那个按钮**顶走了 ——
+                             * 用户点的就是它、视线也在它上面，它必须原地不动。
+                             * 停下来之后新长出来的内容往**下**长，正是"掀开"的观感。
+                             *
+                             * 而且停下来是**持续的**：`detached` 只在用户重新滚回底部时
+                             * 才被清掉（见跟底循环里那条恢复条件），所以展开后可以
+                             * 慢慢往下读，不会被反复拽走。
+                             *
+                             * 反过来说，这也是"点开来看"与"等新内容"两种意图的分界：
+                             * 点折叠 = 我在读已经有的东西；跟底只在流式那种
+                             * "我在等新字"的场合才对。
+                             */
+                            onFoldToggle = { detached = true },
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = messagePadding,
+                            onCopy = { message -> copyToClipboard(context, message.content) },
+                            onRegenerate = { message ->
                                 /*
-                                 * 起点不透明 0 而是 0.28，末段再收满：
-                                 * 两段线性的渐变在中间那一段太"透"，正文走到这里
-                                 * 会有半截字一直若隐若现。加中间站之后是**越往下越实**，
-                                 * 而不是"忽然开始变淡"。
+                                 * ⚠️ **重新生成不锚**，交给跟底。
+                                 *
+                                 * 它把这条换成一条**空的**流式回复 —— 高度会先塌到十几像素
+                                 * （实测 18355px → 12px），此时"原来的阅读位置"在新内容里
+                                 * 根本不存在，锚不住；硬锚只会把视口钳到内容末尾 = 往上跳。
+                                 *
+                                 * 而用户按「重新生成」就是想**看新回复**，跟到底部才对。
+                                 * （对照：「切版本」是看已完成的兄弟版本，那里才锚。）
                                  */
-                                colorStops = arrayOf(
-                                    0f to colors.pageBackground.copy(alpha = 0f),
-                                    0.35f to colors.pageBackground.copy(alpha = 0.28f),
-                                    0.68f to colors.pageBackground.copy(alpha = 0.68f),
-                                    1f to colors.pageBackground,
+                                resumeFollowing()
+                                vm.regenerate(message)
+                            },
+                            supportsContinuation = vm.supportsContinuation,
+                            onContinue = { message ->
+                                /*
+                                 * 续写**跟底**：新内容接在这条末尾，用户按它就是想看接下来写什么。
+                                 * 与「重新生成」同一个判断（那条把内容清空，锚不住）。
+                                 */
+                                resumeFollowing()
+                                vm.continueMessage(message)
+                            },
+                            speakingId = if (readAloudAvailable) speaker.speakingId else null,
+                            readAloudAvailable = readAloudAvailable,
+                            autoCollapseThinking = vm.autoCollapseThinking,
+                            onSpeak = { message ->
+                                // 朗读正文（不是时间线里的过程文字）：用户要听的是回答本身
+                                if (readAloudAvailable) speaker.toggle(message.id, message.content)
+                            },
+                            onEdit = { message ->
+                                if (composerOwner == vm.currentConversationId.orEmpty()) {
+                                    if (message.role == MessageRole.ASSISTANT) {
+                                        aiEditTarget = message
+                                    } else if (editingMessage?.id != message.id) {
+                                        // 再次点中正在编辑的气泡时，保留输入栏里的修改稿。
+                                        if (editingMessage == null) inputBeforeEdit = input
+                                        editingMessage = message
+                                        replaceInput(message.content)
+                                        // 附件跟着进输入栏 —— 改错别字不该顺手把图丢了
+                                        pending = message.attachments
+                                        panel = InputPanelState.NONE
+                                    }
+                                }
+                            },
+                            onDelete = { message -> deleteTarget = message },
+                            onFork = { message -> vm.forkFrom(message) },
+                            onVariantChange = { message, index ->
+                                // 切版本也重建路径（旧分支下游让位）—— 锚住操作栏那一行，
+                                // 换完视口不动，连点 `‹ ›` 才点得准。详见 anchorOnPathChange。
+                                anchorOnPathChange(message)
+                                vm.switchVariant(message, index)
+                            },
+                            onOpenImage = { message, attachment ->
+                                val imageEntries = vm.messages.flatMap { item ->
+                                    item.attachments.filter { it.isImage }.map { item.id to it }
+                                }
+                                val index = imageEntries.indexOf(message.id to attachment)
+                                viewingImage = Triple(imageEntries.map { it.second }, attachment, index)
+                            },
+                            onChooseModel = { openPanel(InputPanelState.THINKING) },
+                            onRetryWithoutAttachmentsAndTools = { message ->
+                                resumeFollowing()
+                                vm.retryMessage(message, omitAttachmentsAndTools = true)
+                            },
+                            onRetry = { message ->
+                                // 同「重新生成」：换成一条空的流式回复 → 不锚，跟到底部看它写
+                                resumeFollowing()
+                                vm.retryMessage(message)
+                            },
+                        )
+                    }
+                }
+
+                /*
+                 * 回到底部。
+                 *
+                 * 只在离开底部时出现 —— 一直挂着会平白挡住正文，而它贴底时毫无用处。
+                 * 点它会**恢复自动跟随**：用户的意图显然是"我要看最新的"。
+                 */
+                /*
+                 * 换会话时的白屏转圈。
+                 *
+                 * 只在"切换会话"且**等了一小会儿还没就位**时出现：短会话一闪而过，
+                 * 没必要闪个圈；长消息排版慢，这时给个明确的"在加载"，
+                 * 比让人看着列表自己往下滑要好。
+                 */
+                if (showLoading) {
+                    CircularProgressIndicator(
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .size(28.dp),
+                        strokeWidth = 3.dp,
+                        color = LocalChatColors.current.processText,
+                    )
+                }
+
+                /*
+                 * 安卓原生的那种细滚动条：滚动时出现、停手淡出。
+                 *
+                 * 放在消息区这一层、贴右缘；输入栏浮在它上面，淡出后也不碍事。
+                 */
+                VerticalScrollBar(
+                    state = listState,
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .fillMaxHeight(),
+                )
+
+                val atBottom by rememberIsAtBottom(listState)
+                BackToBottomButton(
+                    /*
+                     * ★ 显隐判据里必须有 `detached`（用户主动离开底部），**不能只有 `!atBottom`**。
+                     *
+                     * `!atBottom` 在**跟随过程中**会以内容到达的节奏来回翻：每来一批字
+                     * `canScrollForward` 变真 → 按钮冒出来；跟底把它吃掉 → 又变假 → 按钮消失。
+                     * 表现就是"一触发跟底，按钮就不停闪烁"。
+                     *
+                     * `detached` 是**意图**而不是**位置**：跟随期间它一直是假，
+                     * 所以跟底时这个按钮压根不存在 —— 正是要的。
+                     * 留 `!atBottom` 只是为了避免"明明已经在底部还挂着一个回到底部"。
+                     */
+                    visible = !shareSelection.active && vm.messages.isNotEmpty() && detached && !atBottom,
+                    // 生成中在按钮外圈转一圈进度环；生成完自动消失
+                    generating = vm.isStreaming,
+                    onClick = {
+                        // 用户显式要"看最新的" —— 这是少数几个该主动滚动的地方之一
+                        resumeFollowing()
+                        scope.launch {
+                            // Remove the search-only padding before computing the normal content bottom.
+                            withFrameNanos { }
+                            listState.scrollToBottom()
+                        }
+                    },
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(end = 16.dp, bottom = 12.dp)
+                        .offset { IntOffset(0, -inputAreaHeight.value) },
+                )
+
+                /*
+                 * 面板展开时，点消息区任意处即可关闭。
+                 *
+                 * 这层是**透明**的、只在面板展开时存在，并且会吃掉这一击 ——
+                 * 否则用户点空白处关面板，顺手还点开了底下那条消息。
+                 */
+                if (panel != InputPanelState.NONE) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = null,
+                            ) {
+                                dismissInput()
+                                panel = InputPanelState.NONE
+                            },
+                    )
+                }
+
+                /*
+                 * 输入栏**下面**那一层渐变：只铺屏幕最底部的一条，正文滚到这里就化开。
+                 *
+                 * 输入栏以上**一律不铺** —— 之前那层从输入栏顶边往上羽化的带子，
+                 * 会把正在读的那行字从中间洗掉，比硬边还难看。正文应该一直清晰到
+                 * 输入栏的边，然后被输入栏自己盖住。
+                 */
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .fillMaxWidth()
+                            .height(BottomFadeHeight)
+                            .background(
+                                Brush.verticalGradient(
+                                    /*
+                                     * 起点不透明 0 而是 0.28，末段再收满：
+                                     * 两段线性的渐变在中间那一段太"透"，正文走到这里
+                                     * 会有半截字一直若隐若现。加中间站之后是**越往下越实**，
+                                     * 而不是"忽然开始变淡"。
+                                     */
+                                    colorStops = arrayOf(
+                                        0f to colors.pageBackground.copy(alpha = 0f),
+                                        0.35f to colors.pageBackground.copy(alpha = 0.28f),
+                                        0.68f to colors.pageBackground.copy(alpha = 0.68f),
+                                        1f to colors.pageBackground,
+                                    ),
                                 ),
                             ),
-                        ),
-                )
+                    )
             }
+        }
 
-            Column(
+        excerpt?.let { snapshot ->
+            MessageShareTools(shareSelection, emptyList(), snapshot.title, excerpt = snapshot,
+                onCloseExcerpt = { excerpt = null })
+        }
+        val composer: @Composable () -> Unit = {
+            if (shareSelection.active) {
+                MessageShareTools(shareSelection, shareGroups, vm.conversationTitle(),
+                    modifier = Modifier.fillMaxWidth())
+            } else Column(
                 modifier = Modifier
-                    .align(Alignment.BottomCenter)
                     .fillMaxWidth()
-                    // 先量高度再让位：消息列表的底部留白要跟它一致
-                    .onSizeChanged { inputAreaHeight = it.height }
                     .navigationBarsPadding()
                     .imePadding(),
             ) {
+                vm.retrySkipNotice?.let { notice ->
+                    BannerBar(notice, vm::dismissRetrySkipNotice, vm::muteRetrySkipNotice)
+                }
                 vm.imageSkipNotice?.let { message ->
                     BannerBar(message = message, onDismiss = vm::dismissImageSkipNotice,
                         onNeverRemind = vm::neverRemindImageSkip)
@@ -1405,112 +1449,235 @@ fun ChatScreen(
                 attachError?.let { message ->
                     BannerBar(message = message, onDismiss = { attachError = null })
                 }
+                if (fileUploads > 0) Row(verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                    CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Text(stringResource(R.string.service_uploading), modifier = Modifier.padding(start = 8.dp),
+                        style = MaterialTheme.typography.labelMedium)
+                }
 
                 speechError?.let { message ->
                     BannerBar(message = message, onDismiss = { speechError = null })
                 }
 
                 // 待发送附件排在输入栏**上面**：先看到"我挂了什么"，再看到输入框
-                PendingAttachmentsRow(
+                if (!imageMode) PendingAttachmentsRow(
                     attachments = pending,
                     onRemove = { spec -> pending = pending - spec },
-                    onOpen = { spec -> viewingImage = pending.filter { it.isImage } to spec },
+                    onOpen = { spec ->
+                        val images = pending.filter { it.isImage }
+                        viewingImage = Triple(images, spec, images.indexOf(spec))
+                    },
                 )
 
+                fun submitComposer() {
+                    val draftKey = composerOwner ?: return
+                    if (draftKey != vm.currentConversationId.orEmpty()) return
+                    val target = editingMessage
+                    val attached = pending
+                    val submitted = inputState.text.toString()
+                    val clearPersistedInput = {
+                        // Clear only the submitted draft, after the message transaction committed.
+                        if (composerOwner == draftKey && editingMessage?.id == target?.id &&
+                            inputState.text.toString() == submitted && pending == attached
+                        ) {
+                            composerExpanded = false
+                            if (target != null) {
+                                cancelEdit()
+                            } else {
+                                replaceInput("")
+                                pending = emptyList()
+                                draftScope.launch { vm.clearDraft(draftKey) }
+                            }
+                            dismissInput()
+                        }
+                    }
+
+                    // Unsupported attachments are filtered for this turn; keep the text turn alive.
+                    /*
+                     * 主动发消息 = "我要看新内容"：清掉"已离开底部"标记。
+                     *
+                     * ⚠️ **这里不能直接 `scrollToBottom()`** —— 消息是异步落库的，
+                     * 滚动发出时它还没进列表，下标 0 还是上一条回复；等它进来时
+                     * 下标整体后移，Compose 又按 key 把原条目钉住，于是人停在上条
+                     * 回复的结尾（实测就是这个 bug）。
+                     * 交给上面那个"条数变化才滚"的 effect —— 等它真的进列表再滚。
+                     */
+                    resumeFollowing()
+                    if (target != null) {
+                        // 输入栏的发送键就是「保存并发送」，不再让用户做二次选择
+                        requestResend(target, submitted, attached, clearPersistedInput)
+                    } else {
+                        vm.send(submitted, attached, clearPersistedInput)
+                    }
+                }
+
+                val imageRoute = vm.attachmentSettings
+                val imageConfig = imageRoute.imageGenApi
+                val showImageEntry = imageConfig.enabled || imageConfig.nativeResponsesEnabled
+                val imageModels = if (imageMode) {
+                    if (imageConfig.enabled) {
+                        val matchingCatalog = runCatching { imageConfig.connectionBase(imageRoute.baseUrl) }.getOrNull() == imageConfig.modelCatalogBase
+                        (listOf(imageConfig.modelId) + imageConfig.modelIds.takeIf { matchingCatalog }.orEmpty())
+                            .filter { it.isNotBlank() }.distinct().map { it to it }
+                    } else {
+                        (listOf(vm.settings.model) + vm.models).distinctBy { it.id }
+                            .filter { imageRoute.nativeImageAdapter(it.id) != null }
+                            .map { it.id to it.displayName }
+                    }
+                } else emptyList()
+                val imageModel = imageModels.firstOrNull { it.first == pickedImageModel } ?: imageModels.firstOrNull()
+                val imageAdapter = if (imageConfig.enabled) imageConfig.adapter else imageModel?.let { imageRoute.nativeImageAdapter(it.first) }
+                val imageRatios = imageAspectRatios(imageAdapter, imageModel?.first)
+                val imageReferences = referenceImages[composerKey].orEmpty()
+                if (imageMode) PendingAttachmentsRow(
+                    attachments = imageReferences,
+                    onRemove = { referenceImages[composerKey] = imageReferences - it },
+                    onOpen = { viewingImage = Triple(imageReferences, it, imageReferences.indexOf(it)) },
+                )
+                val canSubmitImage = imageModel != null && (imageConfig.enabled || imageRoute.hasKey)
+                fun submitImage(prompt: String) {
+                    val owner = composerOwner ?: return
+                    if (owner != composerKey || !canSubmitImage || prompt.isBlank()) return
+                    val ratio = imageAspectRatio?.takeIf { it in imageRatios }
+                    resumeFollowing()
+                    vm.generateImage(prompt, requestedAspectRatio = ratio, references = imageReferences,
+                        requestedModelId = imageModel?.first) {
+                        if (referenceImages[owner].orEmpty() == imageReferences) referenceImages.remove(owner)
+                        if (imagePromptByConversation[owner] == prompt) imagePromptByConversation.remove(owner)
+                        if (composerOwner == owner && imageFieldState.text.toString() == prompt) {
+                            imageFieldState.setTextAndPlaceCursorAtEnd("")
+                            composerExpanded = false
+                            imageMode = false
+                            dismissInput()
+                        }
+                    }
+                }
+
+                val canUseVoice = !vm.isStreaming && (if (imageMode) canSubmitImage else editingMessage == null) &&
+                    composerOwner == composerKey && (officialAsr != null || voice.state.systemAvailable)
+                fun startVoice(tapMode: Boolean): Boolean {
+                    val imageVoice = imageMode
+                    val field = if (imageVoice) imageFieldState else inputState
+                    if (!canUseVoice || field.text.isNotEmpty() || voice.state.active) return false
+                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
+                        PackageManager.PERMISSION_GRANTED
+                    ) {
+                        microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
+                        return false
+                    }
+                    val owner = composerKey
+                    speechError = null
+                    val started = voice.start(officialAsr, onResult = { transcript ->
+                        voiceTapMode = false
+                        if (owner == vm.currentConversationId.orEmpty() && composerOwner == owner &&
+                            imageMode == imageVoice && field.text.isEmpty() && (imageVoice || editingMessage == null)
+                        ) {
+                            if (imageVoice) {
+                                field.setTextAndPlaceCursorAtEnd(transcript)
+                                submitImage(transcript)
+                            } else {
+                                replaceInput(transcript)
+                                submitComposer()
+                            }
+                        }
+                    }, onError = {
+                        voiceTapMode = false
+                        speechError = it
+                    })
+                    if (started) {
+                        voiceTapMode = tapMode
+                        dismissInput()
+                        panel = InputPanelState.NONE
+                    }
+                    return started
+                }
+
                 InputBar(
-                    text = input,
-                    onTextChange = {
-                        input = it
-                        if (panel != InputPanelState.NONE) panel = InputPanelState.NONE
+                    fieldState = if (imageMode) imageFieldState else inputState,
+                    imageMode = imageMode,
+                    sendAllowed = !imageMode || canSubmitImage,
+                    imageControls = {
+                        CapsuleButton(
+                            text = imageModel?.second ?: stringResource(R.string.image_api_pick_model),
+                            modifier = Modifier.weight(1f, fill = false),
+                            trailingIcon = AppIcons.ChevronDown,
+                            selected = panel == InputPanelState.IMAGE_MODELS,
+                            onClick = { openPanel(InputPanelState.IMAGE_MODELS) },
+                        )
+                        CapsuleButton(
+                            text = imageAspectRatio?.takeIf { it in imageRatios } ?: stringResource(R.string.image_aspect_ratio_label),
+                            trailingIcon = AppIcons.ChevronDown,
+                            selected = panel == InputPanelState.IMAGE_RATIOS,
+                            enabled = imageRatios.isNotEmpty(),
+                            onClick = { openPanel(InputPanelState.IMAGE_RATIOS) },
+                        )
                     },
-                    editingLabel = if (editingMessage != null) stringResource(R.string.msg_edit_input) else null,
-                    onCancelEdit = { cancelEdit() },
+                    expanded = composerExpanded,
+                    onToggleExpanded = if (composerOwner == composerKey) {
+                        {
+                            panel = InputPanelState.NONE
+                            textSelection.dismiss()
+                            composerExpanded = !composerExpanded
+                        }
+                    } else null,
+                    editingLabel = when {
+                        imageMode -> stringResource(R.string.image_generate_title)
+                        editingMessage != null -> stringResource(R.string.msg_edit_input)
+                        else -> null
+                    },
+                    onCancelEdit = {
+                        if (imageMode) {
+                            voice.cancel()
+                            voiceTapMode = false
+                            voiceCancelling = false
+                            imageMode = false
+                            panel = InputPanelState.NONE
+                        } else cancelEdit()
+                    },
                     // 面板展开时输入栏投影淡出，两块合看成一体
                     panelExpanded = panel != InputPanelState.NONE,
                     contextStats = vm.contextStats,
                     statsPanelOpen = panel == InputPanelState.STATS,
                     onOpenStatsPanel = { openPanel(InputPanelState.STATS) },
-                    /*
-                     * 语音输入：**暂时整体下线**（见 `VoiceInputEnabled`）。
-                     *
-                     * 开关关着时这里一律传 false —— 内部逻辑（识别回调、上滑取消、
-                     * 松手即发）全部保留，重新开启只需把常量改回 true，
-                     * 不用再翻一遍这里。
-                     */
-                    showVoice = VoiceInputEnabled && voice.state.available,
-                    voiceListening = voice.state.listening,
-                    onToggleVoice = { if (VoiceInputEnabled) toggleVoice() },
-                    holdToTalkEnabled = VoiceInputEnabled && voice.state.available && hasMicrophonePermission,
-                    onVoiceHoldStart = {
-                        voiceBase = input
-                        voice.start()
+                    holdToTalkEnabled = canUseVoice && vm.holdToTalk,
+                    voiceState = voice.state,
+                    voiceLevel = { voice.level },
+                    voiceSourceLabel = stringResource(
+                        if (officialAsr != null) R.string.voice_source_official else R.string.voice_source_system,
+                    ),
+                    voiceCancelling = voiceCancelling,
+                    voiceTapMode = voiceTapMode,
+                    onVoiceHoldStart = { startVoice(tapMode = false) },
+                    onVoiceHoldFinish = { send -> if (send) voice.finish() else voice.cancel() },
+                    onVoiceSlide = { cancelling ->
+                        voiceCancelling = cancelling
+                        if (cancelling && voice.state.holding) {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        }
                     },
-                    onVoiceHoldEnd = {
-                        // 松手：结束录音，并标记「识别完就发」
-                        sendAfterVoice = true
-                        voice.stop()
-                    },
-                    onVoiceHoldCancel = {
-                        sendAfterVoice = false
-                        voice.cancel()
-                    },
-                    sendSignal = voiceSendSignal,
-                    thinkingEnabled = vm.settings.thinkingEnabled,
+                    onVoiceTap = { if (voiceTapMode) voice.finish() else startVoice(tapMode = true) },
+                    thinkingEnabled = vm.settings.thinkingEnabled || vm.defaultThinkingActive,
                     // 搜索也在这个面板里，开着就算激活（见 InputBar 的说明）
-                    webSearchEnabled = vm.supportsWebSearch && vm.webSearch,
+                    webSearchEnabled = vm.automaticWebSearch || (vm.supportsWebSearch && vm.webSearch),
                     thinkingPanelOpen = panel == InputPanelState.THINKING,
                     onOpenThinkingPanel = { openPanel(InputPanelState.THINKING) },
                     settingsPanelOpen = panel == InputPanelState.SETTINGS,
                     onOpenSettingsPanel = { openPanel(InputPanelState.SETTINGS) },
                     streaming = vm.isStreaming,
-                    onSend = {
-                        val target = editingMessage
-                        val attached = pending
-                        val submitted = input
-                        val draftKey = composerOwner
-                        val clearPersistedInput = {
-                            // Clear only the submitted draft, after the message transaction committed.
-                            if (input == submitted && pending == attached) {
-                                input = ""
-                                pending = emptyList()
-                                editingMessage = null
-                                draftScope.launch { draftKey?.let { vm.clearDraft(it) } }
-                                dismissInput()
-                            }
-                        }
-
-                        /*
-                         * 模型不支持识图时**在这里拦住**，而不是让请求打到服务端换回 400。
-                         * 400 的原文（如 "image_url is not supported"）对用户没有指导意义，
-                         * 这里能直接告诉他"换个模型"。
-                         */
-                        if (attached.any { it.isImage } && !vm.settings.model.supportsVision) {
-                            attachError = Res.get(R.string.chat_vision_unsupported, vm.settings.model.displayName)
-                        } else {
-                            /*
-                             * 主动发消息 = "我要看新内容"：清掉"已离开底部"标记。
-                             *
-                             * ⚠️ **这里不能直接 `scrollToBottom()`** —— 消息是异步落库的，
-                             * 滚动发出时它还没进列表，下标 0 还是上一条回复；等它进来时
-                             * 下标整体后移，Compose 又按 key 把原条目钉住，于是人停在上条
-                             * 回复的结尾（实测就是这个 bug）。
-                             * 交给上面那个"条数变化才滚"的 effect —— 等它真的进列表再滚。
-                             */
-                            resumeFollowing()
-                            if (target != null) {
-                                // 输入栏的发送键就是「保存并发送」，不再让用户做二次选择
-                                requestResend(target, submitted, attached, clearPersistedInput)
-                            } else {
-                                vm.send(submitted, attached, clearPersistedInput)
-                            }
-                        }
-                    },
+                    onSend = { if (imageMode) submitImage(imageFieldState.text.toString()) else submitComposer() },
                     onStop = { vm.stop() },
                     // ⊕ 真的能用了：展开与其它面板同一个容器（浮在输入栏上方的卡片）
-                    canAttach = true,
-                    onAttachClick = { openPanel(InputPanelState.ATTACH) },
+                    canAttach = !imageMode || imageReferences.size < 3,
+                    onAttachClick = {
+                        if (imageMode) {
+                            referencePickerOwner = composerKey
+                            panel = InputPanelState.NONE
+                            referencePicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                        } else openPanel(InputPanelState.ATTACH)
+                    },
                     attachPanelOpen = panel == InputPanelState.ATTACH,
-                    pendingCount = pending.size,
+                    pendingCount = if (imageMode) 0 else pending.size,
                     onTextFieldFocused = { panel = InputPanelState.NONE },
                 )
 
@@ -1539,6 +1706,39 @@ fun ChatScreen(
                             panel = InputPanelState.NONE
                             pickFile()
                         },
+                        onGenerateImage = if (showImageEntry) ({
+                            panel = InputPanelState.NONE
+                            textSelection.dismiss()
+                            if (imageFieldState.text.isBlank() && editingMessage == null && inputState.text.isNotBlank()) {
+                                imageFieldState.setTextAndPlaceCursorAtEnd(inputState.text.toString())
+                            }
+                            imageMode = true
+                        }) else null,
+                    )
+                }
+
+                InputPanel(imageMode && panel == InputPanelState.IMAGE_MODELS, Modifier.padding(top = 10.dp)) {
+                    ImageOptionRows(
+                        title = stringResource(R.string.image_api_pick_model),
+                        options = imageModels,
+                        selected = imageModel?.first,
+                        onSelect = { pickedImageModel = it; panel = InputPanelState.NONE },
+                    )
+                    if (imageConfig.enabled || imageModels.isEmpty()) {
+                        CapsuleButton(
+                            stringResource(R.string.image_configure),
+                            onClick = onConfigureImageApi,
+                            modifier = Modifier.padding(start = 10.dp, end = 10.dp, top = 8.dp),
+                        )
+                    }
+                }
+                InputPanel(imageMode && panel == InputPanelState.IMAGE_RATIOS, Modifier.padding(top = 10.dp)) {
+                    ImageOptionRows(
+                        title = stringResource(R.string.image_aspect_ratio_label),
+                        options = listOf("" to stringResource(R.string.image_size_default)) + imageRatios.map { it to it },
+                        selected = imageAspectRatio?.takeIf { it in imageRatios }.orEmpty(),
+                        showAspectRatioIcons = true,
+                        onSelect = { imageAspectRatio = it.ifEmpty { null }; panel = InputPanelState.NONE },
                     )
                 }
 
@@ -1556,7 +1756,11 @@ fun ChatScreen(
                         hint = vm.modelHint,
                         showWebSearch = vm.supportsWebSearch,
                         webSearchEnabled = vm.webSearch,
+                        automaticWebSearch = vm.automaticWebSearch,
+                        onConfigureApi = { panel = InputPanelState.NONE; onConfigureApi() },
                         onToggleWebSearch = { vm.toggleWebSearch() },
+                        supportsExplicitThinkingOff = vm.apiStyle == ApiStyle.ANTHROPIC &&
+                            com.simplechat.app.net.claudeAdaptiveModel(vm.settings.model.id)?.canDisableThinking != false,
                     )
                 }
 
@@ -1568,9 +1772,10 @@ fun ChatScreen(
                     ContextPanelContent(
                         stats = vm.contextStats,
                         usage = vm.lastUsage,
+                        showUsageCost = com.simplechat.app.net.isOfficialDeepSeekEndpoint(vm.attachmentSettings.baseUrl),
                         compaction = vm.compaction,
                         compacting = vm.compacting,
-                        compactPreview = vm.compactPreview,
+                        compactionStatus = vm.compactionStatus,
                         onCompact = { vm.compactContext() },
                         onCancelCompact = { vm.cancelCompaction() },
                         onClearCompaction = { vm.clearCompaction() },
@@ -1585,6 +1790,8 @@ fun ChatScreen(
                 ) {
                     ConversationSettingsPanelContent(
                         settings = vm.settings,
+                        officialPro = vm.settings.model.id == com.simplechat.app.net.DEEPSEEK_PRO &&
+                            com.simplechat.app.net.isOfficialDeepSeekEndpoint(vm.attachmentSettings.baseUrl),
                         onSettingsChange = { vm.updateSettings(it) },
                         presets = vm.presets,
                         conversationId = vm.currentConversationId,
@@ -1617,6 +1824,9 @@ fun ChatScreen(
                 Spacer(Modifier.size(8.dp))
             }
 
+        }
+
+        val overlay: @Composable () -> Unit = {
             /*
              * 消息索引（§34）—— **盖在最上面**：索引开着的时候输入栏、回到底部、
              * 面板统统按不动，用户就是在找路。点遮罩即收。
@@ -1646,8 +1856,39 @@ fun ChatScreen(
                 modifier = Modifier.fillMaxSize(),
             )
         }
+        Layout(
+            modifier = Modifier
+                .weight(1f)
+                .then(if (shareSelection.active) Modifier else Modifier.messageIndexDrag(messageIndex)),
+            contents = listOf(backdrop, composer, overlay),
+        ) { (backdrop, composer, overlay), constraints ->
+            val input = composer.single().measure(constraints.copy(minHeight = 0))
+            val height = input.height
+            val previousHeight = Snapshot.withoutReadObservation {
+                inputAreaHeight.value
+            }
+            if (height != previousHeight) {
+                // Reserve space and preserve the old bottom anchor in the same measure pass.
+                // A reader who scrolled up keeps the visible message anchored to the top.
+                Snapshot.withoutReadObservation {
+                    if (height > previousHeight && previousHeight > 0 && !detached &&
+                        vm.searchTarget == null && !vm.switching && !switchingConversation &&
+                        listState.isAtBottom()
+                    ) {
+                        listState.advanceBottomForObstruction(height - previousHeight)
+                    }
+                }
+                inputAreaHeight.value = height
+            }
+            val background = backdrop.single().measure(constraints)
+            val foreground = overlay.single().measure(constraints)
+            layout(background.width, background.height) {
+                background.placeRelative(0, 0)
+                input.placeRelative(0, background.height - height)
+                foreground.placeRelative(0, 0)
+            }
+        }
     }
-
     // ── AI 回复编辑：只有这一处需要区分「保存」与「保存并发送」────
 
     aiEditTarget?.let { target ->
@@ -1670,10 +1911,11 @@ fun ChatScreen(
 
     // ── 图片放大查看 ──────────────────────────────────────
 
-    viewingImage?.let { (all, one) ->
+    viewingImage?.let { (all, one, index) ->
         AttachmentViewerDialog(
             images = all,
             initial = one,
+            initialIndex = index,
             onDismiss = { viewingImage = null },
         )
     }
@@ -1867,6 +2109,5 @@ internal fun BannerBar(message: String, onDismiss: () -> Unit, onNeverRemind: ((
         )
     }
 }
-
 
 

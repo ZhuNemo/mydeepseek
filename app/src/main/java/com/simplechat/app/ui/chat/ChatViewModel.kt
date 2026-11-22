@@ -1,11 +1,9 @@
 package com.simplechat.app.ui.chat
 
+import android.os.SystemClock
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
-import java.time.LocalDateTime
-import java.time.format.DateTimeFormatter
-import java.util.Locale
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -17,13 +15,18 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import com.simplechat.app.R
 import com.simplechat.app.data.ApiKey
 import com.simplechat.app.data.BackgroundGeneration
+import com.simplechat.app.data.ImageRequest
 import com.simplechat.app.data.Attachment
 import com.simplechat.app.data.ChatRepository
-import com.simplechat.app.ui.markdown.MarkdownInitialBlocks
+import com.simplechat.app.data.Diagnostics
+import com.simplechat.app.data.CompactionCheckpoint
+import com.simplechat.app.data.compactionFingerprint
 import com.simplechat.app.ui.markdown.warmMarkdownCache
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import com.simplechat.app.data.Res
+import com.simplechat.app.data.nativeImageAdapter
+import com.simplechat.app.data.imageAspectRatios
+import com.simplechat.app.data.imageSizeForRatio
 import com.simplechat.app.data.SettingsStore
 import com.simplechat.app.data.StoredSettings
 import com.simplechat.app.data.TITLE_MATERIAL_CHARS
@@ -38,6 +41,10 @@ import com.simplechat.app.data.userMessage
 import com.simplechat.app.db.CompactionEntity
 import com.simplechat.app.db.DraftEntity
 import com.simplechat.app.net.ChatApi
+import com.simplechat.app.net.ImageGenerationApi
+import com.simplechat.app.net.RemoteModelMetadata
+import com.simplechat.app.net.ModelCapabilityOverride
+import com.simplechat.app.net.DeepSeekAsr
 import com.simplechat.app.net.DeepSeekTts
 import com.simplechat.app.net.ApiStyle
 import com.simplechat.app.net.MessageContent
@@ -52,6 +59,7 @@ import com.simplechat.app.net.headersFor
 import com.simplechat.app.net.isOfficialDeepSeekEndpoint
 import com.simplechat.app.net.serverErrorText
 import java.util.UUID
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
@@ -64,6 +72,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
+import com.simplechat.app.net.ImageToolCall
+import com.simplechat.app.net.requestsImageGeneration
 
 /**
  * 对话状态与流式调度。
@@ -79,22 +89,6 @@ import kotlinx.coroutines.sync.Mutex
  *   （≈ 一帧一次，对齐官方 demo 的 rAF 节拍），避免每个 token 都触发列表重组（§8）。
  * - **不发送 `reasoning_content`**：本期不带 `tools`，官方明确无需回传（§11.1）。
  */
-/** 换会话时后台预热的尾部消息条数：贴底打开先看到的就是这几条。 */
-private const val WarmTailMessages = 10
-
-/**
- * 预热的总字符预算。
- *
- * 从尾部往前累计，到量就停。这条预算的意义是**给"打开"设一个上限**：
- * 后台解析约 1–2 秒的量，再多就只是在拖慢打开动画，而多出来的那几条
- * 本来也还没进视口。
- *
- * ⚠️ 早先这里是一条**单条长度上限**（超过 2.4 万字就整条不预热），
- * 那条规则把超长消息推到了主线程上：首帧冷缓存同步解析 → 卡死 → ANR。
- * 现在超长消息也预热，只是每条只预热首帧要用的块数（见 `warmMarkdownCache`）。
- */
-private const val WarmBudgetChars = 120_000
-
 class ChatViewModel(
     private val chatApi: ChatApi,
     private val settingsStore: SettingsStore,
@@ -103,6 +97,15 @@ class ChatViewModel(
 ) : ViewModel() {
 
     val messages = mutableStateListOf<UiMessage>()
+    internal val imageDrafts = mutableMapOf<String, String>()
+
+    private var loadingLabel by mutableStateOf<Pair<String, String>?>(null)
+
+    internal var loadingWordsUseThemeColor by mutableStateOf(false)
+        private set
+
+    internal fun loadingLabelFor(messageId: String): String? =
+        loadingLabel?.takeIf { it.first == messageId }?.second
 
     /** 当前会话 id；为空表示尚未落库的新对话。 */
     var currentConversationId by mutableStateOf<String?>(null)
@@ -125,6 +128,12 @@ class ChatViewModel(
      * [ensureConversation] 建会话时一并用上。
      */
     private var pendingTitle: String? = null
+    /*
+     * 跨对话记忆**不在本仓库**（按需求排除）。上游这一整套（检索 + 注入 +
+     * 每会话开关）已经删干净；`conversations.memoryEnabled` 这一列作为
+     * schema 的一部分保留（删列要重建带级联外键的表，见 Entities 的注释），
+     * 但没有任何读取方 —— 它的默认值是 1，永远不起作用。
+     */
 
     init {
         viewModelScope.launch {
@@ -166,12 +175,11 @@ class ChatViewModel(
 
     var compacting by mutableStateOf(false)
         private set
-
-    /** 压缩过程中的流式预览，让用户看到"它在写什么"。 */
-    var compactPreview by mutableStateOf("")
+    var compactionStatus by mutableStateOf<String?>(null)
         private set
 
     private var compactJob: Job? = null
+    private var compactGeneration = 0L
 
     var presets by mutableStateOf<List<Preset>>(emptyList())
         private set
@@ -191,6 +199,16 @@ class ChatViewModel(
     private var showImageSkipNotice = true
     private var skippedNoVision = 0
     private var skippedUnreadable = 0
+    private var skippedUnsupportedFiles = 0
+
+    var retrySkipNotice by mutableStateOf<String?>(null)
+        private set
+
+    fun dismissRetrySkipNotice() { retrySkipNotice = null }
+    fun muteRetrySkipNotice() {
+        dismissRetrySkipNotice()
+        viewModelScope.launch { settingsStore.muteRetrySkipNotice() }
+    }
 
     fun dismissImageSkipNotice() { imageSkipNotice = null }
     fun neverRemindImageSkip() {
@@ -209,6 +227,16 @@ class ChatViewModel(
     var banner by mutableStateOf<String?>(null)
         private set
 
+    /**
+     * 从别处（抽屉里的重命名 / 置顶 / 删除）投递一条全局提示。
+     *
+     * 复用对话页这条 banner，而不是再造一个 Snackbar 宿主：这两类提示的
+     * 呈现位置、时长、关闭方式本来就该一致，多一套只会多一种"提示长得不一样"。
+     */
+    fun showBanner(text: String) {
+        banner = text
+    }
+
     var models by mutableStateOf(ModelCatalog.knownModels(ProviderKind.DEEPSEEK))
         private set
 
@@ -220,6 +248,8 @@ class ChatViewModel(
      */
     var ttsVoiceName by mutableStateOf("")
         private set
+
+    val readAloudEnabled: Boolean get() = stored.readAloudEnabled
 
     var autoReadAloud by mutableStateOf(false)
         private set
@@ -250,6 +280,9 @@ class ChatViewModel(
     var officialTts by mutableStateOf<DeepSeekTts.Config?>(null)
         private set
 
+    internal var officialAsr by mutableStateOf<DeepSeekAsr.Config?>(null)
+        private set
+
     /**
      * 实际生效的协议通道。
      *
@@ -257,6 +290,18 @@ class ChatViewModel(
      * `AUTO` 时 DeepSeek 官方走扩展通道（能拿到搜索 / 引用 / 服务端标题），
      * 其余端点走 OpenAI 兼容。
      */
+    val defaultThinkingActive: Boolean
+        get() {
+            val model = settings.model
+            if (!model.supportsThinking) return false
+            if (apiStyle == ApiStyle.ANTHROPIC) return com.simplechat.app.net.claudeAdaptiveModel(model.id)?.canDisableThinking == false
+            return model.reasoningWire == com.simplechat.app.net.ReasoningWire.EFFORT &&
+                model.effortLevels?.none { it in com.simplechat.app.net.ReasoningWire.offLevels } == true
+        }
+
+    val supportsContinuation: Boolean
+        get() = apiStyle == ApiStyle.ANTHROPIC && com.simplechat.app.net.claudeAdaptiveModel(settings.model.id) == null
+
     var apiStyle by mutableStateOf(ApiStyle.ANTHROPIC)
         private set
 
@@ -266,7 +311,10 @@ class ChatViewModel(
      * 搜索走的是扩展通道的工具（`deepseek_web_search`），OpenAI 兼容通道没有等价入口。
      * 所以通道不支持时干脆不显示，而不是留一个按下去什么都不发生的开关。
      */
-    val supportsWebSearch: Boolean get() = apiStyle == ApiStyle.ANTHROPIC
+    val automaticWebSearch: Boolean get() = com.simplechat.app.net.usesAutomaticOpenAiSearch(settings.model.id, apiStyle)
+    val supportsWebSearch: Boolean get() = automaticWebSearch || attachmentSettings.supportsWebSearch ||
+        com.simplechat.app.net.supportsOpenAiSearchTool(attachmentSettings.baseUrl, settings.model.id, apiStyle)
+    val attachmentSettings: StoredSettings get() = stored.copy(modelId = settings.model.id)
 
     /** 智能搜索开关：这一轮要不要向服务端声明 `deepseek_web_search`。 */
     var webSearch by mutableStateOf(false)
@@ -282,6 +330,10 @@ class ChatViewModel(
     var autoCollapseThinking by mutableStateOf(true)
         private set
 
+    /** 长按输入框开始语音输入（设置页可关）。 */
+    var holdToTalk by mutableStateOf(true)
+        private set
+
     /**
      * 已经向服务端要过标题的会话。
      *
@@ -293,7 +345,7 @@ class ChatViewModel(
     /** 切换智能搜索（输入栏那个开关）。立即落库，下次启动保持。 */
     fun toggleWebSearch() {
         // 通道不支持时不该有入口；这里再挡一道，避免其它路径把它打开
-        if (!supportsWebSearch) return
+        if (!supportsWebSearch || automaticWebSearch) return
         val next = !webSearch
         webSearch = next
         viewModelScope.launch { settingsStore.setWebSearch(next) }
@@ -307,6 +359,7 @@ class ChatViewModel(
 
     private var streamJob: Job? = null
     private var streamGeneration = 0L
+    private val imageGenerationApi = ImageGenerationApi()
 
     /** 会话切换任务；`send()` 会等它完成，避免把消息插进半成品列表。 */
     private var switchJob: Job? = null
@@ -332,7 +385,7 @@ class ChatViewModel(
     private var switchGeneration = 0
 
     private var stoppedByUser = false
-    private var stored: StoredSettings = StoredSettings()
+    private var stored by mutableStateOf(StoredSettings())
     private var previousProviderKind: ProviderKind? = null
 
     /** 上一次见到的端点，用来判断"模型列表该不该作废 / 换一份"。 */
@@ -340,9 +393,9 @@ class ChatViewModel(
 
     /** 上一次见到的远端模型列表（落库的那份），同理只用来比较。 */
     private var previousModelIds: List<String> = emptyList()
-
-    /** 流式 checkpoint 的节流计时。 */
-    private var lastCheckpointAt = 0L
+    private var previousModelContextWindows: Map<String, Int> = emptyMap()
+    private var previousModelMetadata: Map<String, RemoteModelMetadata> = emptyMap()
+    private var previousModelOverrides: Map<String, ModelCapabilityOverride> = emptyMap()
 
     private val providerKind: ProviderKind
         get() = runCatching { ProviderKind.valueOf(stored.providerId) }
@@ -371,10 +424,12 @@ class ChatViewModel(
          * 放在前面会读到还没赋值的委托（真机表现为启动即 NPE）。
          */
         viewModelScope.launch {
+            var weights = emptyMap<String, MessageWeight>()
             snapshotFlow { StatsInput(messages.toList(), settings, presets, compaction) }
                 .collectLatest { input ->
                     delay(ContextStatsDebounceMs)
-                    val stats = withContext(Dispatchers.Default) { computeContextStats(input) }
+                    val (stats, currentWeights) = withContext(Dispatchers.Default) { computeContextStats(input, weights) }
+                    weights = currentWeights
                     contextStats = stats
                 }
         }
@@ -403,28 +458,36 @@ class ChatViewModel(
          * 一进设置、或重启一次，列表就空了。
          */
         val endpointChanged = kind != previousProviderKind || value.baseUrl != previousBaseUrl
-        if (endpointChanged || value.modelIds != previousModelIds) {
+        if (endpointChanged || value.modelIds != previousModelIds || value.modelContextWindows != previousModelContextWindows ||
+            value.modelMetadata != previousModelMetadata || value.modelOverrides != previousModelOverrides) {
             previousProviderKind = kind
             previousBaseUrl = value.baseUrl
             previousModelIds = value.modelIds
-            models = ModelCatalog.pickerModels(kind, value.modelIds)
+            previousModelContextWindows = value.modelContextWindows
+            previousModelMetadata = value.modelMetadata
+            previousModelOverrides = value.modelOverrides
+            models = ModelCatalog.pickerModels(kind, value.modelIds, value.modelContextWindows,
+                value.modelMetadata, value.modelOverrides)
             // 端点换了，上一轮的"已拉取 N 个"不再成立；只是列表更新则保留提示
             if (endpointChanged) modelHint = null
         }
         apiStyle = ApiStyle.resolve(kind, value.apiStyleId, value.baseUrl)
         webSearch = value.webSearch
         autoCollapseThinking = value.autoCollapseThinking
+        holdToTalk = value.holdToTalk
+        loadingWordsUseThemeColor = value.loadingWordsUseThemeColor
         ttsVoiceName = value.ttsVoiceName
         autoReadAloud = value.autoReadAloud
         showImageSkipNotice = value.showImageSkipNotice
         if (!showImageSkipNotice) imageSkipNotice = null
+        officialAsr = DeepSeekAsr.configFor(value.providerId, value.baseUrl, value.apiKey)
         officialTts = if (DeepSeekTts.isOfficialTtsVoiceAvailable(value.providerId, value.apiKey)) {
             DeepSeekTts.Config(value.apiKey)
         } else {
             null
         }
         settings = settings.copy(
-            model = ModelCatalog.find(kind, value.modelId),
+            model = ModelCatalog.find(kind, value.modelId, value.modelContextWindows, value.modelMetadata, value.modelOverrides),
             reasoningLevel = runCatching { ReasoningLevel.valueOf(value.reasoningLevelId) }
                 .getOrDefault(ReasoningLevel.OFF),
             temperature = value.temperature,
@@ -500,34 +563,11 @@ class ChatViewModel(
 
     fun dismissSearch() { searchTarget = null }
 
-    /**
-     * 从库里重新载入**当前**会话。
-     *
-     * 只为一件事存在：同步刚把这条会话换成了远端版本，内存里的消息树与库里
-     * 已经不是同一份 —— 继续在旧列表上追加，消息 id 与父链都会和库对不上。
-     *
-     * - 流式进行中**直接跳过**：正在写的那条只在内存里，重载会把半截回复抹掉
-     * - 不切标题、不显示切换态：会话没变，变的只是内容
-     */
-    fun refreshFromStorage() {
-        val id = currentConversationId ?: return
-        if (isStreaming) return
-        switchJob?.cancel()
-        val generation = ++switchGeneration
-        switchJob = viewModelScope.launch {
-            val loaded = repository.loadActivePath(id)
-            if (generation != switchGeneration) return@launch
-            messages.clear()
-            messages.addAll(loaded)
-            pathRevision++
-            compaction = repository.getCompactions(id).lastOrNull()
-        }
-    }
-
-    fun openConversation(id: String, targetMessageId: String? = null, query: String = "") {
+    fun openConversation(id: String, targetMessageId: String? = null, query: String = "", reasoningMatch: Boolean = false) {
         if (id == currentConversationId && targetMessageId == null) return
-        searchTarget = targetMessageId?.let { SearchTarget(it, query, ++searchRequest) }
+        searchTarget = targetMessageId?.let { SearchTarget(it, query, ++searchRequest, reasoningMatch = reasoningMatch) }
         imageSkipNotice = null
+        retrySkipNotice = null
         stop()
         cancelCompaction()
         switchJob?.cancel()
@@ -568,24 +608,9 @@ class ChatViewModel(
              * 再 publish 给界面。列表真正组合时只命中缓存，主线程保持空闲，
              * 转圈因此是顺的。
              */
-            withContext(Dispatchers.Default) {
-                /*
-                 * 从尾部往前预热，累计到 [WarmBudgetChars] 就停。
-                 *
-                 * ⚠️ 这里**不再按单条长度跳过**。跳过超长消息 = 把它留给主线程
-                 * 首帧冷解析，而那正是"点开超长对话卡死闪退"的成因。
-                 * 现在超长消息也预热，但只预热首帧窗口那几块
-                 * （[MarkdownInitialBlocks]，与 `MarkdownTextBlocks` 一致），
-                 * 更后面的块由渐进式渲染逐帧补齐。
-                 */
-                var budget = WarmBudgetChars
-                for (message in loaded.asReversed().take(WarmTailMessages)) {
-                    if (budget <= 0) break
-                    warmMarkdownCache(message.content, maxBlocks = MarkdownInitialBlocks)
-                    budget -= message.content.length
-                }
+            if (targetMessageId == null) withContext(Dispatchers.Default) {
+                for (body in historyPrewarmBodies(loaded, before = loaded.size)) warmMarkdownCache(body)
             }
-
 
             if (generation != switchGeneration) return@launch
 
@@ -647,6 +672,7 @@ class ChatViewModel(
         messages.clear()
         banner = null
         imageSkipNotice = null
+        retrySkipNotice = null
         switching = false
         settings = settings.copy(systemPrompt = "")
     }
@@ -696,13 +722,26 @@ class ChatViewModel(
     }
 
     /**
-     * 从别处（抽屉里的重命名 / 置顶 / 删除）投递一条全局提示。
+     * 从库里重读当前会话（云同步把远端版本拉下来之后调用）。
      *
-     * 复用对话页那条 banner，而不是再造一个 Snackbar 宿主：这两类提示的
-     * 呈现位置、时长、关闭方式本来就该一致，多一套只会多一种"提示长得不一样"。
+     * 与 [openConversation] 的区别：**不切会话、不动搜索目标、不重建状态机**，
+     * 只是把消息树换成库里最新的那一份。消息 id 可能整批换掉（远端是另一台设备
+     * 写的），所以 [pathRevision] 也要 +1 —— 否则界面上那些按 id 建的索引
+     * （消息跳转、复制、朗读）全部指向已经不存在的消息。
      */
-    fun showBanner(text: String) {
-        banner = text
+    fun refreshFromStorage() {
+        val id = currentConversationId ?: return
+        if (isStreaming) return
+        switchJob?.cancel()
+        val generation = ++switchGeneration
+        switchJob = viewModelScope.launch {
+            val loaded = repository.loadActivePath(id)
+            if (generation != switchGeneration) return@launch
+            messages.clear()
+            messages.addAll(loaded)
+            pathRevision++
+            compaction = repository.getCompactions(id).lastOrNull()
+        }
     }
 
     fun refreshModels() {
@@ -710,26 +749,46 @@ class ChatViewModel(
         refreshingModels = true
         modelHint = null
         val source = stored
+        val kind = runCatching { ProviderKind.valueOf(source.providerId) }.getOrDefault(ProviderKind.DEEPSEEK)
+        val profile = source.apiProfiles.firstOrNull { it.id == source.activeApiProfileId }
         viewModelScope.launch {
-            val result = chatApi.fetchModels(
-                baseUrl = source.baseUrl.ifBlank { providerKind.defaultBaseUrl },
-                apiKey = source.apiKey,
-            )
-            if (stored.activeApiProfileId != source.activeApiProfileId || stored.baseUrl != source.baseUrl) {
+            try {
+                val result = chatApi.fetchModelCatalog(
+                    baseUrl = source.baseUrl.ifBlank { kind.defaultBaseUrl },
+                    apiKey = if (kind.modelListNeedsAuth) source.apiKey else "",
+                    apiStyle = source.resolvedApiStyle,
+                )
+                if (stored.activeApiProfileId != source.activeApiProfileId || stored.baseUrl != source.baseUrl ||
+                    stored.providerId != source.providerId || stored.apiKey != source.apiKey || stored.apiStyleId != source.apiStyleId) {
+                    return@launch
+                }
+                result.onSuccess { catalog ->
+                    modelHint = Res.get(R.string.models_fetched, catalog.ids.size)
+                }
+                result.onFailure { error ->
+                    modelHint = Res.get(R.string.models_fetch_failed, error.userMessage()) +
+                        if (!stored.hasKey) Res.get(R.string.models_fetch_needs_key) else ""
+                }
+                // 落库：设置页的「模型」选择器读的是这份，重启后也还在
+                result.getOrNull()?.let { catalog ->
+                    settingsStore.updateApiProfile(source.activeApiProfileId) { current ->
+                        if (profile != null && current.baseUrl == profile.baseUrl && current.providerId == profile.providerId &&
+                            current.apiKeyEncrypted == profile.apiKeyEncrypted && current.apiStyleId == profile.apiStyleId) {
+                            current.copy(modelIds = catalog.ids, modelContextWindows = catalog.contextWindows, modelMetadata = catalog.metadata)
+                        } else current
+                    }
+                }
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                if (stored.activeApiProfileId == source.activeApiProfileId && stored.baseUrl == source.baseUrl &&
+                    stored.providerId == source.providerId && stored.apiKey == source.apiKey && stored.apiStyleId == source.apiStyleId) {
+                    modelHint = Res.get(R.string.models_fetch_failed, error.userMessage()) +
+                        if (!stored.hasKey) Res.get(R.string.models_fetch_needs_key) else ""
+                }
+            } finally {
                 refreshingModels = false
-                return@launch
             }
-            result.onSuccess { ids ->
-                models = ModelCatalog.pickerModels(providerKind, ids)
-                modelHint = Res.get(R.string.models_fetched, ids.size)
-            }
-            result.onFailure { error ->
-                modelHint = Res.get(R.string.models_fetch_failed, error.userMessage()) +
-                    if (!stored.hasKey) Res.get(R.string.models_fetch_needs_key) else ""
-            }
-            // 落库：设置页的「模型」选择器读的是这份，重启后也还在
-            result.getOrNull()?.let { settingsStore.setModelIds(it, source.activeApiProfileId, source.baseUrl) }
-            refreshingModels = false
         }
     }
 
@@ -755,6 +814,7 @@ class ChatViewModel(
             return
         }
 
+        if (compacting) cancelCompaction()
         banner = null
         imageSkipNotice = null
 
@@ -880,170 +940,212 @@ class ChatViewModel(
      *
      * 三件事刻意分开：
      * - **不删本地消息** —— 压缩只影响 `buildRequestMessages()` 里挑哪些发出去
-     * - **保留最近 [KEEP_RECENT] 条完整消息** —— 最近的对白是文风与语气的锚，
+     * - **通常保留最近 6 条完整消息** —— 最近的对白是文风与语气的锚，
      *   被摘要成"他们继续交谈"会立刻丢失质感
      * - **摘要可读可改** —— AI 记错人名地名时用户能直接修正（见 [updateCompactionSummary]）
      */
     fun compactContext() {
-        if (compacting || isStreaming) return
+        if (compacting || isStreaming || switching) return
         val conversationId = currentConversationId ?: return
-
-        val existing = validCompaction(messages, compaction)
-
-        /*
-         * **增量滚动压缩**：只总结上次摘要之后的新增部分。
-         *
-         * 每次从头重压一遍的话，早先的情节会被反复摘要 ——
-         * 信息每过一轮就衰减一次，几轮下来人名地名就开始漂。
-         */
-        val alreadyCovered = existing
-            ?.let { c -> messages.indexOfFirst { it.id == c.throughMessageId } }
-            ?: -1
-        val candidates = messages
-            .filterIndexed { index, _ -> index > alreadyCovered }
-            .filter { !it.streaming && it.content.isNotBlank() }
-
-        if (candidates.size <= KEEP_RECENT) {
-            banner = Res.get(R.string.compact_too_few)
-            return
-        }
-
-        // 保留最后 KEEP_RECENT 条；其余交给模型总结
-        var cutIndex = candidates.size - KEEP_RECENT
-
-        /*
-         * 切割点必须落在**用户消息**上，让保留下来的第一条是 user。
-         * 否则请求会出现"一个没有问题的回答"——服务端多半能接受，
-         * 但语义已经不对，模型容易顺着自说自话。
-         */
-        while (cutIndex > 0 && candidates[cutIndex].role != MessageRole.USER) {
-            cutIndex--
-        }
-        if (cutIndex <= 0) {
-            banner = Res.get(R.string.compact_too_few)
-            return
-        }
-
-        val toSummarize = candidates.take(cutIndex)
-        val throughId = toSummarize.last().id
-        val previousSummary = existing?.summary?.takeIf { it.isNotBlank() }
-
-        compacting = true
-        compactPreview = ""
+        val model = settings.model
+        val baseUrl = stored.baseUrl.ifBlank { providerKind.defaultBaseUrl }
+        val apiKey = stored.apiKey
+        val headers = providerKind.headersFor(openCodeSessionId)
+        val selectedApiStyle = apiStyle
         banner = null
         imageSkipNotice = null
-
         compactJob = viewModelScope.launch {
-            val transcript = buildString {
-                if (previousSummary != null) {
-                    append(Res.get(R.string.prompt_compact_existing))
-                    append(previousSummary)
-                    append(Res.get(R.string.prompt_compact_new))
-                }
-                toSummarize.forEach { message ->
-                    append(Res.get(if (message.role == MessageRole.USER) R.string.prompt_user_prefix else R.string.prompt_ai_prefix))
-                    append(message.content.trim())
-                    // 文本附件的内容要进摘要，否则"我上传的那份设定"会在压缩后凭空消失
-                    message.attachments
-                        .filter { it.kind == Attachment.Kind.TEXT }
-                        .forEach { append("\n").append(it.toPromptBlock()) }
-                    if (message.attachments.any { it.isImage }) append(Res.get(R.string.prompt_has_image))
-                    append("\n\n")
-                }
-            }
-
-            val collected = StringBuilder()
-            var failure: String? = null
-
             try {
-                chatApi.streamChat(
-                    baseUrl = stored.baseUrl.ifBlank { providerKind.defaultBaseUrl },
-                    apiKey = stored.apiKey,
-                    model = settings.model,
-                    messages = listOf(
-                        OutMessageDto(
-                            role = "system",
-                            content = MessageContent.text(Res.get(R.string.prompt_compact_system)),
-                        ),
-                        OutMessageDto(
-                            role = "user",
-                            content = MessageContent.text(transcript),
-                        ),
-                    ),
-                    // 总结不需要思考，也不需要保留已存在的摘要上下文
-                    thinkingEnabled = false,
-                    temperature = 0.3,
-                    extraHeaders = providerKind.headersFor(openCodeSessionId),
-                ).collect { event ->
-                    when (event) {
-                        is StreamEvent.Content -> {
-                            collected.append(event.text)
-                            compactPreview = collected.toString()
-                        }
-
-                        // 流内错误对象是**上游网关原文**：先翻成人话，认不出才保留原文
-                        is StreamEvent.Error -> failure = serverErrorText(event.message)
-                        else -> Unit
-                    }
-                }
-            } catch (t: kotlinx.coroutines.CancellationException) {
-                throw t
-            } catch (t: Exception) {
-                failure = t.userMessage()
-            }
-
-            val summary = collected.toString().trim()
-            if (failure != null || summary.isEmpty()) {
-                banner = Res.get(R.string.compact_failed_detail, failure ?: Res.get(R.string.error_no_content))
-                compacting = false
-                compactPreview = ""
-                return@launch
-            }
-
-            val entity = CompactionEntity(
-                id = existing?.id ?: UUID.randomUUID().toString(),
-                conversationId = conversationId,
-                throughMessageId = throughId,
-                summary = summary,
-                createdAt = existing?.createdAt ?: System.currentTimeMillis(),
-                updatedAt = System.currentTimeMillis(),
-            )
-            try {
-                repository.saveCompaction(entity)
-                if (conversationId == currentConversationId) compaction = entity
+                compactHistory(conversationId, model, baseUrl, apiKey, headers, selectedApiStyle)
             } catch (error: kotlinx.coroutines.CancellationException) {
                 throw error
             } catch (error: Exception) {
-                if (conversationId == currentConversationId) banner = Res.get(R.string.compact_failed_detail, error.userMessage())
+                if (currentConversationId == conversationId) banner = compactionErrorText(error)
             } finally {
-                if (conversationId == currentConversationId) {
-                    compacting = false
-                    compactPreview = ""
-                }
+                if (!compacting && currentConversationId == conversationId) compactJob = null
             }
+        }
+    }
+
+    private suspend fun compactHistory(
+        conversationId: String,
+        model: ModelInfo,
+        baseUrl: String,
+        apiKey: String,
+        headers: Map<String, String>,
+        selectedApiStyle: ApiStyle,
+        requestWindow: Int? = null,
+    ): Boolean {
+        val generation = switchGeneration
+        val revision = pathRevision
+        val operation = ++compactGeneration
+        val savedCompaction = compaction
+        val sourceMessages = messages.toList()
+        val existing = validCompaction(sourceMessages, savedCompaction)
+        val extended = selectedApiStyle == ApiStyle.ANTHROPIC
+        val promptsByStyle = CompactionStyle.entries.associateWith { style -> Res.get(when (style) {
+            CompactionStyle.CREATIVE -> R.string.prompt_compact_creative
+            CompactionStyle.TECHNICAL -> R.string.prompt_compact_technical
+            CompactionStyle.GENERAL -> R.string.prompt_compact_system
+        }) }
+        val basePrompts = CompactionPrompts(
+            system = promptsByStyle.getValue(CompactionStyle.GENERAL),
+            existing = Res.get(R.string.prompt_compact_existing),
+            newMessages = Res.get(R.string.prompt_compact_new),
+            user = Res.get(R.string.prompt_user_prefix),
+            assistant = Res.get(R.string.prompt_ai_prefix),
+            image = Res.get(R.string.prompt_has_image),
+        )
+
+        compacting = true
+        compactionStatus = null
+
+        try {
+            val result = withContext(Dispatchers.Default) {
+                val alreadyCovered = existing?.let { c -> sourceMessages.indexOfFirst { it.id == c.throughMessageId } } ?: -1
+                val candidates = sourceMessages.asSequence().drop(alreadyCovered + 1)
+                    .filter { !it.streaming && (it.content.isNotBlank() || it.attachments.isNotEmpty()) }.toList()
+                val recentBudget = compactionRecentTokenBudget(model.contextWindow, requestWindow)
+                val cutIndex = compactionCutIndex(candidates, recentBudget)
+                if (cutIndex <= 0) throw com.simplechat.app.data.AppTextException(
+                    if (existing != null) R.string.compact_no_new_history else R.string.compact_too_few,
+                )
+                val toSummarize = candidates.take(cutIndex)
+                val style = classifyCompaction(toSummarize, existing?.summary)
+                val prompts = basePrompts.copy(system = promptsByStyle.getValue(style))
+                val segments = compactionSegments(toSummarize, existing?.summary, prompts)
+                val fingerprint = compactionFingerprint(sequenceOf(
+                    "hierarchical-compaction-v1", conversationId, model.id, model.contextWindow.toString(),
+                    baseUrl, apiKey, selectedApiStyle.name, headers.toSortedMap().toString(), prompts.system,
+                    existing?.throughMessageId.orEmpty(),
+                ) + toSummarize.asSequence().map { it.id } + segments)
+                val saved = repository.loadCompactionCheckpoint(conversationId, fingerprint)
+                    ?: CompactionCheckpoint(fingerprint = fingerprint)
+                val checkpoint = requestWindow?.let { saved.copy(requestWindow = minOf(saved.requestWindow, it)) } ?: saved
+                val summary = compactInBatches(
+                    segments, prompts, model.contextWindow, checkpoint,
+                    // Other endpoints can impose lower output limits even when advertising a 1M input window.
+                    harnessBudget = runCatching { java.net.URI(baseUrl).host.equals("api.deepseek.com", true) }.getOrDefault(false) &&
+                        model.id in setOf("deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4.1-flash", "deepseek-v4-flash-vision-exp"),
+                    onCheckpoint = { repository.saveCompactionCheckpoint(conversationId, it) },
+                    onProgress = {
+                        // Log only operational metadata, never conversation content or credentials.
+                        android.util.Log.i("SimpleChat/Compaction",
+                            "level=${it.level} batch=${it.batch} attempt=${it.attempt} inputChars=${it.inputChars} " +
+                                "processed=${it.processedChars}/${it.totalChars} window=${it.effectiveWindow} output=${it.outputTokens} recovery=${it.recovery}")
+                        if (it.recovery == null) {
+                            val phase = if (it.isWholeSource) Res.get(R.string.compact_whole_source) else if (it.level == 0) {
+                                val percent = 100 * it.processedChars / it.totalChars.coerceAtLeast(1)
+                                Res.get(R.string.compact_batch_source, percent, it.attempt)
+                            } else Res.get(R.string.compact_batch_merge, it.attempt)
+                            withContext(Dispatchers.Main) {
+                                if (operation == compactGeneration) compactionStatus = phase
+                            }
+                        }
+                    },
+                ) { transcript, maxTokens, _ ->
+                    val brief = Res.get(R.string.compact_output_target, (maxTokens / 3).coerceIn(32, 1200))
+                    // Finish with the active summarization task, after the quoted history.
+                    val material = transcript + "\n\n" + brief
+                    val stream = if (extended) {
+                        chatApi.streamMessage(
+                            baseUrl = baseUrl, apiKey = apiKey,
+                            request = buildAnthropicRequest(
+                                model = model.id, systemPrompt = prompts.system,
+                                path = listOf(UiMessage("compact", MessageRole.USER, material)),
+                                searchEnabled = false, thinkingEnabled = false, requestTitle = false,
+                                latestReminder = null, maxTokens = maxTokens, outputLimit = model.maxOutputTokens, temperature = 0.3,
+                                deepSeekExtensions = isOfficialDeepSeekEndpoint(baseUrl),
+                            ).copy(tools = emptyList()),
+                            extraHeaders = headers, contextWindow = model.contextWindow, retryBeforeContent = false,
+                        )
+                    } else {
+                        chatApi.streamChat(
+                            apiStyle = selectedApiStyle,
+                            baseUrl = baseUrl, apiKey = apiKey, model = model,
+                            messages = listOf(
+                                OutMessageDto("system", MessageContent.text(prompts.system)),
+                                OutMessageDto("user", MessageContent.text(material)),
+                            ),
+                            thinkingEnabled = false, maxTokens = maxTokens,
+                            temperature = 0.3, extraHeaders = headers, retryBeforeContent = false,
+                        )
+                    }
+                    collectCompactionSummary(stream, maxChars = com.simplechat.app.data.MaxCompactionSummaryChars) { reason, chars, thinking ->
+                        android.util.Log.i("SimpleChat/Compaction", "protocol=$apiStyle end=$reason textChars=$chars thinkingChars=$thinking maxTokens=$maxTokens")
+                    }
+                }
+                (toSummarize.lastOrNull()?.id ?: checkNotNull(existing).throughMessageId) to summary
+            }
+            // A changed branch/edit invalidates the source snapshot, even if the chat ID matches.
+            if (generation != switchGeneration || revision != pathRevision || savedCompaction != compaction || operation != compactGeneration) return false
+            val entity = CompactionEntity(
+                id = existing?.id ?: UUID.randomUUID().toString(),
+                conversationId = conversationId,
+                throughMessageId = result.first,
+                summary = result.second,
+                createdAt = existing?.createdAt ?: System.currentTimeMillis(),
+                updatedAt = System.currentTimeMillis(),
+            )
+            repository.saveCompaction(entity)
+            if (generation != switchGeneration || revision != pathRevision || operation != compactGeneration || savedCompaction != compaction) return false
+            compaction = entity
+            repository.deleteCompactionCheckpoint(conversationId)
+            return true
+
+        } finally {
+            if (generation == switchGeneration && operation == compactGeneration) {
+                compacting = false
+                compactionStatus = null
+            }
+        }
+    }
+
+    private fun compactionErrorText(error: Exception): String {
+        val detail = if (error is CompactionRequestFailure) when (error.kind) {
+            CompactionFailureKind.INPUT_LIMIT -> Res.get(R.string.compact_input_rejected)
+            CompactionFailureKind.TRANSIENT -> Res.get(R.string.compact_interrupted)
+            CompactionFailureKind.TIMEOUT -> Res.get(R.string.compact_request_timeout)
+            CompactionFailureKind.TRUNCATED -> Res.get(R.string.compact_truncated)
+            CompactionFailureKind.EMPTY -> Res.get(R.string.compact_incomplete)
+            CompactionFailureKind.PERMANENT -> error.event?.let {
+                if (it.rawMessage != null || it.code != null) it.message else serverErrorText(it.message)
+            } ?: Res.get(R.string.compact_incomplete)
+        } else error.userMessage()
+        val resource = (error as? com.simplechat.app.data.AppTextException)?.text?.resId
+        return when (resource) {
+            R.string.compact_request_cap, R.string.compact_deadline,
+            R.string.compact_whole_limit, R.string.compact_whole_rejected -> detail
+            else -> Res.get(R.string.compact_failed_detail, detail)
         }
     }
 
     /** 放弃压缩，恢复发送全部消息。**本地消息一条都没少。** */
     fun clearCompaction() {
         val active = compaction ?: return
+        cancelCompaction()
         compaction = null
-        launchGuarded("clearCompaction") { repository.deleteCompaction(active.id) }
+        viewModelScope.launch {
+            repository.deleteCompaction(active.id)
+            repository.deleteCompactionCheckpoint(active.conversationId)
+        }
     }
 
     /** 手工修正摘要（AI 记错人名地名时用）。 */
     fun updateCompactionSummary(text: String) {
         val active = compaction ?: return
+        cancelCompaction()
         val updated = active.copy(summary = text.trim(), updatedAt = System.currentTimeMillis())
         compaction = updated
         viewModelScope.launch { repository.saveCompaction(updated) }
     }
 
     fun cancelCompaction() {
+        compactGeneration++
         compactJob?.cancel()
         compactJob = null
         compacting = false
-        compactPreview = ""
+        compactionStatus = null
     }
 
     // ── 上下文统计 ────────────────────────────────────────
@@ -1117,7 +1219,9 @@ class ChatViewModel(
         val compaction: CompactionEntity?,
     )
 
-    private fun computeContextStats(input: StatsInput): ContextStats {
+    private data class MessageWeight(val text: String, val weight: Long)
+
+    private fun computeContextStats(input: StatsInput, previous: Map<String, MessageWeight>): Pair<ContextStats, Map<String, MessageWeight>> {
         val messages = input.messages
         val settings = input.settings
         val presets = input.presets
@@ -1126,38 +1230,45 @@ class ChatViewModel(
         // —— 实际会发给 API 的部分 ——
         val system = settings.composedSystemPrompt(presets)
         val outgoing = orderedOutgoingMessages(messages, active)
-        val inContext = buildList {
-            if (system.isNotBlank()) add(system)
-            if (active != null && active.summary.isNotBlank()) add(active.summary)
-            outgoing.forEach { add(it.content) }
+        val weights = messages.asSequence().filter { !it.streaming }.associate { message ->
+            val cached = previous[message.id]?.takeIf { it.text === message.content }
+            message.id to (cached ?: MessageWeight(message.content, TokenEstimate.weight(message.content)))
         }
-        // 附件也要算进去：图片按每张上限 1024、文本附件按字数（见 RequestContent）
+        val summaryWeight = active?.let { TokenEstimate.weight(it.summary) } ?: 0L
+        val usedWeight = TokenEstimate.weight(system) + summaryWeight + outgoing.sumOf { weights.getValue(it.id).weight }
         val attachmentTokens = outgoing.sumOf { attachmentTokenEstimate(it.attachments) }
-
-        // —— 本地全部内容（含被压缩掉的）——
-        val allTexts = messages.filter { !it.streaming }.map { it.content }
 
         val ttfts = messages.mapNotNull { it.ttftMs }
         val tpsList = messages.mapNotNull { it.tps }
         val thinking = messages.mapNotNull { it.reasoningSeconds }
 
+        /*
+         * 服务端回报的用量：只算**有上报**的回复。老数据 tokensIn/out 为 null，
+         * 不能按 0 计入 —— 否则"本会话消耗"会永远停在 0，看起来像没工作。
+         */
+        val usageMessages = messages.filter { it.role == MessageRole.ASSISTANT && it.tokensIn != null }
+
         return ContextStats(
-            usedTokens = TokenEstimate.ofAll(inContext) + attachmentTokens,
+            usedTokens = TokenEstimate.fromWeight(usedWeight) + attachmentTokens,
             windowTokens = settings.model.contextWindow,
             messageCount = messages.size,
-            totalTokens = TokenEstimate.ofAll(allTexts),
+            totalTokens = TokenEstimate.fromWeight(weights.values.sumOf { it.weight }),
             compactedTokenSaving = run {
                 if (active == null) return@run 0
                 val cut = messages.indexOfFirst { it.id == active.throughMessageId }
                 if (cut < 0) return@run 0
-                TokenEstimate.ofAll(messages.take(cut + 1).map { it.content }) -
-                    TokenEstimate.of(active.summary)
+                TokenEstimate.fromWeight(messages.take(cut + 1).sumOf { weights[it.id]?.weight ?: TokenEstimate.weight(it.content) }) -
+                    TokenEstimate.fromWeight(summaryWeight)
             },
             avgTtftMs = ttfts.takeIf { it.isNotEmpty() }?.average()?.toLong(),
             avgTps = tpsList.takeIf { it.isNotEmpty() }?.average()?.toFloat(),
             totalThinkingSeconds = thinking.takeIf { it.isNotEmpty() }?.sum(),
             hasCompaction = active != null,
-        )
+            usageReplies = usageMessages.size,
+            usagePromptTokens = usageMessages.sumOf { it.tokensIn ?: 0 },
+            usageCompletionTokens = usageMessages.sumOf { it.tokensOut ?: 0 },
+            usageCacheHitTokens = usageMessages.sumOf { it.cacheHitTokens ?: 0 },
+        ) to weights
     }
 
     // ── 消息操作：重新生成 / 重试 / 编辑 / 删除 / 切版本 ──────────
@@ -1171,15 +1282,20 @@ class ChatViewModel(
      * 用**当前**选的模型（顺带写回 `model`）：用户很可能就是换了模型
      * 才来点重试的。所以这里不做"沿用当初那个模型"的假设。
      */
-    fun retryMessage(target: UiMessage) {
-        if (isStreaming || target.role != MessageRole.ASSISTANT) return
+    fun retryMessage(target: UiMessage, omitAttachmentsAndTools: Boolean = false) {
+        if (isStreaming || switching || target.role != MessageRole.ASSISTANT) return
+        if (target.imageGeneration && !omitAttachmentsAndTools) { regenerate(target); return }
         val conversationId = currentConversationId ?: return
-
-        launchGuarded("retry") {
-            switchJob?.join()
-            repository.resetForRetry(target.id, settings.model.id)
-            reloadPath(conversationId)
-            startStream(conversationId, target.id)
+        viewModelScope.launch {
+            if (!sendMutex.tryLock()) return@launch
+            try {
+                if (conversationId != currentConversationId || isStreaming || switching) return@launch
+                repository.resetForRetry(target.id, settings.model.id)
+                reloadPath(conversationId)
+                startStream(conversationId, target.id, omitAttachmentsAndTools = omitAttachmentsAndTools)
+            } finally {
+                sendMutex.unlock()
+            }
         }
     }
 
@@ -1192,23 +1308,45 @@ class ChatViewModel(
      * 于是旧回复没被替换、新回复排到了队尾 —— 表现就是"一个接一个"。
      */
     fun regenerate(target: UiMessage) {
+        if (target.imageGeneration) {
+            val parent = messages.firstOrNull { it.id == target.parentId && it.role == MessageRole.USER } ?: return
+            val request = target.imageRequest
+            generateImage(request?.prompt ?: parent.content, retryParentId = parent.id,
+                references = parent.attachments.takeIf { request?.usesReferences != false }.orEmpty(),
+                retryRequest = request)
+            return
+        }
         if (isStreaming || target.role != MessageRole.ASSISTANT) return
         val conversationId = currentConversationId ?: return
         val index = messages.indexOfFirst { it.id == target.id }
         if (index < 0) return
+        if (compacting) cancelCompaction()
 
-        launchGuarded("regenerate") {
-            // 挂在**被重新生成那条的父亲**下 → 成为它的兄弟，旧回答留着
-            val fresh = repository.addActiveVariant(
-                conversationId = conversationId,
-                parentId = target.parentId,
-                role = MessageRole.ASSISTANT,
-                content = "",
-                reasoning = "",
-                status = MessageStatus.STREAMING,
-            )
-            reloadPath(conversationId)
-            startStream(conversationId, fresh.id)
+        val generation = switchGeneration
+        viewModelScope.launch {
+            if (!sendMutex.tryLock()) return@launch
+            try {
+                if (generation != switchGeneration || conversationId != currentConversationId || isStreaming || switching ||
+                    messages.none { it.id == target.id }
+                ) return@launch
+                // 挂在**被重新生成那条的父亲**下 → 成为它的兄弟，旧回答留着
+                val fresh = repository.addActiveVariant(
+                    conversationId = conversationId,
+                    parentId = target.parentId,
+                    role = MessageRole.ASSISTANT,
+                    content = "",
+                    reasoning = "",
+                    status = MessageStatus.STREAMING,
+                )
+                reloadPath(conversationId)
+                startStream(conversationId, fresh.id)
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                banner = Res.get(R.string.error_send_failed, error.userMessage())
+            } finally {
+                sendMutex.unlock()
+            }
         }
     }
 
@@ -1224,31 +1362,38 @@ class ChatViewModel(
      * 扩展通道回复才允许续写。不满足就静默返回 —— 按钮本来也不该出现。
      */
     fun continueMessage(target: UiMessage) {
-        if (isStreaming) return
+        if (target.imageGeneration || isStreaming || !supportsContinuation) return
         val conversationId = currentConversationId ?: return
         val index = messages.indexOfFirst { it.id == target.id }
         if (index < 0) return
         if (!canContinueReply(target, isLastOnPath = index == messages.lastIndex)) return
+        if (compacting) cancelCompaction()
 
-        launchGuarded("continue") {
-            switchJob?.join()
-            repository.resumeStreaming(target.id)
-            patch(target.id) {
-                it.copy(
-                    status = MessageStatus.STREAMING,
-                    errorMessage = null,
-                    stopReason = null,
-                )
-            }
-            startStream(conversationId, target.id, prefix = target)
-        }.invokeOnCompletion { cause ->
-            /*
-             * 没走到 startStream 就失败（库写不进去）：把这条从 STREAMING 退回原状态。
-             * 否则它会以"正在生成"的样子卡在界面上 —— 操作栏与长按菜单全部禁用，
-             * 用户既删不掉也切不走（见 §44 里那张"僵尸消息"的坑）。
-             */
-            if (cause != null && !isStreaming) {
-                patch(target.id) { it.copy(status = target.status, errorMessage = target.errorMessage) }
+        val generation = switchGeneration
+        viewModelScope.launch {
+            if (!sendMutex.tryLock()) return@launch
+            try {
+                switchJob?.join()
+                val currentIndex = messages.indexOfFirst { it.id == target.id }
+                val current = messages.getOrNull(currentIndex)
+                if (generation != switchGeneration || conversationId != currentConversationId || isStreaming || switching ||
+                    current == null || !canContinueReply(current, isLastOnPath = currentIndex == messages.lastIndex)
+                ) return@launch
+                repository.resumeStreaming(target.id)
+                patch(target.id) {
+                    it.copy(
+                        status = MessageStatus.STREAMING,
+                        errorMessage = null,
+                        stopReason = null,
+                    )
+                }
+                startStream(conversationId, target.id, prefix = current)
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                banner = Res.get(R.string.error_send_failed, error.userMessage())
+            } finally {
+                sendMutex.unlock()
             }
         }
     }
@@ -1275,6 +1420,7 @@ class ChatViewModel(
         val kept = attachments ?: target.attachments
         if (text.isEmpty() && kept.isEmpty()) return
         val conversationId = currentConversationId ?: return
+        if (compacting) cancelCompaction()
 
         val generation = switchGeneration
         viewModelScope.launch {
@@ -1289,6 +1435,13 @@ class ChatViewModel(
                  * 会出现"保存了却没变"（OpenAI 通道生效、Anthropic 通道不生效）。
                  * 思考 / 搜索 / 读链接块保持原序，它们描述的是这段答案的来历。
                  */
+                if (compactionInvalidatedByEdit(messages.toList(), compaction, target.id)) {
+                    val stale = compaction
+                    if (stale != null) repository.deleteCompaction(stale.id)
+                    compaction = null
+                    runCatching { repository.deleteCompactionCheckpoint(conversationId) }
+                        .onFailure { android.util.Log.w("SimpleChat/Compaction", "Stale checkpoint could not be deleted") }
+                }
                 repository.editMessageInPlace(
                     id = target.id,
                     content = text,
@@ -1364,7 +1517,8 @@ class ChatViewModel(
     fun deleteMessage(target: UiMessage) {
         if (isStreaming) return
         val conversationId = currentConversationId ?: return
-        launchGuarded("deleteMessage") {
+        if (compacting) cancelCompaction()
+        viewModelScope.launch {
             repository.deleteMessage(target.id)
             reloadPath(conversationId)
         }
@@ -1381,8 +1535,8 @@ class ChatViewModel(
      */
     fun forkFrom(target: UiMessage) {
         if (isStreaming) return
-        launchGuarded("fork") {
-            val newId = repository.forkConversation(target.id) ?: return@launchGuarded
+        viewModelScope.launch {
+            val newId = repository.forkConversation(target.id) ?: return@launch
             openConversation(newId)
         }
     }
@@ -1397,12 +1551,10 @@ class ChatViewModel(
         if (isStreaming) return
         val conversationId = currentConversationId ?: return
         if (variantIndex !in 0 until target.variantCount) return
+        if (compacting) cancelCompaction()
 
-        launchGuarded("switchVariant") {
-            val id = repository.messageIdAt(conversationId, target.parentId, variantIndex)
-                ?: return@launchGuarded
-            repository.activateVariant(id, conversationId, target.parentId)
-            reloadPath(conversationId)
+        viewModelScope.launch {
+            if (repository.activateVariantAt(conversationId, target.parentId, variantIndex)) reloadPath(conversationId)
         }
     }
 
@@ -1417,37 +1569,131 @@ class ChatViewModel(
         BackgroundGeneration.sync(false)
     }
 
-    /**
-     * 跑一个**会写库 / 会动文件**的操作，并把异常收敛成一条 banner。
-     *
-     * ### 为什么必须收口
-     *
-     * `viewModelScope` 默认没有 `CoroutineExceptionHandler`：协程体里抛出的
-     * 异常会被交给线程的默认处理器 —— 在 Android 上就是**进程直接死掉**。
-     * 用户看到的是"点了一下重新生成，界面卡了半秒，然后 App 没了"，
-     * 而真正的原因可能只是磁盘满了、库被别的写入锁住了。
-     *
-     * 这类操作（重试 / 重新生成 / 续写 / 删除 / 分叉 / 切版本）此前都是裸
-     * `launch`，一条 SQLite 异常就能带走整个进程。现在统一从这里进：
-     * 失败 → 一条人话 banner，界面其余部分照常可用。
-     *
-     * 取消照旧往外抛：那是正常控制流（切会话会取消旧任务），不是错误。
-     *
-     * @param tag 动作名，**只进日志**（不进界面文案：界面上那句话与语言相关，
-     *            而日志要给开发者看，英文标签更好搜）。
-     */
-    private fun launchGuarded(
-        tag: String,
-        block: suspend CoroutineScope.() -> Unit,
-    ): Job = viewModelScope.launch {
-        try {
-            block()
-        } catch (cancel: kotlinx.coroutines.CancellationException) {
-            throw cancel
-        } catch (error: Exception) {
-            // 原始异常进日志（排查要用），界面只给一句人话
-            android.util.Log.e("SimpleChat/Action", "action failed: " + tag, error)
-            banner = Res.get(R.string.error_action_failed, error.userMessage())
+    private suspend fun executeImageRequest(request: ImageRequest, route: StoredSettings, references: List<Attachment>): com.simplechat.app.net.GeneratedImage {
+        val config = route.imageGenApi
+        val nativeAdapter = route.nativeImageAdapter(request.modelId)
+        if (request.independent && (!config.enabled || config.adapter != request.adapter) ||
+            !request.independent && nativeAdapter != request.adapter) {
+            throw com.simplechat.app.data.AppTextException(R.string.image_model_unavailable)
+        }
+        val images = if (request.usesReferences) repository.materialize(references.filter { it.isImage }) else emptyList()
+        if (request.usesReferences && (images.isEmpty() || images.any { it.data.isBlank() || it.remoteImage })) {
+            throw com.simplechat.app.data.AppTextException(R.string.image_reference_unreadable)
+        }
+        val options = config.copy(
+            modelId = request.modelId, size = request.size ?: config.size,
+            aspectRatio = request.aspectRatio ?: config.aspectRatio,
+            geminiImageSize = request.geminiImageSize ?: config.geminiImageSize,
+        )
+        return when {
+            request.independent -> imageGenerationApi.generateIndependent(options, route.baseUrl, route.apiKey, request.prompt, images)
+            request.adapter == "GEMINI" -> imageGenerationApi.generateGemini(
+                options.copy(baseUrl = "", reuseChatKey = true), route.baseUrl, route.apiKey, request.prompt, images,
+            )
+            else -> imageGenerationApi.generateWithResponses(route.baseUrl, route.apiKey, request.modelId, request.prompt, images, request.size)
+        }
+    }
+
+    fun generateImage(
+        prompt: String, requestedAspectRatio: String? = null, retryParentId: String? = null,
+        references: List<Attachment> = emptyList(), requestedModelId: String? = null,
+        retryRequest: ImageRequest? = null, onPersisted: () -> Unit = {},
+    ) {
+        val description = prompt.trim()
+        if (description.isEmpty() || isStreaming || switching) return
+        val route = stored
+        val selectedModel = retryRequest?.modelId ?: requestedModelId?.takeIf { it.isNotBlank() }
+        val nativeModel = selectedModel ?: settings.model.id
+        val nativeAdapter = route.nativeImageAdapter(nativeModel)
+        val adapter = if (route.imageGenApi.enabled) route.imageGenApi.adapter else nativeAdapter
+        val outputModel = if (route.imageGenApi.enabled) selectedModel ?: route.imageGenApi.modelId else nativeModel
+        val ratio = requestedAspectRatio?.takeIf { it in imageAspectRatios(adapter, outputModel) }
+        val explicitSize = imageSizeForRatio(adapter, outputModel, ratio)
+        val size = explicitSize ?: route.imageGenApi.size
+        val imageConfig = route.imageGenApi.copy(
+            modelId = selectedModel ?: route.imageGenApi.modelId,
+            size = size, aspectRatio = ratio ?: route.imageGenApi.aspectRatio,
+        )
+        if (retryRequest == null && !imageConfig.enabled && nativeAdapter == null) {
+            banner = Res.get(R.string.image_model_unavailable)
+            return
+        }
+        if (retryRequest == null && imageConfig.enabled && imageConfig.modelId.isBlank()) {
+            banner = Res.get(R.string.error_no_model)
+            return
+        }
+        if (!(retryRequest?.independent ?: imageConfig.enabled) && route.apiKey.isBlank()) {
+            banner = Res.get(R.string.error_no_api_key)
+            return
+        }
+        val generation = ++streamGeneration
+        val viewGeneration = switchGeneration
+        val imageModel = retryRequest?.modelId ?: if (imageConfig.enabled) imageConfig.modelId else nativeModel
+        val request = retryRequest ?: ImageRequest(
+            prompt = description, modelId = imageModel,
+            adapter = if (imageConfig.enabled) imageConfig.adapter else checkNotNull(nativeAdapter),
+            independent = imageConfig.enabled,
+            size = if (imageConfig.enabled) size else explicitSize,
+            aspectRatio = imageConfig.aspectRatio, geminiImageSize = imageConfig.geminiImageSize,
+            usesReferences = references.any { it.isImage },
+        )
+        if (compacting) cancelCompaction()
+        isStreaming = true
+        BackgroundGeneration.sync(true)
+        stoppedByUser = false
+        banner = null
+        streamJob = viewModelScope.launch {
+            var replyId: String? = null
+            try {
+                if (!sendMutex.tryLock()) return@launch
+                val id: String
+                val reply: String
+                try {
+                    id = ensureConversation(viewGeneration) ?: return@launch
+                    val parentId = retryParentId ?: repository.appendUserMessage(id, description, references).also { user ->
+                        if (viewGeneration == switchGeneration) messages += user
+                    }.id
+                    ensureActive()
+                    reply = repository.beginAssistantMessage(id, parentId, imageModel, imageGeneration = true, imageRequest = request)
+                    replyId = reply
+                    ensureActive()
+                    if (viewGeneration != switchGeneration) return@launch
+                    if (retryParentId != null) {
+                        reloadPath(id)
+                    } else messages += UiMessage(
+                        id = reply, role = MessageRole.ASSISTANT, content = "", status = MessageStatus.STREAMING,
+                        parentId = parentId, model = imageModel, imageGeneration = true, imageRequest = request,
+                    )
+                    onPersisted()
+                } finally {
+                    sendMutex.unlock()
+                }
+                val generated = executeImageRequest(request, route, references)
+                if (generation != streamGeneration) throw kotlinx.coroutines.CancellationException("Image generation stopped")
+                val attachment = repository.attachGeneratedImage(reply, generated.bytes, markDone = true)
+                patch(reply) { it.copy(attachments = listOf(attachment), status = MessageStatus.DONE) }
+                runCatching { repository.touchConversation(id) }
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                replyId?.let { id ->
+                    withContext(NonCancellable) {
+                        val stopped = runCatching { repository.settleImageGeneration(id, MessageStatus.STOPPED) }.getOrDefault(false)
+                        if (stopped) patch(id) { it.copy(status = MessageStatus.STOPPED) }
+                    }
+                }
+                throw error
+            } catch (error: Exception) {
+                replyId?.let { id ->
+                    val message = error.message ?: "Image generation failed"
+                    val failed = runCatching { repository.settleImageGeneration(id, MessageStatus.ERROR, message) }.getOrDefault(false)
+                    if (failed) patch(id) { it.copy(status = MessageStatus.ERROR, errorMessage = message) }
+                } ?: run { banner = error.message ?: "Image generation failed" }
+            } finally {
+                if (generation == streamGeneration) {
+                    isStreaming = false
+                    streamJob = null
+                    BackgroundGeneration.sync(false)
+                }
+            }
         }
     }
 
@@ -1487,8 +1733,15 @@ class ChatViewModel(
 
     // ── 流式实现 ──────────────────────────────────────────
 
-    private fun startStream(conversationId: String, replyId: String, prefix: UiMessage? = null) {
+    private fun startStream(
+        conversationId: String,
+        replyId: String,
+        prefix: UiMessage? = null,
+        omitAttachmentsAndTools: Boolean = false,
+    ) {
         if (conversationId != currentConversationId) return
+        retrySkipNotice = if (omitAttachmentsAndTools && stored.showRetrySkipNotice) Res.get(R.string.retry_skipped_notice) else null
+        lastUsage = null
         /*
          * ★ **发请求之前先验 Key 的字符集。**
          *
@@ -1502,17 +1755,44 @@ class ChatViewModel(
             return
         }
         val generation = ++streamGeneration
+        if (prefix == null) {
+            val phrase = stored.loadingWords.randomOrNull() ?: Res.strings(R.array.reply_waiting_phrases).random()
+            loadingLabel = replyId to phrase
+        }
         isStreaming = true
         // 生成期间把进程提到前台服务优先级：退到后台 / 熄屏也继续收
         BackgroundGeneration.sync(true)
         stoppedByUser = false
-        lastCheckpointAt = System.currentTimeMillis()
-        val extended = apiStyle == ApiStyle.ANTHROPIC
+        val route = attachmentSettings
+        val options = settings
+        val latestUser = messages.lastOrNull { it.role == MessageRole.USER }
+        val latestQuestion = latestUser?.content.orEmpty()
+        val imageIntent = prefix == null && requestsImageGeneration(latestQuestion)
+        val nativeImageAdapter = route.nativeImageAdapter(options.model.id)
+        val nativeGeminiTurn = imageIntent && !route.imageGenApi.enabled && nativeImageAdapter == "GEMINI"
+        val imageToolEnabled = imageIntent && !nativeGeminiTurn &&
+            (if (route.imageGenApi.enabled) route.imageGenApi.modelId.isNotBlank() else nativeImageAdapter != null)
+        val selectedApiStyle = apiStyle
+        val extended = selectedApiStyle == ApiStyle.ANTHROPIC
 
+        val routeProvider = providerKind
+        val searchRequested = webSearch && !com.simplechat.app.net.usesAutomaticOpenAiSearch(options.model.id, selectedApiStyle)
+        Diagnostics.log(
+            "CHAT",
+            "start model=${options.model.id} style=$selectedApiStyle " +
+                "base=${route.baseUrl} search=$searchRequested " +
+                "messages=${messages.size}",
+        )
         streamJob = viewModelScope.launch {
-            val startedAt = System.currentTimeMillis()
+            val startedAt = SystemClock.elapsedRealtime()
+            var lastCheckpointAt = startedAt
             var firstTokenAt: Long? = null
             var contentChars = 0
+            var optionalFieldsSent = false
+            var canDegrade = false
+            var pendingImageTool = false
+            var generatedImageAttached = false
+            var contextRejection: CompactionRequestFailure? = null
 
             /*
              * 思维链的起止时刻。
@@ -1526,6 +1806,7 @@ class ChatViewModel(
             var reasoningText = ""
             var contentText = ""
             val reasonBuf = StringBuilder()
+            var hasReasoningText = false
             val contentBuf = StringBuilder()
 
             /*
@@ -1539,83 +1820,127 @@ class ChatViewModel(
             // 续写：以已有块开局，新内容往后面接（见 ReplyAccumulator.seed）
             if (accumulator != null && prefix != null) accumulator.seed(prefix.timeline)
             var timeline: List<ReplyBlock> = prefix?.timeline.orEmpty()
+            var research = com.simplechat.app.net.SearchAugmentation()
+            val citations = linkedMapOf<String, com.simplechat.app.net.Citation>()
             var dirty = false
 
-            fun publishBuffered() {
-                if (reasonBuf.isNotEmpty()) { reasoningText += reasonBuf.toString(); reasonBuf.clear() }
-                if (contentBuf.isNotEmpty()) { contentText += contentBuf.toString(); contentBuf.clear() }
-                patch(replyId) { it.copy(reasoning = reasoningText.ifEmpty { null }, content = contentText) }
+            fun refreshBuffered() {
+                if (accumulator != null) {
+                    timeline = accumulator.blocks
+                    reasoningText = accumulator.thinking
+                    contentText = accumulator.answer
+                } else {
+                    if (hasReasoningText && reasonBuf.length != reasoningText.length) reasoningText = reasonBuf.toString()
+                    if (contentBuf.length != contentText.length) contentText = contentBuf.toString()
+                    if (research.blocks.isNotEmpty() || citations.isNotEmpty()) {
+                        timeline = research.replyBlocks(reasoningText, contentText, reasoningStartedAt, reasoningEndedAt).map { block ->
+                            if (block is ReplyBlock.Text) block.copy(citations = citations.values.toList()) else block
+                        }
+                    }
+                }
             }
 
             /** 正文（或正文块）一出现 = 思维链已经写完，思考栏当场收口。 */
             fun noteBody() {
-                if (firstTokenAt == null) firstTokenAt = System.currentTimeMillis()
                 if (reasoningEndedAt != null) return
-                val endedAt = System.currentTimeMillis()
+                val endedAt = SystemClock.elapsedRealtime()
+                firstTokenAt = endedAt
                 reasoningEndedAt = endedAt
-                val ms = endedAt - (reasoningStartedAt ?: startedAt)
+                val ms = reasoningStartedAt?.let { endedAt - it }
                 patch(replyId) {
-                    it.copy(reasoningDone = true, reasoningSeconds = thinkingSeconds(ms))
+                    it.copy(reasoningDone = true, reasoningSeconds = ms?.let(::thinkingSeconds) ?: prefix?.reasoningSeconds)
                 }
             }
 
             fun noteThinking() {
-                if (reasoningStartedAt == null) reasoningStartedAt = System.currentTimeMillis()
+                if (reasoningStartedAt == null && reasoningEndedAt == null) {
+                    reasoningStartedAt = SystemClock.elapsedRealtime()
+                }
             }
 
             // 节流提交器：与 collect 同在主线程调度器，天然串行，无需加锁
             val flusher = launch {
+                var checkpointJob: Job? = null
+                var needsCheckpoint = false
                 while (isActive) {
                     delay(STREAM_THROTTLE_MS)
-                    if (!dirty) continue
-
-                    if (accumulator != null) {
-                        // 块通道是**全量替换**：顺序与内容都由累加器持有
-                        timeline = accumulator.blocks
-                        patch(replyId) {
-                            it.copy(
-                                content = accumulator.answer,
-                                reasoning = accumulator.thinking.ifEmpty { null },
-                                timeline = accumulator.blocks,
-                            )
-                        }
-                    } else {
-                        publishBuffered()
+                    if (dirty) {
+                        refreshBuffered()
+                        patch(replyId) { it.copy(reasoning = reasoningText.ifEmpty { null }, content = contentText, timeline = timeline) }
+                        dirty = false
+                        needsCheckpoint = true
                     }
-                    if (accumulator != null) { reasoningText = accumulator.thinking; contentText = accumulator.answer }
-                    dirty = false
 
-                    // §4.4：流中每约 1.5s 落一次盘，崩溃不丢内容
-                    val now = System.currentTimeMillis()
-                    if (now - lastCheckpointAt >= CHECKPOINT_INTERVAL_MS) {
+                    val now = SystemClock.elapsedRealtime()
+                    if (needsCheckpoint && checkpointJob?.isCompleted != false && now - lastCheckpointAt >= CHECKPOINT_INTERVAL_MS) {
                         lastCheckpointAt = now
+                        needsCheckpoint = false
                         val r = reasoningText
                         val c = contentText
                         val t = timeline
-                        withContext(NonCancellable) {
-                            runCatching { repository.checkpoint(replyId, c, r, t) }
+                        checkpointJob = launch {
+                            withContext(NonCancellable + Dispatchers.IO) {
+                                runCatching { repository.checkpoint(replyId, c, r, t) }
+                            }
                         }
                     }
                 }
             }
 
+            fun sendError(event: StreamEvent.Error): String {
+                val hint = com.simplechat.app.net.providerHintRes(event.rawMessage ?: event.message)
+                android.util.Log.w("SimpleChat/Send", "protocol=$apiStyle http=${event.code} category=${Res.nameOrNull(hint)} retryable=${event.retryable}")
+                val rejected = compactionFailure(event)
+                if (rejected.kind == CompactionFailureKind.INPUT_LIMIT) contextRejection = rejected
+                if (optionalFieldsSent &&
+                    com.simplechat.app.net.canRetryWithoutAttachmentsAndTools(event.code, event.rawMessage ?: event.message)
+                ) canDegrade = true
+                return if (event.code != null) event.message else serverErrorText(event.message)
+            }
             var failure: String? = null
             var cancelled = false
             var serverTitle: String? = null
 
-            try {
+            suspend fun streamAttempt(textOnly: Boolean) {
+                if (nativeGeminiTurn && !textOnly) {
+                    pendingImageTool = true
+                    noteBody()
+                    val request = ImageRequest(
+                        latestQuestion, options.model.id, "GEMINI", independent = false,
+                        aspectRatio = route.imageGenApi.aspectRatio, geminiImageSize = route.imageGenApi.geminiImageSize,
+                        usesReferences = latestUser?.attachments?.any { it.isImage } == true,
+                    )
+                    repository.markImageGeneration(replyId, request)
+                    patch(replyId) { it.copy(imageGeneration = true, imageRequest = request) }
+                    val result = executeImageRequest(request, route, latestUser?.attachments.orEmpty())
+                    ensureActive()
+                    val attachment = repository.attachGeneratedImage(replyId, result.bytes)
+                    generatedImageAttached = true
+                    patch(replyId) { it.copy(attachments = listOf(attachment)) }
+                    return
+                }
+                val imageTool = ImageToolCall()
                 if (accumulator != null) {
+                    val request = buildAnthropicRequestNow(
+                        prefix, research.context, route, options, searchRequested, textOnly,
+                        generateImageTool = imageToolEnabled && !textOnly,
+                    )
+                    optionalFieldsSent = !textOnly && (request.tools.isNotEmpty() || request.title != null ||
+                        request.messages.any { it.role == "user" && it.content is kotlinx.serialization.json.JsonArray } || research.context.isNotBlank())
                     chatApi.streamMessage(
-                        baseUrl = stored.baseUrl.ifBlank { providerKind.defaultBaseUrl },
-                        apiKey = stored.apiKey,
-                        request = buildAnthropicRequestNow(prefix),
-                        extraHeaders = providerKind.headersFor(openCodeSessionId),
+                        baseUrl = route.baseUrl.ifBlank { routeProvider.defaultBaseUrl },
+                        apiKey = route.apiKey,
+                        request = request,
+                        extraHeaders = routeProvider.headersFor(openCodeSessionId) +
+                            if (!textOnly && route.supportsFileReferences && (route.filesApi.enabled || messages.any { message -> message.attachments.any { it.fileId != null } }))
+                                mapOf("anthropic-beta" to "files-api-2025-04-14") else emptyMap(),
+                        contextWindow = options.model.contextWindow,
                     ).collect { event ->
                         when (event) {
                             is StreamEvent.BlockStart -> {
                                 if (event.block is ReplyBlock.Text) noteBody()
                                 if (event.block is ReplyBlock.Thinking) noteThinking()
-                                accumulator.consume(event, System.currentTimeMillis())
+                                accumulator.consume(event, SystemClock.elapsedRealtime())
                                 dirty = true
                             }
 
@@ -1624,13 +1949,13 @@ class ChatViewModel(
                                     noteBody()
                                     contentChars += event.text.length
                                 }
-                                accumulator.consume(event, System.currentTimeMillis())
+                                accumulator.consume(event, SystemClock.elapsedRealtime())
                                 dirty = true
                             }
 
                             is StreamEvent.ThinkingDelta -> {
                                 noteThinking()
-                                accumulator.consume(event, System.currentTimeMillis())
+                                accumulator.consume(event, SystemClock.elapsedRealtime())
                                 dirty = true
                             }
 
@@ -1638,53 +1963,72 @@ class ChatViewModel(
 
                             is StreamEvent.CitationDelta, is StreamEvent.SignatureDelta,
                             is StreamEvent.BlockStop, is StreamEvent.Stopped -> {
-                                accumulator.consume(event, System.currentTimeMillis())
+                                imageTool.consume(event)
+                                accumulator.consume(event, SystemClock.elapsedRealtime())
                                 dirty = true
                             }
 
                             is StreamEvent.Usage -> recordUsage(event)
 
+                            is StreamEvent.ToolCallDelta -> imageTool.consume(event)
+
                             StreamEvent.Done -> Unit
 
                             // 流内错误对象是**上游网关原文**（如 `No available channel …`）：
                             // 先翻成人话，认不出才保留原文（见 `serverErrorText`）
-                            is StreamEvent.Error -> failure = serverErrorText(event.message)
+                            is StreamEvent.Error -> {
+                                Diagnostics.log(
+                                    "CHAT",
+                                    "stream error code=${event.code} " +
+                                        "retryable=${event.retryable} msg=${event.message.take(300)}",
+                                )
+                                failure = sendError(event)
+                            }
 
                             // 块通道不该出现这两类增量；出现了说明通道配错，忽略
                             is StreamEvent.Content, is StreamEvent.Reasoning -> Unit
                         }
                     }
                 } else {
+                    val outgoing = buildRequestMessages(research.context, route, options, textOnly)
+                    val builtInFlash = route.officialFlash && !textOnly
+                    val readLink = builtInFlash && HttpLink.containsMatchIn(latestQuestion)
+                    val title = builtInFlash && shouldRequestTitle()
+                    val search = builtInFlash && searchRequested && !route.searchApi.enabled
+                    val openAiSearch = !textOnly && searchRequested && !route.searchApi.enabled &&
+                        com.simplechat.app.net.supportsOpenAiSearchTool(route.baseUrl, options.model.id, selectedApiStyle)
+                    optionalFieldsSent = !textOnly && (imageToolEnabled || openAiSearch || outgoing.any { it.content is kotlinx.serialization.json.JsonArray } ||
+                        search || readLink || research.context.isNotBlank() || title && outgoing.sumOf {
+                            ((it.content as? kotlinx.serialization.json.JsonPrimitive)?.content?.length ?: 8001).toLong() + 32
+                        } <= 8000)
                     chatApi.streamChat(
-                        baseUrl = stored.baseUrl.ifBlank { providerKind.defaultBaseUrl },
-                        apiKey = stored.apiKey,
-                        model = settings.model,
-                        messages = buildRequestMessages(),
-                        thinkingEnabled = settings.reasoningLevel.enabled,
-                        reasoningEffort = settings.reasoningEffort,
-                        maxTokens = settings.maxTokens,
-                        temperature = settings.temperature.toDouble(),
-                        topP = settings.topP.toDouble(),
-                        extraHeaders = providerKind.headersFor(openCodeSessionId),
+                        apiStyle = selectedApiStyle,
+                        baseUrl = route.baseUrl.ifBlank { routeProvider.defaultBaseUrl },
+                        apiKey = route.apiKey,
+                        model = options.model,
+                        messages = outgoing,
+                        search = search,
+                        openAiSearch = openAiSearch,
+                        readLink = readLink,
+                        requestTitle = title,
+                        generateImageTool = imageToolEnabled && !textOnly,
+                        thinkingEnabled = options.thinkingEnabled,
+                        reasoningEffort = options.reasoningEffort,
+                        maxTokens = options.maxTokens,
+                        temperature = options.temperature.toDouble(),
+                        topP = options.topP.toDouble(),
+                        extraHeaders = routeProvider.headersFor(openCodeSessionId),
                     ).collect { event ->
                         when (event) {
                             is StreamEvent.Reasoning -> {
-                                /*
-                                 * 用户选了「关闭思考」就不收思考内容。
-                                 *
-                                 * 请求里已经带了 `thinking.type = disabled`，但**有些模型 / 网关
-                                 * 仍会吐 `reasoning_content`** —— 实测：opencode 那边已停用的
-                                 * `deepseek-v4-flash` 会被路由到 `deepseek-flash`，而网关不认
-                                 * 我们发过去的 disabled。
-                                 *
-                                 * 既然用户选的是关闭，就当它没来过：不落库、不显示，
-                                 * 界面与设置保持一致。（服务端是否真的少算这部分 token，
-                                 * 客户端管不着 —— 那是上游的事。）
-                                 */
-                                if (!settings.reasoningLevel.enabled) return@collect
-                                noteThinking()
+                                // 请求档位控制发送参数，显示以服务端实际返回为准。
+                                // 保留空白分片，等收到可见文字才开始计时和发布思考内容。
                                 reasonBuf.append(event.text)
-                                dirty = true
+                                if (!hasReasoningText && event.text.isNotBlank()) {
+                                    hasReasoningText = true
+                                    noteThinking()
+                                }
+                                if (hasReasoningText) dirty = true
                             }
 
                             is StreamEvent.Content -> {
@@ -1694,43 +2038,151 @@ class ChatViewModel(
                                 dirty = true
                             }
 
+                            is StreamEvent.Title -> serverTitle = event.text
+                            is StreamEvent.CitationDelta -> {
+                                citations[event.citation.url] = event.citation
+                                dirty = true
+                            }
+
                             /* 有些网关把用量放在流末尾单独一帧 —— 这里如实收下，
                                缓存命中率就是从这里来的（见 recordUsage）。 */
                             is StreamEvent.Usage -> recordUsage(event)
+
+                            is StreamEvent.ToolCallDelta -> imageTool.consume(event)
 
                             StreamEvent.Done -> Unit
 
                             // 流内错误对象是**上游网关原文**（如 `No available channel …`）：
                             // 先翻成人话，认不出才保留原文（见 `serverErrorText`）
-                            is StreamEvent.Error -> failure = serverErrorText(event.message)
+                            is StreamEvent.Error -> {
+                                Diagnostics.log(
+                                    "CHAT",
+                                    "stream error code=${event.code} " +
+                                        "retryable=${event.retryable} msg=${event.message.take(300)}",
+                                )
+                                failure = sendError(event)
+                            }
+
+                            is StreamEvent.Stopped -> imageTool.consume(event)
 
                             // 块级事件只属于 Anthropic 通道；这条路径上忽略
                             else -> Unit
                         }
                     }
                 }
-            } catch (t: kotlinx.coroutines.CancellationException) {
-                cancelled = true
-            } catch (t: Throwable) {
-                if (!stoppedByUser) failure = t.userMessage()
-            } finally {
-                flusher.cancel()
-                if (accumulator != null) {
-                    accumulator.settle(System.currentTimeMillis())
-                    timeline = accumulator.blocks
+                val prompt = if (failure == null && imageToolEnabled && !textOnly) imageTool.prompt() else null
+                if (prompt != null) {
+                    val imageConfig = route.imageGenApi
+                    canDegrade = false
+                    pendingImageTool = true
+                    noteBody()
+                    val request = ImageRequest(
+                        prompt = prompt, modelId = if (imageConfig.enabled) imageConfig.modelId else options.model.id,
+                        adapter = if (imageConfig.enabled) imageConfig.adapter else checkNotNull(nativeImageAdapter),
+                        independent = imageConfig.enabled, size = imageConfig.size.takeIf { imageConfig.enabled },
+                        aspectRatio = imageConfig.aspectRatio, geminiImageSize = imageConfig.geminiImageSize,
+                        usesReferences = latestUser?.attachments?.any { it.isImage } == true,
+                    )
+                    repository.markImageGeneration(replyId, request)
+                    patch(replyId) { it.copy(imageGeneration = true, imageRequest = request) }
+                    val result = executeImageRequest(request, route, latestUser?.attachments.orEmpty())
+                    ensureActive()
+                    val attachment = repository.attachGeneratedImage(replyId, result.bytes)
+                    generatedImageAttached = true
                     patch(replyId) {
-                        it.copy(
-                            content = accumulator.answer,
-                            reasoning = accumulator.thinking.ifEmpty { null },
-                            timeline = accumulator.blocks,
-                        )
+                        it.copy(attachments = listOf(attachment), imageGeneration = true)
                     }
-                } else {
-                    publishBuffered()
+                    dirty = true
                 }
             }
 
-            val finishedAt = System.currentTimeMillis()
+            suspend fun sendAttempt(textOnly: Boolean) {
+                contextRejection = null
+                try {
+                    streamAttempt(textOnly)
+                } catch (error: com.simplechat.app.data.AppTextException) {
+                    if (error.text.resId != R.string.error_context_budget) throw error
+                    contextRejection = CompactionRequestFailure(CompactionFailureKind.INPUT_LIMIT)
+                    failure = error.userMessage()
+                }
+            }
+
+            fun canRetryThisTurn(): Boolean = !pendingImageTool && prefix == null && contentChars == 0 && reasonBuf.isEmpty() &&
+                accumulator?.answer.isNullOrEmpty() && accumulator?.thinking.isNullOrEmpty() &&
+                generation == streamGeneration && !stoppedByUser
+
+            try {
+                if (!nativeGeminiTurn && !omitAttachmentsAndTools && searchRequested && route.searchApi.enabled) {
+                    val question = messages.lastOrNull { it.role == MessageRole.USER }?.content.orEmpty()
+                    val previousBlocks = prefix?.timeline.orEmpty()
+                    try {
+                        research = com.simplechat.app.net.searchAugmentation(route, question) { progress ->
+                            research = research.copy(blocks = progress)
+                            timeline = previousBlocks + progress
+                            accumulator?.seed(timeline)
+                            patch(replyId) { it.copy(timeline = timeline) }
+                        }
+                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                        throw cancelled
+                    } catch (toolError: Exception) {
+                        android.util.Log.w("SimpleChat/Tools", "search tool skipped")
+                        research = com.simplechat.app.net.SearchAugmentation()
+                        timeline = previousBlocks
+                        accumulator?.seed(timeline)
+                        patch(replyId) { it.copy(timeline = timeline) }
+                        if (route.showRetrySkipNotice) retrySkipNotice = Res.get(R.string.tool_request_skipped_continue)
+                    }
+                }
+                sendAttempt(omitAttachmentsAndTools)
+                var textOnly = omitAttachmentsAndTools
+                if (canDegrade && !textOnly && canRetryThisTurn()) {
+                    textOnly = true
+                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                    failure = null
+                    research = com.simplechat.app.net.SearchAugmentation()
+                    timeline = emptyList()
+                    accumulator?.seed(timeline)
+                    dirty = true
+                    if (route.showRetrySkipNotice) retrySkipNotice = Res.get(R.string.retry_skipped_notice)
+                    sendAttempt(textOnly)
+                }
+                val limit = contextRejection
+                if (limit != null && canRetryThisTurn()) {
+                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                    val recoveryWindow = minOf(options.model.contextWindow, limit.inputLimit ?: 128_000)
+                    try {
+                        if (compactHistory(conversationId, options.model,
+                                route.baseUrl.ifBlank { routeProvider.defaultBaseUrl }, route.apiKey,
+                                routeProvider.headersFor(openCodeSessionId), selectedApiStyle, recoveryWindow,
+                            ) && canRetryThisTurn()
+                        ) {
+                            failure = null
+                            if (route.showRetrySkipNotice) retrySkipNotice = Res.get(R.string.context_recovery_applied)
+                            sendAttempt(textOnly)
+                        }
+                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        failure = listOfNotNull(failure, compactionErrorText(error)).joinToString("\n")
+                    }
+                }
+            } catch (t: kotlinx.coroutines.CancellationException) {
+                cancelled = true
+            } catch (t: Throwable) {
+                if (!stoppedByUser) {
+                    val category = (t as? com.simplechat.app.data.AppTextException)?.text?.resId
+                    val http = (t as? com.simplechat.app.net.ServiceApi.HttpFailure)?.status
+                    android.util.Log.w("SimpleChat/Send", "protocol=$apiStyle error=${t.javaClass.simpleName} http=$http category=${Res.nameOrNull(category)}")
+                    failure = t.userMessage()
+                }
+            } finally {
+                flusher.cancel()
+            }
+
+            val finishedAt = SystemClock.elapsedRealtime()
+            accumulator?.settle(finishedAt)
+            if (reasoningStartedAt != null && reasoningEndedAt == null) reasoningEndedAt = finishedAt
+            refreshBuffered()
             /*
              * 这里**不做任何"审核/撤回"处理**。
              *
@@ -1748,8 +2200,13 @@ class ChatViewModel(
             val seconds = (finishedAt - startedAt).coerceAtLeast(1) / 1000f
             // 粗估：中文约 1 token ≈ 1.6 字符，仅用于性能仪表展示
             val tps = if (contentChars > 0) (contentChars / 1.6f) / seconds else null
-            val finalContent = accumulator?.answer ?: contentText
-            val finalReasoning = accumulator?.thinking ?: reasoningText
+            val finalContent = when {
+                generatedImageAttached && status == MessageStatus.DONE -> Res.get(R.string.image_generated)
+                pendingImageTool -> ""
+                else -> contentText
+            }
+            if (pendingImageTool) timeline = timeline.filterNot { it is ReplyBlock.Text }
+            val finalReasoning = reasoningText
             /*
              * **真实**思考时长 = 首条思维链 → 首条正文。
              *
@@ -1761,12 +2218,14 @@ class ChatViewModel(
              * 续写且这一轮没再思考时，思考时长要**沿用上一轮的值** ——
              * 否则一条「已深度思考 · 8 秒」的回复，点一下继续生成就变成"没思考过"。
              */
-            val thinkingMs = reasoningStartedAt?.let { start ->
-                (reasoningEndedAt ?: finishedAt) - start
+            val thinkingMs = if (accumulator != null) accumulator.thinkingMillis(finishedAt) else {
+                reasoningStartedAt?.let { start -> (reasoningEndedAt ?: finishedAt) - start }
             } ?: prefix?.reasoningSeconds?.times(1000)
 
             patch(replyId) {
                 it.copy(
+                    content = finalContent,
+                    reasoning = finalReasoning.ifEmpty { null },
                     status = status,
                     errorMessage = failure,
                     ttftMs = ttft,
@@ -1779,27 +2238,49 @@ class ChatViewModel(
 
             // 终写一次：即使进程被杀，内容也已落库
             val persisted = withContext(NonCancellable) {
+                // Wait for any in-flight checkpoint so it cannot overwrite the final row.
+                flusher.join()
                 runCatching {
-                    repository.finishMessage(
-                        id = replyId,
-                        content = finalContent,
-                        reasoning = finalReasoning,
-                        status = status,
-                        errorMessage = failure,
-                        ttftMs = ttft,
-                        tps = tps,
-                        thinkingMs = thinkingMs,
-                        timeline = timeline,
-                        stopReason = accumulator?.stopReason,
-                    )
-                    repository.touchConversation(conversationId)
+                    withContext(Dispatchers.IO) {
+                        repository.finishMessage(
+                            id = replyId,
+                            content = finalContent,
+                            reasoning = finalReasoning,
+                            status = status,
+                            errorMessage = failure,
+                            ttftMs = ttft,
+                            tps = tps,
+                            thinkingMs = thinkingMs,
+                            timeline = timeline,
+                            stopReason = accumulator?.stopReason,
+                            tokensIn = lastUsage?.promptTokens?.takeIf { it > 0 },
+                            tokensOut = lastUsage?.completionTokens?.takeIf { it > 0 },
+                            cacheHitTokens = lastUsage?.cacheHitTokens,
+                        )
+                        repository.touchConversation(conversationId)
+                    }
                 }.onFailure { error ->
                     android.util.Log.e("SimpleChat/Save", "Reply persistence failed: ${error.javaClass.simpleName}")
+                    Diagnostics.e("SAVE", "reply persistence failed", error)
                     if (conversationId == currentConversationId) {
                         banner = Res.get(R.string.reply_save_failed)
                         patch(replyId) { it.copy(status = MessageStatus.ERROR, errorMessage = Res.get(R.string.reply_save_failed)) }
                     }
                 }.isSuccess
+            }
+
+            /*
+             * 把这轮的用量写回内存里那条消息：落库的已是最新值，但界面统计读的是
+             * 内存列表 —— 不补这一下，「本会话消耗」要等重新打开会话才会更新。
+             */
+            if (persisted && conversationId == currentConversationId) {
+                patch(replyId) { message ->
+                    message.copy(
+                        tokensIn = lastUsage?.promptTokens?.takeIf { it > 0 },
+                        tokensOut = lastUsage?.completionTokens?.takeIf { it > 0 },
+                        cacheHitTokens = lastUsage?.cacheHitTokens,
+                    )
+                }
             }
 
             /*
@@ -1840,7 +2321,7 @@ class ChatViewModel(
              *
              * 扩展通道已经由服务端给了标题（[serverTitle]），就不再自己发一轮请求。
              */
-            if (generation == streamGeneration && conversationId == currentConversationId && status == MessageStatus.DONE && title.isNullOrEmpty()) {
+            if (!pendingImageTool && generation == streamGeneration && conversationId == currentConversationId && status == MessageStatus.DONE && title.isNullOrEmpty()) {
                 maybeGenerateTitle(conversationId)
             }
         }
@@ -1852,11 +2333,21 @@ class ChatViewModel(
      * 与 [`buildRequestMessages`] 的差别不只是协议：扩展通道的 `system` 只有一个字符串，
      * 所以压缩摘要只能**拼进系统提示词**，不能像 OpenAI 通道那样再塞一条 system 消息。
      */
-    private suspend fun buildAnthropicRequestNow(prefix: UiMessage?): AnthropicRequest {
-        skippedNoVision = 0; skippedUnreadable = 0
+    private suspend fun buildAnthropicRequestNow(
+        prefix: UiMessage?, research: String, route: StoredSettings, options: ConversationSettings,
+        searchRequested: Boolean, omitAttachmentsAndTools: Boolean,
+        generateImageTool: Boolean = false,
+    ): AnthropicRequest {
+        skippedNoVision = 0; skippedUnreadable = 0; skippedUnsupportedFiles = 0
         val active = validCompaction(messages, compaction)
+        val previousModel = modelSwitchedFrom(messages, options.model.id)
+        val modelSwitchContext = previousModel?.let {
+            Res.get(R.string.model_switch_context, it, options.model.id)
+        }
         val system = buildString {
-            append(settings.composedSystemPrompt(presets))
+            append(options.composedSystemPrompt(presets))
+            if (research.isNotBlank()) appendLine().appendLine(research)
+            if (modelSwitchContext != null) appendLine().appendLine(modelSwitchContext)
             if (active != null && active.summary.isNotBlank()) {
                 if (isNotEmpty()) appendLine().appendLine()
                 append(Res.get(R.string.prompt_recap_intro))
@@ -1864,13 +2355,13 @@ class ChatViewModel(
             }
         }
         val requestTitle = shouldRequestTitle()
-        if (requestTitle) serverTitleRequestedFor = currentConversationId
 
         /*
          * 续写时把这条 assistant 从历史里摘出去：它要以**末尾前缀**的身份出现，
          * 留在历史里就是同一轮回答发了两遍，服务端会把它当成两个不同的回答。
          */
-        val path = orderedOutgoingMessages(messages, active)
+        val outgoingMessages = orderedOutgoingMessages(messages, active)
+        val preparedPath = outgoingMessages
             .filter { it.id != prefix?.id }
             /*
              * 附件在这里整理：落盘字节读回内存（`toDataUrl()` / image block 只认内联），
@@ -1881,33 +2372,43 @@ class ChatViewModel(
              * `unsupported image`，而且每一轮都复现（v1.1.2 的真实事故）。
              */
             .map { message ->
-                if (message.attachments.isEmpty()) message
-                else message.copy(attachments = outgoingAttachments(message.attachments))
+                val outgoing = if (message.role != MessageRole.USER) message
+                else if (omitAttachmentsAndTools) message.copy(attachments = emptyList())
+                else prepareOutgoingUser(message, route, options.model)
+                preserveTurnWhenAttachmentsSkipped(message, outgoing)
             }
 
+        val path = preparedPath
+
         /*
-         * 官方域才发 DeepSeek 扩展字段（safety_check / 搜索工具 / 服务端标题 /
+         * 官方域才发 DeepSeek 扩展字段（搜索工具 / 服务端标题 /
          * latest_reminder 角色 / thinking.type=disabled）。自建网关或 Claude 兼容中转
          * 遇到这些会 400，而不是"忽略" —— 见 `buildAnthropicRequest` 的说明。
          */
         val officialDeepSeek = isOfficialDeepSeekEndpoint(
-            stored.baseUrl.ifBlank { providerKind.defaultBaseUrl },
+            route.baseUrl,
         )
         return buildAnthropicRequest(
-            model = settings.model.id,
+            model = options.model.id,
             systemPrompt = system,
             path = path,
-            searchEnabled = webSearch,
-            thinkingEnabled = settings.thinkingEnabled,
+            searchEnabled = searchRequested && !route.searchApi.enabled,
+            reasoningEffort = options.model.resolveReasoningEffort(options.reasoningEffort),
+            thinkingEnabled = options.thinkingEnabled,
             requestTitle = requestTitle,
             latestReminder = latestReminder(),
-            maxTokens = settings.maxTokens,
+            maxTokens = options.maxTokens,
+            outputLimit = options.model.maxOutputTokens,
             prefix = prefix,
             deepSeekExtensions = officialDeepSeek,
-            temperature = settings.temperature.toDouble(),
-            topP = settings.topP.toDouble(),
+            allowServerTools = !omitAttachmentsAndTools,
+            includeAttachments = !omitAttachmentsAndTools,
+            generateImageTool = generateImageTool,
+            temperature = options.temperature.toDouble(),
+            topP = options.topP.toDouble(),
         ).also { request ->
             if (request.messages.none { it.role == "user" }) throw com.simplechat.app.data.AppTextException(R.string.error_no_sendable_messages)
+            if (request.title != null) serverTitleRequestedFor = currentConversationId
         }
     }
 
@@ -1960,6 +2461,8 @@ class ChatViewModel(
      * 3. 每个会话只尝试一次。
      */
     private fun maybeGenerateTitle(conversationId: String) {
+        // Official routes already requested an eligible inline title. Keep the local title otherwise.
+        if (isOfficialDeepSeekEndpoint(stored.baseUrl) || apiStyle == ApiStyle.ANTHROPIC) return
         if (titleGeneratedFor == conversationId) return
         if (isStreaming) return
 
@@ -1993,6 +2496,7 @@ class ChatViewModel(
             val collected = StringBuilder()
             runCatching {
                 chatApi.streamChat(
+                    apiStyle = if (apiStyle == ApiStyle.OPENAI_RESPONSES) apiStyle else ApiStyle.OPENAI,
                     baseUrl = stored.baseUrl.ifBlank { providerKind.defaultBaseUrl },
                     apiKey = stored.apiKey,
                     model = model,
@@ -2061,19 +2565,35 @@ class ChatViewModel(
      * 以前用视觉模型聊过的）。让整条对话因为一张旧图发不出去，代价太大 ——
      * 所以按模型能力过滤，并给一句普通提醒（不是错误）。
      */
-    private suspend fun outgoingAttachments(attachments: List<Attachment>): List<Attachment> {
+    private suspend fun outgoingAttachments(attachments: List<Attachment>, route: StoredSettings, model: ModelInfo): List<Attachment> {
         if (attachments.isEmpty()) return attachments
-        var filtered = attachments
-        if (!settings.model.supportsVision) {
-            filtered = attachments.filterNot { it.isImage }
-            val dropped = attachments.size - filtered.size
-            skippedNoVision += dropped
+        val compatible = if (route.supportsFileReferences) attachments else attachments.mapNotNull { file ->
+            when {
+                file.fileId == null -> file
+                !file.remoteImage && file.data.isNotBlank() -> file.copy(fileId = null, fileEndpoint = null, fileAccount = null)
+                file.remoteImage && !model.supportsVision -> { skippedNoVision++; null }
+                else -> { skippedUnsupportedFiles++; null }
+            }
+        }
+        compatible.filter { it.fileId != null }.forEach { file ->
+            val endpoint = route.filesApi.endpoint(route.baseUrl, route.filesApi.filesPath)
+            val chatHost = java.net.URI(route.baseUrl).host
+            val fileHost = java.net.URI(endpoint).host
+            val account = com.simplechat.app.data.FileApiTextCache.fingerprint(route.filesApi.key(route.apiKey))
+            if (file.fileEndpoint != endpoint || chatHost != fileHost || file.fileAccount != account)
+                throw com.simplechat.app.data.AppTextException(R.string.service_file_endpoint_mismatch)
+        }
+        var filtered = compatible
+        if (!model.supportsVision) {
+            filtered = compatible.filterNot { it.isImage }
+            skippedNoVision += compatible.count { it.isImage }
         }
         // 字节读回 + 图片按真实内容校正（格式不收的转码、坏图丢掉）。见 ApiImage
         val (prepared, unreadable) = repository.prepareRequestAttachments(filtered)
         skippedUnreadable += unreadable
         if (showImageSkipNotice) {
             imageSkipNotice = when {
+                skippedUnsupportedFiles > 0 -> Res.get(R.string.attachments_skipped_unsupported, skippedUnsupportedFiles)
                 skippedUnreadable > 0 -> Res.get(R.string.images_skipped_unreadable, skippedUnreadable)
                 skippedNoVision > 0 -> Res.get(R.string.images_skipped_no_vision, skippedNoVision)
                 else -> null
@@ -2082,36 +2602,30 @@ class ChatViewModel(
         return prepared
     }
 
-    /**
-     * 给正文加一行"当前时间"。
-     *
-     * 格式固定为 `yyyy-MM-dd HH:mm`：**不随界面语言变** —— 模型对 ISO 风格的
-     * 日期最敏感，而 `11月19日` 这种本地化写法在不同语言下还会换顺序，
-     * 对"算一下隔了几天"这类推理没有好处。
-     */
-    private fun stampedText(text: String): String {
-        val cjk = Res.bool(R.bool.ui_is_cjk)
-        val locale = if (cjk) Locale.SIMPLIFIED_CHINESE else Locale.getDefault()
-        /*
-         * 用**自然语言**写日期，而不是 `2026-11-19 15:35`。
-         *
-         * ISO 格式对排序友好，但对"今天是星期几""上周三说过什么"这类问题并不直观：
-         * 模型得自己从日期推星期。直接给出「2026年11月19日 星期四 15:35」，
-         * 星期、年月日、时刻一次到位，正是人类在对话里报时间的方式。
-         *
-         * 语言跟着界面走：英文界面给 `Thursday, 19 November 2026 15:35`，
-         * 避免中文日期混在英文回答里。
-         */
-        val pattern = if (cjk) "yyyy年M月d日 EEEE HH:mm" else "EEEE, d MMMM yyyy HH:mm"
-        val formatted = LocalDateTime.now().format(DateTimeFormatter.ofPattern(pattern, locale))
-        return Res.get(R.string.prompt_current_time, formatted) + "\n\n" + text
+    private suspend fun prepareOutgoingUser(message: UiMessage, route: StoredSettings, model: ModelInfo): UiMessage {
+        val (text, attachments) = repository.prepareLongTextForRequest(message.content, message.attachments, route)
+        return message.copy(content = text, attachments = outgoingAttachments(attachments, route, model))
     }
 
-    private suspend fun buildRequestMessages(): List<OutMessageDto> {
-        skippedNoVision = 0; skippedUnreadable = 0
-        val request = mutableListOf<OutMessageDto>()
+    private fun preserveTurnWhenAttachmentsSkipped(original: UiMessage, outgoing: UiMessage): UiMessage =
+        if (original.role == MessageRole.USER && original.content.isBlank() && original.attachments.isNotEmpty() &&
+            outgoing.attachments.isEmpty()
+        ) outgoing.copy(content = Res.get(R.string.prompt_attachments_skipped)) else outgoing
 
-        val system = settings.composedSystemPrompt(presets)
+    private suspend fun buildRequestMessages(
+        research: String, route: StoredSettings, options: ConversationSettings,
+        omitAttachmentsAndTools: Boolean,
+    ): List<OutMessageDto> {
+        skippedNoVision = 0; skippedUnreadable = 0; skippedUnsupportedFiles = 0
+        val request = mutableListOf<OutMessageDto>()
+        if (research.isNotBlank()) request += OutMessageDto("system", MessageContent.text(research))
+        modelSwitchedFrom(messages, options.model.id)?.let { previousModel ->
+            request += OutMessageDto("system", MessageContent.text(
+                Res.get(R.string.model_switch_context, previousModel, options.model.id),
+            ))
+        }
+
+        val system = options.composedSystemPrompt(presets)
         if (system.isNotBlank()) {
             request += OutMessageDto(role = "system", content = MessageContent.text(system))
         }
@@ -2132,35 +2646,19 @@ class ChatViewModel(
 
         // 顺序规则见 `orderedOutgoingMessages`（纯函数，有单测钉死）
         val outgoingMessages = orderedOutgoingMessages(messages, active)
-
-        /*
-         * 时间戳只挂在**最后一条 user 消息**上，而且**不写库**。
-         *
-         * 为什么不放进 system：DeepSeek / Anthropic 的 prompt 缓存按**前缀**匹配，
-         * system 是序列的第一个元素 —— 它的末尾一变，后面整段历史全部 cache miss，
-         * 长对话每轮都在白付全量上下文的价钱。挂在最后一条用户消息上，前缀
-         * （system + 历史）原样不动，只有本来就要重新发的那一条变了。
-         *
-         * 也不写进 message.content：那是用户的原话，掺进时间会出现在气泡里，
-         * 也会进搜索索引与备份。
-         */
-        val lastUserIndex = outgoingMessages.indexOfLast { it.role == MessageRole.USER }
-
-        outgoingMessages.forEachIndexed { index, message ->
+        outgoingMessages.forEach { message ->
             /*
              * 空消息不发：历史里出错/被中断的 assistant、既没正文也没附件的 user
              * 是可能存在的，而部分兼容网关对空 `content` 直接 400 ——
              * 一条空消息不值得让整段历史发不出去（见 `isSendableOutgoing`）。
              */
-            val outgoing = if (message.role == MessageRole.USER && message.attachments.isNotEmpty()) {
-                message.copy(attachments = outgoingAttachments(message.attachments))
+            val outgoing = if (message.role == MessageRole.USER) {
+                if (omitAttachmentsAndTools) message.copy(attachments = emptyList())
+                else prepareOutgoingUser(message, route, options.model)
             } else message
-            if (!isSendableOutgoing(outgoing)) return@forEachIndexed
-            /*
-             * 只在最后一条用户消息前加时间：模型据此知道"现在是什么时候"，
-             * 而历史里那些"昨天/下周"的指代仍然按各自发送时的语境理解。
-             */
-            val body = if (index == lastUserIndex) stampedText(outgoing.content) else outgoing.content
+            val sendable = preserveTurnWhenAttachmentsSkipped(message, outgoing)
+            if (!isSendableOutgoing(sendable)) return@forEach
+            val body = sendable.content
             request += OutMessageDto(
                 role = if (message.role == MessageRole.USER) "user" else "assistant",
                 /*
@@ -2170,10 +2668,10 @@ class ChatViewModel(
                  * assistant 消息即使历史里挂着附件也只发正文：图片放进 assistant
                  * 在协议里是不合法的（会 400），而 AI 回复本来也不该带图。
                  */
-                content = if (message.role != MessageRole.USER || message.attachments.isEmpty()) {
+                content = if (message.role != MessageRole.USER || sendable.attachments.isEmpty()) {
                     MessageContent.text(body)
                 } else {
-                    userContent(body, outgoing.attachments)
+                    userContent(body, sendable.attachments)
                 },
             )
         }
@@ -2206,8 +2704,8 @@ class ChatViewModel(
          * 相邻两次屏幕更新实际落在 50～100ms 之间抖，看着就是一跳一跳。
          * 官方只有 rAF 一把尺子，所以是连续流动的。
          *
-         * 单次提交的**重活由渲染层兜住**：`rememberSmoothReveal`（`ui/markdown/SmoothReveal.kt`）按帧耗时自适应
-         * 冷却（`cooldownAfter`，上限 96ms），一帧被拖长就自动少放几个字。
+         * 单次提交的**重活由渲染层兜住**：`MarkdownText` 现在按帧耗时自适应
+         * 冷却（`adaptiveCooldownMs`），一帧被拖长就自动少跳几帧。
          * 也就是说"提频"与"防卡"分别由两层各管一段，而不是靠一个保守的常数两头兼顾。
          *
          * ⚠️ 真机上若出现滚动掉帧，先量一次帧时间再回调这个值 ——
@@ -2233,9 +2731,6 @@ class ChatViewModel(
          */
         private const val ContextStatsDebounceMs = 250L
 
-        /** 压缩时保留最近多少条完整消息。 */
-        private const val KEEP_RECENT = 6
-
         /**
          * 压缩用的系统提示词见 `prompt_compact_system`（`strings.xml`，随界面语言）。
          *
@@ -2257,9 +2752,7 @@ class ChatViewModel(
 }
 
 private fun String.toConversationModeSafe(): ConversationMode =
-    runCatching { ConversationMode.valueOf(this) 
-/** 时间戳格式：与语言无关，模型最容易正确解析的那一种。 */
-}.getOrDefault(ConversationMode.CREATIVE)
+    runCatching { ConversationMode.valueOf(this) }.getOrDefault(ConversationMode.CREATIVE)
 
 /**
  * 思考耗时 → 展示用秒数。
@@ -2270,4 +2763,11 @@ private fun String.toConversationModeSafe(): ConversationMode =
  * `internal` 是为了能单测 —— 取整边界是最容易写错、又最不容易被发现的地方。
  */
 internal fun thinkingSeconds(ms: Long): Long = ((ms + 500) / 1000).coerceAtLeast(1)
+
+
+
+
+
+
+
 

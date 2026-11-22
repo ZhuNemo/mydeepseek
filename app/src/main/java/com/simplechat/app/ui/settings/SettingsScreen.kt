@@ -5,12 +5,15 @@ import java.io.File
 import android.net.Uri
 import android.provider.DocumentsContract
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.ui.semantics.Role
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,6 +23,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -36,9 +40,6 @@ import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.ui.graphics.Color
-import androidx.compose.material3.TextButton
-import androidx.compose.material3.AlertDialog
 import kotlinx.coroutines.flow.MutableStateFlow
 import androidx.compose.runtime.collectAsState
 import androidx.compose.material3.LinearProgressIndicator
@@ -49,6 +50,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -63,39 +65,52 @@ import com.simplechat.app.BuildConfig
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import com.simplechat.app.ui.common.MenuShape
-import com.simplechat.app.ui.common.ContainerShape
 import com.simplechat.app.ui.common.BubbleShapeOut
 import com.simplechat.app.App
 import com.simplechat.app.R
 import com.simplechat.app.data.ApiKey
 import com.simplechat.app.net.UpdateChecker
+import com.simplechat.app.net.DeepSeekBalance
+import com.simplechat.app.net.isOfficialDeepSeekEndpoint
 import com.simplechat.app.data.AppLanguage
 import com.simplechat.app.data.ImportMode
 import com.simplechat.app.data.Res
-import com.simplechat.app.data.DEFAULT_DAV_PATH
 import com.simplechat.app.data.StoredSettings
-import com.simplechat.app.data.sync.SyncStage
-import com.simplechat.app.data.sync.SyncState
+import com.simplechat.app.data.TokenEstimate
+import com.simplechat.app.data.Diagnostics
+import com.simplechat.app.data.SettingsStore
+import com.simplechat.app.data.normalizeLoadingWord
 import com.simplechat.app.data.ApiProfile
 import com.simplechat.app.data.userMessage
 import com.simplechat.app.data.copyExportFile
 import com.simplechat.app.data.stageArchive
+import com.simplechat.app.net.ApiStyle
+import com.simplechat.app.net.ModelCapabilityOverride
+import com.simplechat.app.net.ReasoningWire
 import com.simplechat.app.net.ModelCatalog
 import com.simplechat.app.net.DeepSeekTts
 import com.simplechat.app.net.ProviderKind
+import com.simplechat.app.ui.lock.AppLockType
+import com.simplechat.app.ui.lock.PinSetupFlow
+import com.simplechat.app.ui.lock.hasDeviceLock
+import com.simplechat.app.ui.lock.openSecuritySettings
 import com.simplechat.app.ui.common.AppIcons
+import com.simplechat.app.MainActivity
 import com.simplechat.app.ui.common.AppConfirmDialog
 import com.simplechat.app.ui.common.AppMenu
 import com.simplechat.app.ui.common.AppMenuCheck
@@ -109,6 +124,7 @@ import com.simplechat.app.ui.common.AppSwitch
 import com.simplechat.app.ui.common.ContainerShape
 import com.simplechat.app.ui.common.IconCircleButton
 import com.simplechat.app.ui.common.PillShape
+import com.simplechat.app.ui.common.Space
 import com.simplechat.app.ui.common.screenTransform
 import com.simplechat.app.ui.theme.AccentColor
 import com.simplechat.app.ui.theme.LocalChatColors
@@ -124,28 +140,52 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
- * 设置页内的一级 / 二级页面。
+ * 设置页内的页面层级。
  *
- * [depth] 只用来判断转场方向：二级页从右侧进来，返回时原路退回。
+ * [depth] 只用来判断转场方向：子页从右侧进来，返回时原路退回。
  */
-private enum class SettingsPage(val depth: Int) {
-    ROOT(0),
-    DATA(1),
-    API(1),
-    API_PROFILES(2),
-    /** 云端同步（WebDAV）。 */
-    SYNC(1),
-    PRESETS(1),
-    FONT(1),
+private enum class SettingsPage(private val parentName: String?) {
+    ROOT(null),
+    DATA("ROOT"),
+    API_PROFILES("ROOT"),
+    API_PROFILE("API_PROFILES"),
+    SEARCH_API("API_PROFILES"),
+    FILES_API("API_PROFILES"),
+    IMAGE_API("API_PROFILES"),
+    PRESETS("ROOT"),
+    /** 外观：主题模式、主题色、字体大小入口。 */
+    APPEARANCE("ROOT"),
+    /** 字体大小（外观 → 二级）。 */
+    FONT("APPEARANCE"),
+    /** 对话行为：思考折叠、搜索范围等开关。 */
+    CHAT("ROOT"),
+    SEARCH_SETTINGS("CHAT"),
+    LOADING_WORDS("CHAT"),
+    /** 安全与隐私：应用锁、保险箱。 */
+    SECURITY("ROOT"),
     /** 朗读音色（系统 TTS）。 */
-    VOICE(1),
-    ABOUT(1),
+    VOICE("ROOT"),
+    /** 用量与余额：账户余额 + 全部会话累计消耗。 */
+    USAGE("ROOT"),
+    ABOUT("ROOT"),
     /** 开源许可与版权清单（关于 → 二级）。 */
-    LICENSES(2),
+    LICENSES("ABOUT"),
+    /** 诊断日志（关于 → 二级；复制/导出当前运行日志）。 */
+    DIAGNOSTICS("ABOUT");
+
+    /** 返回键回到哪一页；层级只在这里声明一次，转场方向也由它推出。 */
+    val parent: SettingsPage? get() = parentName?.let { valueOf(it) }
+    val depth: Int get() = parent?.let { it.depth + 1 } ?: 0
+}
+
+private enum class ModelCapabilityField(val label: Int) {
+    VISION(R.string.api_model_vision), THINKING(R.string.api_model_thinking),
+    CONTEXT(R.string.api_model_context), WIRE(R.string.api_model_wire),
 }
 
 private sealed interface SettingsDialog {
@@ -154,6 +194,8 @@ private sealed interface SettingsDialog {
     data object Model : SettingsDialog
     /** 手动填写模型 id：端点没实现 `/models`、或列表里没有目标模型时的出口。 */
     data object ModelManual : SettingsDialog
+    data object ModelCapabilities : SettingsDialog
+    data class ModelCapability(val field: ModelCapabilityField) : SettingsDialog
     data object ApiKey : SettingsDialog
     data class ApiProfileName(val profile: ApiProfile? = null, val copyCurrent: Boolean = false) : SettingsDialog
     data class DeleteApiProfile(val profile: ApiProfile) : SettingsDialog
@@ -163,11 +205,6 @@ private sealed interface SettingsDialog {
     data object ApiStyle : SettingsDialog
     /** 地区（时间地点提醒里的地点那一项）。 */
     data object Location : SettingsDialog
-    /** 云端同步：服务器地址 / 账号 / 应用密码 / 远程目录。 */
-    data object SyncServer : SettingsDialog
-    data object SyncUser : SettingsDialog
-    data object SyncPassword : SettingsDialog
-    data object SyncPath : SettingsDialog
     /** 编辑预设；[preset] 为 null 表示新建。 */
     data class PresetEditor(val preset: Preset?) : SettingsDialog
     data class DeletePreset(val preset: Preset) : SettingsDialog
@@ -183,6 +220,7 @@ private sealed interface SettingsDialog {
 private enum class ApiStylePreference(val labelRes: Int) {
     AUTO(R.string.api_style_auto),
     OPENAI(R.string.api_style_openai),
+    OPENAI_RESPONSES(R.string.api_style_openai_responses),
     ANTHROPIC(R.string.api_style_anthropic),
     ;
 
@@ -204,16 +242,41 @@ private enum class ApiStylePreference(val labelRes: Int) {
 /**
  * 设置页。
  *
- * 一级列表只放**入口**，具体编辑都进二级页面 —— 一级列表保持一屏内可扫完。
- * 外观例外：只有三个互斥选项，弹个菜单比切页面快。
- *
- * 每个一级入口配**各自不同**的图标（数据管理 / API 配置 / 外观 / 字体大小 /
- * 自动折叠思考 / 关于）；二级页面里的行不再配图标，避免图标语义打架。
+ * 一级页面按账户、个性化、对话和数据管理分组。
+ * 外观包含主题、主题色和字体大小；对话行为包含思考折叠和搜索范围。
+ * 子页面使用 [SettingsPage.parent] 处理返回路径。
  */
 @Composable
 fun SettingsScreen(
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
+    startAtImageApi: Boolean = false,
+    startAtApiProfiles: Boolean = false,
+    /** 从「安全与隐私」进保险箱。保险箱是根界面的路由，设置页只负责转达。 */
+    onOpenVault: () -> Unit = {},
+    /** 标题的共享元素修饰符（页面转场用）。 */
+    titleModifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    SettingsScreen(
+        onBack = onBack,
+        modifier = modifier,
+        store = (context.applicationContext as App).container.settingsStore,
+        startAtImageApi = startAtImageApi,
+        startAtApiProfiles = startAtApiProfiles,
+        onOpenVault = onOpenVault,
+        titleModifier = titleModifier,
+    )
+}
+
+@Composable
+internal fun SettingsScreen(
+    onBack: () -> Unit,
+    modifier: Modifier,
+    store: SettingsStore,
+    startAtImageApi: Boolean = false,
+    startAtApiProfiles: Boolean = false,
+    onOpenVault: () -> Unit = {},
     /** 标题的共享元素修饰符（页面转场时由 `RootScreen` 注入）。 */
     titleModifier: Modifier = Modifier,
 ) {
@@ -221,12 +284,34 @@ fun SettingsScreen(
     val context = LocalContext.current
     val container = (context.applicationContext as App).container
     val scope = rememberCoroutineScope()
-    val store = container.settingsStore
     val repository = container.chatRepository
 
     var stored by remember { mutableStateOf(StoredSettings()) }
-    // rememberSaveable：换语言会 recreate()（见 MainActivity），二级页要停在原地
-    var page by rememberSaveable { mutableStateOf(SettingsPage.ROOT) }
+    var settingsLoaded by remember { mutableStateOf(false) }
+    // 换语言会重建 Activity，保留设置页的当前位置。
+    var page by rememberSaveable { mutableStateOf(when {
+        startAtImageApi -> SettingsPage.IMAGE_API
+        startAtApiProfiles -> SettingsPage.API_PROFILES
+        else -> SettingsPage.ROOT
+    }) }
+    var editingProfileId by rememberSaveable { mutableStateOf<String?>(null) }
+    val editingProfile = stored.apiProfiles.firstOrNull { it.id == editingProfileId }
+    val editingSettings = editingProfile?.let { profile ->
+        stored.copy(providerId = profile.providerId, baseUrl = profile.baseUrl,
+            modelId = profile.modelId, apiStyleId = profile.apiStyleId, modelIds = profile.modelIds,
+            modelContextWindows = profile.modelContextWindows,
+            modelMetadata = profile.modelMetadata,
+            modelOverrides = profile.modelOverrides,
+            webSearch = profile.webSearch)
+    }
+    var savingService by remember { mutableStateOf(false) }
+    var serviceBack by remember { mutableStateOf<(() -> Unit)?>(null) }
+
+    var serviceVisit by remember { mutableStateOf(0) }
+    fun openService(target: SettingsPage) {
+        serviceVisit++
+        page = target
+    }
     var dialog by remember { mutableStateOf<SettingsDialog?>(null) }
     var testing by remember { mutableStateOf(false) }
     var testResult by remember { mutableStateOf<String?>(null) }
@@ -236,6 +321,21 @@ fun SettingsScreen(
             try { action(); profileError = null }
             catch (error: CancellationException) { throw error }
             catch (error: Exception) { profileError = error.userMessage() }
+        }
+    }
+    // 设置应用锁密码的整屏流程（没有密码时开启 PIN 锁要先设一个）
+    var pinSetupVisible by remember { mutableStateOf(false) }
+    var loadingWordsError by remember { mutableStateOf<String?>(null) }
+    fun updateLoadingWordsSettings(save: suspend () -> Unit) {
+        scope.launch {
+            try {
+                save()
+                loadingWordsError = null
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                loadingWordsError = error.userMessage()
+            }
         }
     }
     var dataMessage by remember { mutableStateOf<String?>(null) }
@@ -253,14 +353,6 @@ fun SettingsScreen(
         onDispose { pendingArchive?.delete(); pendingImport?.delete() }
     }
     var presets by remember { mutableStateOf<List<Preset>>(emptyList()) }
-
-    /*
-     * 同步状态从容器里那个**长活**的 SyncManager 读：它自带作用域，
-     * 用户点完「立即同步」就切回对话页也不会中断；回到设置页还能看到结果。
-     */
-    val syncState by container.syncManager.state.collectAsState()
-    var syncTesting by remember { mutableStateOf(false) }
-    var syncTestMessage by remember { mutableStateOf<String?>(null) }
 
     /*
      * 朗读音色。
@@ -309,8 +401,14 @@ fun SettingsScreen(
             speaker.consumeError()
         }
     }
-    LaunchedEffect(page) {
-        if (page == SettingsPage.VOICE && speechVoices == null) {
+    LaunchedEffect(stored.readAloudEnabled) {
+        if (!stored.readAloudEnabled) {
+            speaker.stop()
+            speechError = null
+        }
+    }
+    LaunchedEffect(page, stored.readAloudEnabled) {
+        if (stored.readAloudEnabled && page == SettingsPage.VOICE && speechVoices == null) {
             speechError = null
             /*
              * 加超时兜底：个别设备的 TTS 引擎初始化回调可能**永远不来**
@@ -323,16 +421,57 @@ fun SettingsScreen(
         }
     }
 
-    LaunchedEffect(Unit) { store.flow.collect { stored = it } }
+    LaunchedEffect(store) { store.flow.collect { stored = it; settingsLoaded = true } }
     LaunchedEffect(Unit) { repository.observePresets().collect { presets = it } }
 
-    // 二级页面按返回键先回一级，而不是直接退出设置
-    fun previousPage() { page = if (page == SettingsPage.API_PROFILES) SettingsPage.API else SettingsPage.ROOT }
-    BackHandler(enabled = page != SettingsPage.ROOT) { previousPage() }
+    fun previousPage() {
+        if (savingService) return
+        if (page == SettingsPage.IMAGE_API && startAtImageApi || page == SettingsPage.API_PROFILES && startAtApiProfiles) {
+            onBack()
+            return
+        }
+        profileError = null
+        testResult = null
+        page = page.parent ?: SettingsPage.ROOT
+    }
+    fun requestBack() {
+        if (savingService) return
+        if (page == SettingsPage.ROOT) onBack()
+        else if (page in listOf(SettingsPage.SEARCH_API, SettingsPage.FILES_API, SettingsPage.IMAGE_API) && settingsLoaded) serviceBack?.invoke()
+        else previousPage()
+    }
+    LaunchedEffect(startAtImageApi) { if (startAtImageApi) page = SettingsPage.IMAGE_API }
+    BackHandler(enabled = page != SettingsPage.ROOT) { requestBack() }
     LaunchedEffect(stored.activeApiProfileId, stored.baseUrl) { testResult = null }
 
-    val provider = runCatching { ProviderKind.valueOf(stored.providerId) }
+    val profileSettings = editingSettings ?: stored
+    val provider = runCatching { ProviderKind.valueOf(profileSettings.providerId) }
         .getOrDefault(ProviderKind.DEEPSEEK)
+    fun editProfile(change: (ApiProfile) -> ApiProfile) {
+        val id = editingProfileId ?: return
+        updateProfile { store.updateApiProfile(id, change) }
+    }
+    fun openProfile(profile: ApiProfile) {
+        editingProfileId = profile.id
+        testResult = null
+        profileError = null
+        page = SettingsPage.API_PROFILE
+    }
+    var keyDialogValue by remember { mutableStateOf("") }
+    fun pickProfileField(field: SettingsDialog) {
+        if (field != SettingsDialog.ApiKey) {
+            dialog = field
+            return
+        }
+        val id = editingProfileId ?: return
+        updateProfile {
+            val key = store.readApiKeyForProfile(id)
+            if (page == SettingsPage.API_PROFILE && editingProfileId == id) {
+                keyDialogValue = key
+                dialog = field
+            }
+        }
+    }
 
     val themeMode = runCatching { ThemeMode.valueOf(stored.themeModeId) }
         .getOrDefault(ThemeMode.SYSTEM)
@@ -380,7 +519,7 @@ fun SettingsScreen(
         }
     }
 
-    fun prepareExport(extension: String, launch: (String) -> Unit, generate: suspend (File) -> Unit) {
+    fun prepareExport(extension: String, launch: (String) -> Unit, prefix: String = "simplechat-", datePattern: String = "yyyyMMdd-HHmm", generate: suspend (File) -> Unit) {
         if (archiveProgress.value != null || importProgress.value != null || importReading) return
         archiveSaving = false
         archiveProgress.value = 0f
@@ -395,8 +534,8 @@ fun SettingsScreen(
                     check(target.length() > 0) { Res.get(R.string.export_failed_short) }
                 }
                 pendingArchive = target
-                val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
-                launch("simplechat-$stamp.$extension")
+                val stamp = SimpleDateFormat(datePattern, Locale.US).format(Date())
+                launch("$prefix$stamp.$extension")
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
@@ -469,16 +608,6 @@ fun SettingsScreen(
         archiveProgress.value = 1f
     }
 
-    val crashLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) {
-        uri: Uri? -> savePreparedExport(uri)
-    }
-    fun startCrashExport() = prepareExport("txt", { crashLauncher.launch(it) }) { file ->
-        val report = com.simplechat.app.data.CrashDiagnostics.file(context)
-            ?: error(Res.get(R.string.crash_report_missing))
-        report.inputStream().use { input -> file.outputStream().use { input.copyTo(it) } }
-        archiveProgress.value = 1f
-    }
-
     val archiveLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/zip"),
     ) { uri: Uri? -> savePreparedExport(uri) }
@@ -486,30 +615,50 @@ fun SettingsScreen(
     fun startArchiveExport() = prepareExport("zip", { archiveLauncher.launch(it) }) { file ->
         stageArchive(file) { repository.exportArchive(it) { p -> archiveProgress.value = p } }
     }
+    fun startDeepSeekExport() = prepareExport("zip", { archiveLauncher.launch(it) }, prefix = "deepseek_data-", datePattern = "yyyy-MM-dd") { file ->
+        repository.exportDeepSeekArchive(file) { p -> archiveProgress.value = p }
+        java.util.zip.ZipFile(file).use { zip ->
+            check(zip.entries().asSequence().firstOrNull()?.name == "manifest.json")
+            check(zip.getEntry("chat_session_index.json") != null && zip.getEntry("user.json") == null)
+        }
+    }
     // ── 页面 ──────────────────────────────────────────────
 
     Column(
         modifier = modifier
             .fillMaxSize()
-            .background(colors.settingsBackground),
+            .background(colors.settingsBackground)
+            .imePadding(),
     ) {
         SettingsTopBar(
             titleModifier = titleModifier,
             title = when (page) {
                 SettingsPage.ROOT -> stringResource(R.string.settings_title)
                 SettingsPage.DATA -> stringResource(R.string.settings_data)
-                SettingsPage.API -> stringResource(R.string.settings_api)
-                SettingsPage.SYNC -> stringResource(R.string.settings_sync)
-                SettingsPage.API_PROFILES -> stringResource(R.string.api_profiles_title)
+                SettingsPage.API_PROFILES -> stringResource(R.string.settings_api)
+                SettingsPage.API_PROFILE -> editingProfile?.name
+                    ?: stringResource(R.string.settings_api)
+                SettingsPage.SEARCH_API -> stringResource(R.string.service_search_title)
+                SettingsPage.FILES_API -> stringResource(R.string.service_files_title)
+                SettingsPage.IMAGE_API -> stringResource(R.string.image_api_title)
                 SettingsPage.PRESETS -> stringResource(R.string.settings_presets)
+                SettingsPage.APPEARANCE -> stringResource(R.string.settings_appearance)
+                SettingsPage.SECURITY -> stringResource(R.string.settings_group_security)
                 SettingsPage.FONT -> stringResource(R.string.settings_font_size)
-                SettingsPage.VOICE -> stringResource(R.string.tts_voice)
+                SettingsPage.CHAT -> stringResource(R.string.settings_chat_behavior)
+                SettingsPage.SEARCH_SETTINGS -> stringResource(R.string.settings_search_options)
+                SettingsPage.LOADING_WORDS -> stringResource(R.string.settings_loading_words)
+                SettingsPage.VOICE -> stringResource(R.string.settings_read_aloud)
+                SettingsPage.USAGE -> stringResource(
+                    if (isOfficialDeepSeekEndpoint(stored.baseUrl)) R.string.settings_usage_title else R.string.settings_usage_only,
+                )
                 SettingsPage.ABOUT -> stringResource(R.string.settings_about)
                 SettingsPage.LICENSES -> stringResource(R.string.about_licenses)
+                SettingsPage.DIAGNOSTICS -> stringResource(R.string.about_diagnostics_group)
             },
             onBack = {
                 if (archiveProgress.value == null && importProgress.value == null && !importReading) {
-                    if (page == SettingsPage.ROOT) onBack() else previousPage()
+                    requestBack()
                 }
             },
         )
@@ -541,7 +690,7 @@ fun SettingsScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .verticalScroll(rememberScrollState())
-                        .padding(horizontal = 16.dp),
+                        .padding(horizontal = Space.Screen),
                 ) {
                     when (target) {
                         SettingsPage.ROOT -> RootPage(
@@ -549,14 +698,58 @@ fun SettingsScreen(
                             presetCount = presets.size,
                             themeMode = themeMode,
                             accentColor = accentColor,
-                            language = AppLanguage.fromId(stored.languageId),
+                            appLockType = AppLockType.fromId(stored.appLockTypeId),
                             onOpen = { page = it },
+                        )
+
+                        SettingsPage.APPEARANCE -> AppearancePage(
+                            stored = stored,
+                            themeMode = themeMode,
+                            accentColor = accentColor,
                             onThemeChange = { scope.launch { store.setThemeMode(it.name) } },
                             onAccentChange = { scope.launch { store.setAccentColor(it.name) } },
-                            onPureBlackChange = { scope.launch { store.setPureBlack(it) } },
+                            onIconChange = { activity, enabled ->
+                                scope.launch {
+                                    try {
+                                        store.setUseSimpleCatIcon(enabled)
+                                        activity.applyLauncherIconAndExit(enabled)
+                                    } catch (_: java.io.IOException) {
+                                        android.widget.Toast.makeText(activity, R.string.diagnostics_save_failed, android.widget.Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            },
+                            onOpenFont = { page = SettingsPage.FONT },
+                            language = AppLanguage.fromId(stored.languageId),
                             onLanguageChange = { scope.launch { store.setLanguage(it.name) } },
+                        )
+
+                        SettingsPage.CHAT -> ChatBehaviorPage(
+                            stored = stored,
                             onToggleAutoCollapse = {
                                 scope.launch { store.setAutoCollapseThinking(it) }
+                            },
+                            onOpenSearch = { page = SettingsPage.SEARCH_SETTINGS },
+                            onToggleHoldToTalk = {
+                                scope.launch { store.setHoldToTalk(it) }
+                            },
+                            onOpenLoadingWords = { page = SettingsPage.LOADING_WORDS },
+                        )
+
+                        SettingsPage.SEARCH_SETTINGS -> SearchSettingsPage(
+                            stored,
+                            onToggleSearchInactiveBranches = { scope.launch { store.setSearchInactiveBranches(it) } },
+                            onToggleSearchReasoning = { scope.launch { store.setSearchReasoning(it) } },
+                        )
+
+                        SettingsPage.LOADING_WORDS -> if (settingsLoaded) LoadingWordsPage(
+                            words = stored.loadingWords,
+                            useThemeColor = stored.loadingWordsUseThemeColor,
+                            onUseThemeColorChange = { enabled ->
+                                updateLoadingWordsSettings { store.setLoadingWordsUseThemeColor(enabled) }
+                            },
+                            error = loadingWordsError,
+                            onChange = { update ->
+                                updateLoadingWordsSettings { store.editLoadingWords(update) }
                             },
                         )
 
@@ -568,8 +761,7 @@ fun SettingsScreen(
                             exportSaving = archiveSaving,
                             onExport = { startExport() },
                             onExportArchive = { startArchiveExport() },
-                            onExportReport = { startReportExport() },
-                            onExportCrash = { startCrashExport() },
+                            onExportDeepSeek = { startDeepSeekExport() },
                             onImport = {
                                 // 全放行：Chatbox 的备份是 .zip，有的设备报的 MIME 还很不标准。
                                 // 真正的判定放在解析那一步，认不出来会给出明确原因。
@@ -578,58 +770,41 @@ fun SettingsScreen(
                             onDeleteAll = { dialog = SettingsDialog.DeleteAll },
                         )
 
-                        SettingsPage.SYNC -> SyncPage(
-                            stored = stored,
-                            state = syncState,
-                            testing = syncTesting,
-                            testMessage = syncTestMessage,
-                            onEdit = { dialog = it },
-                            onSyncNow = {
-                                syncTestMessage = null
-                                container.syncManager.startSync()
-                            },
-                            onTest = {
-                                if (syncTesting) return@SyncPage
-                                syncTesting = true
-                                syncTestMessage = null
-                                scope.launch {
-                                    syncTestMessage = container.syncManager.testConnection()
-                                    syncTesting = false
-                                }
-                            },
-                            onAutoSync = { enabled ->
-                                scope.launch { store.setDavAutoSync(enabled) }
-                            },
-                        )
-
-                        SettingsPage.API -> ApiPage(
-                            stored = stored,
+                        SettingsPage.API_PROFILE -> if (editingProfile != null && editingSettings != null) ApiPage(
+                            stored = editingSettings,
+                            profile = editingProfile,
+                            onRename = { dialog = SettingsDialog.ApiProfileName(profile = editingProfile) },
                             provider = provider,
                             testing = testing,
                             testResult = testResult,
-                            onPick = { dialog = it },
-                            onProfiles = { page = SettingsPage.API_PROFILES },
+                            onPick = ::pickProfileField,
                             profileError = profileError,
-                            onWebSearch = { enabled ->
-                                scope.launch { store.setWebSearch(enabled) }
-                            },
+                            onWebSearch = { enabled -> editProfile { it.copy(webSearch = enabled) } },
                             onTest = {
                                 if (testing) return@ApiPage
                                 testing = true
                                 testResult = null
-                                val source = stored
+                                val source = editingProfile
                                 scope.launch {
                                     try {
-                                    val result = container.chatApi.fetchModels(
+                                    val result = container.chatApi.fetchModelCatalog(
                                         baseUrl = source.baseUrl.ifBlank { provider.defaultBaseUrl },
-                                        apiKey = source.apiKey,
+                                        apiKey = if (provider.modelListNeedsAuth) store.readApiKeyForProfile(source.id) else "",
+                                        apiStyle = ApiStyle.resolve(provider, source.apiStyleId, source.baseUrl.ifBlank { provider.defaultBaseUrl }),
                                     )
                                     // 拉到的列表**必须落库**：它就是「模型」选择器的数据源，
                                     // 早先只报了个条数、列表丢掉，于是自定义端点明明"连接成功"，
                                     // 点开「模型」却是一个只有标题的白框。
-                                    result.onSuccess { ids -> store.setModelIds(ids, source.activeApiProfileId, source.baseUrl) }
-                                    if (stored.activeApiProfileId == source.activeApiProfileId && stored.baseUrl == source.baseUrl) testResult = result.fold(
-                                        onSuccess = { Res.get(R.string.api_test_ok, it.size) },
+                                    result.onSuccess { catalog ->
+                                        store.updateApiProfile(source.id) {
+                                            if (it.baseUrl == source.baseUrl && it.providerId == source.providerId &&
+                                                it.apiKeyEncrypted == source.apiKeyEncrypted && it.apiStyleId == source.apiStyleId) it.copy(modelIds = catalog.ids, modelContextWindows = catalog.contextWindows, modelMetadata = catalog.metadata) else it
+                                        }
+                                    }
+                                    if (page == SettingsPage.API_PROFILE && editingProfileId == source.id &&
+                                        stored.apiProfiles.any { it.id == source.id && it.baseUrl == source.baseUrl &&
+                                            it.providerId == source.providerId && it.apiKeyEncrypted == source.apiKeyEncrypted && it.apiStyleId == source.apiStyleId }) testResult = result.fold(
+                                        onSuccess = { Res.get(R.string.api_test_ok, it.ids.size) },
                                         onFailure = { Res.get(R.string.api_test_failed, it.userMessage()) },
                                     )
                                     } catch (error: CancellationException) { throw error }
@@ -639,13 +814,42 @@ fun SettingsScreen(
                             },
                         )
 
-                        SettingsPage.API_PROFILES -> ApiProfilesPage(
-                            stored = stored, error = profileError,
-                            onSelect = { profile -> updateProfile { store.selectApiProfile(profile.id); page = SettingsPage.API } },
-                            onNew = { dialog = SettingsDialog.ApiProfileName() },
-                            onCopy = { dialog = SettingsDialog.ApiProfileName(copyCurrent = true) },
-                            onRename = { dialog = SettingsDialog.ApiProfileName(profile = it) },
-                            onDelete = { dialog = SettingsDialog.DeleteApiProfile(it) },
+                        SettingsPage.API_PROFILES -> if (settingsLoaded) {
+                            ApiProfilesPage(
+                                stored = stored, error = profileError,
+                                onSelect = { profile -> updateProfile { store.selectApiProfile(profile.id) } },
+                                onNew = { dialog = SettingsDialog.ApiProfileName() },
+                                onCopy = { dialog = SettingsDialog.ApiProfileName(copyCurrent = true) },
+                                onEdit = ::openProfile,
+                                onDelete = { dialog = SettingsDialog.DeleteApiProfile(it) },
+                            )
+                            ToolApisPage(
+                                stored = stored,
+                                onOpenSearch = { openService(SettingsPage.SEARCH_API) },
+                                onOpenFiles = { openService(SettingsPage.FILES_API) },
+                                onOpenImage = { openService(SettingsPage.IMAGE_API) },
+                            )
+                        }
+
+                        SettingsPage.SEARCH_API, SettingsPage.FILES_API -> if (settingsLoaded) ServiceApiPage(
+                            files = target == SettingsPage.FILES_API,
+                            visit = serviceVisit,
+                            stored = stored,
+                            store = store,
+                            saving = savingService,
+                            onSavingChange = { savingService = it },
+                            onBackAction = { serviceBack = it },
+                            onSaved = { if (page == target) previousPage() },
+                        )
+
+                        SettingsPage.IMAGE_API -> if (settingsLoaded) ImageGenApiPage(
+                            visit = serviceVisit,
+                            stored = stored,
+                            store = store,
+                            saving = savingService,
+                            onSavingChange = { savingService = it },
+                            onBackAction = { serviceBack = it },
+                            onSaved = { if (page == target) previousPage() },
                         )
 
                         SettingsPage.PRESETS -> PresetsPage(
@@ -662,11 +866,50 @@ fun SettingsScreen(
 
                         SettingsPage.ABOUT -> AboutPage(
                             onOpenLicenses = { page = SettingsPage.LICENSES },
+                            onOpenDiagnostics = { page = SettingsPage.DIAGNOSTICS },
                         )
 
                         SettingsPage.LICENSES -> LicensesPage()
 
+                        SettingsPage.DIAGNOSTICS -> DiagnosticsPage(
+                            exportMessage = dataMessage,
+                            exportBusy = archiveProgress.value != null,
+                            onExportReport = { startReportExport() },
+                        )
+
+                        SettingsPage.USAGE -> UsagePage(
+                            stored = stored,
+                            loadTotals = { repository.usageTotals() },
+                            loadDaily = { repository.dailyUsage(it) },
+                        )
+
+                        SettingsPage.SECURITY -> SecurityPage(
+                            stored = stored,
+                            lockType = AppLockType.fromId(stored.appLockTypeId),
+                            onSetLockType = { type ->
+                                when {
+                                    // 选 PIN 但还没设过密码：先走设置流程，成功了再落库
+                                    type == AppLockType.PIN && !stored.hasVaultPin -> pinSetupVisible = true
+                                    /*
+                                     * 选 DEVICE 但设备没有锁屏：这是唯一能保护隐私的方式都没就绪，
+                                     * 直接把用户送去系统设置，比在这里弹一句"不可用"有用。
+                                     */
+                                    type == AppLockType.DEVICE && !context.hasDeviceLock() ->
+                                        context.openSecuritySettings()
+                                    else -> scope.launch { store.setAppLockType(type.id) }
+                                }
+                            },
+                            onSetTimeout = { seconds -> scope.launch { store.setAppLockTimeout(seconds) } },
+                            onChangePin = { pinSetupVisible = true },
+                            onOpenVault = onOpenVault,
+                        )
+
                         SettingsPage.VOICE -> VoicePage(
+                            enabled = stored.readAloudEnabled,
+                            onToggle = { enabled ->
+                                if (!enabled) speaker.stop()
+                                scope.launch { store.setReadAloudEnabled(enabled) }
+                            },
                             selectedName = stored.ttsVoiceName,
                             voices = speechVoices,
                             officialVoices = officialVoices,
@@ -691,6 +934,19 @@ fun SettingsScreen(
         }
     }
 
+    if (pinSetupVisible) {
+        PinSetupFlow(
+            onDone = { pin ->
+                scope.launch {
+                    store.setVaultPin(pin)
+                    store.setAppLockType(AppLockType.PIN.id)
+                }
+                pinSetupVisible = false
+            },
+            onCancel = { pinSetupVisible = false },
+        )
+    }
+
     // ── 弹窗 ──────────────────────────────────────────────
 
     // 先收进局部变量：dialog 是委托属性，直接 when(dialog) 无法智能转换
@@ -703,7 +959,7 @@ fun SettingsScreen(
             onDismiss = { dialog = null },
             onSelect = { picked ->
                 dialog = null
-                updateProfile { store.selectProvider(picked) }
+                editProfile { if (it.providerId == picked.name) it else it.copy(providerId = picked.name, baseUrl = picked.defaultBaseUrl, modelId = picked.defaultModel, modelIds = emptyList(), modelContextWindows = emptyMap(), modelMetadata = emptyMap(), modelOverrides = emptyMap()) }
             },
         )
 
@@ -720,7 +976,11 @@ fun SettingsScreen(
                     dialog = null
                     updateProfile {
                         if (activeDialog.profile != null) store.renameApiProfile(activeDialog.profile.id, value)
-                        else { store.createApiProfile(value, activeDialog.copyCurrent); page = SettingsPage.API }
+                        else {
+                            store.createApiProfile(value, activeDialog.copyCurrent)
+                            stored = store.flow.first()
+                            if (page == SettingsPage.API_PROFILES) stored.apiProfiles.firstOrNull { it.id == stored.activeApiProfileId }?.let(::openProfile)
+                        }
                     }
                 }
             },
@@ -737,12 +997,12 @@ fun SettingsScreen(
 
         SettingsDialog.BaseUrl -> TextInputDialog(
             title = "Base URL",
-            initial = stored.baseUrl.ifBlank { provider.defaultBaseUrl },
+            initial = profileSettings.baseUrl.ifBlank { provider.defaultBaseUrl },
             placeholder = "https://api.deepseek.com",
             onDismiss = { dialog = null },
             onConfirm = { value ->
                 dialog = null
-                updateProfile { store.setBaseUrl(value) }
+                editProfile { if (it.baseUrl == value.trim()) it else it.copy(baseUrl = value.trim(), modelIds = emptyList(), modelContextWindows = emptyMap(), modelMetadata = emptyMap(), modelOverrides = emptyMap()) }
             },
         )
 
@@ -754,11 +1014,12 @@ fun SettingsScreen(
              * 于是「测试连接」显示"可用模型 45 个"、点开「模型」却什么都没有 ——
              * 拉取结果根本没进界面。
              */
-            val models = ModelCatalog.pickerModels(provider, stored.modelIds)
+            val models = ModelCatalog.pickerModels(provider, profileSettings.modelIds, profileSettings.modelContextWindows,
+                profileSettings.modelMetadata, profileSettings.modelOverrides)
             ChoiceDialog(
                 title = stringResource(R.string.label_model),
                 options = models.map { it to it.displayName },
-                selected = models.firstOrNull { it.id == stored.modelId },
+                selected = models.firstOrNull { it.id == profileSettings.modelId },
                 emptyHint = stringResource(R.string.api_model_empty_hint),
                 extraAction = stringResource(R.string.api_model_manual) to {
                     dialog = SettingsDialog.ModelManual
@@ -766,14 +1027,14 @@ fun SettingsScreen(
                 onDismiss = { dialog = null },
                 onSelect = { picked ->
                     dialog = null
-                    scope.launch { store.setModel(picked.id) }
+                    editProfile { it.copy(modelId = picked.id) }
                 },
             )
         }
 
         SettingsDialog.ModelManual -> TextInputDialog(
             title = stringResource(R.string.api_model_manual),
-            initial = stored.modelId,
+            initial = profileSettings.modelId,
             // 例子用**当前服务商的默认模型**：用户照抄一个多半就是能用的
             placeholder = provider.defaultModel.ifBlank { ProviderKind.DEEPSEEK.defaultModel },
             onDismiss = { dialog = null },
@@ -781,13 +1042,84 @@ fun SettingsScreen(
                 dialog = null
                 val id = value.trim()
                 // 空值等于"没选"，不要拿它覆盖已选模型
-                if (id.isNotEmpty()) scope.launch { store.setModel(id) }
+                if (id.isNotEmpty()) editProfile { it.copy(modelId = id) }
             },
         )
 
+        SettingsDialog.ModelCapabilities -> {
+            val automatic = ModelCatalog.find(provider, profileSettings.modelId,
+                profileSettings.modelContextWindows, profileSettings.modelMetadata)
+            val manual = profileSettings.modelOverrides[profileSettings.modelId] ?: ModelCapabilityOverride()
+            val auto = stringResource(R.string.api_model_automatic)
+            val fields = listOf(
+                ModelCapabilityField.VISION to "${stringResource(R.string.api_model_vision)} · ${capabilityLabel(manual.vision, automatic.supportsVision)}",
+                ModelCapabilityField.THINKING to "${stringResource(R.string.api_model_thinking)} · ${capabilityLabel(manual.thinking, automatic.supportsThinking)}",
+                ModelCapabilityField.CONTEXT to "${stringResource(R.string.api_model_context)} · " +
+                    (manual.contextWindow?.toString() ?: stringResource(R.string.api_model_auto_window, automatic.contextWindow)),
+            ) + if (profileSettings.resolvedApiStyle == ApiStyle.OPENAI) {
+                listOf(ModelCapabilityField.WIRE to "${stringResource(R.string.api_model_wire)} · ${manual.reasoningWire?.let(::reasoningWireLabel) ?: auto}")
+            } else emptyList()
+            ChoiceDialog(
+                title = stringResource(R.string.api_model_capabilities),
+                options = fields,
+                selected = null,
+                onDismiss = { dialog = null },
+                onSelect = { dialog = SettingsDialog.ModelCapability(it) },
+            )
+        }
+
+        is SettingsDialog.ModelCapability -> {
+            val id = profileSettings.modelId
+            val title = stringResource(activeDialog.field.label)
+            val manual = profileSettings.modelOverrides[id] ?: ModelCapabilityOverride()
+            val automatic = ModelCatalog.find(provider, id, profileSettings.modelContextWindows, profileSettings.modelMetadata)
+            val auto = stringResource(R.string.api_model_automatic)
+            fun save(change: (ModelCapabilityOverride) -> ModelCapabilityOverride) {
+                editProfile { profile ->
+                    val next = change(profile.modelOverrides[id] ?: ModelCapabilityOverride())
+                    val updated = if (next == ModelCapabilityOverride()) profile.modelOverrides - id
+                        else profile.modelOverrides + (id to next)
+                    profile.copy(modelOverrides = updated)
+                }
+                dialog = SettingsDialog.ModelCapabilities
+            }
+            val back = { dialog = SettingsDialog.ModelCapabilities }
+            when (activeDialog.field) {
+                ModelCapabilityField.CONTEXT -> {
+                    val invalid = stringResource(R.string.api_model_invalid_window)
+                    TextInputDialog(
+                        title = title,
+                        initial = manual.contextWindow?.toString().orEmpty(),
+                        placeholder = stringResource(R.string.api_model_auto_window, automatic.contextWindow),
+                        onDismiss = back,
+                        validate = { raw -> if (raw.isBlank() || (raw.trim().toIntOrNull() ?: 0) > 0) null else invalid },
+                        onConfirm = { raw -> save { it.copy(contextWindow = raw.trim().toIntOrNull()) } },
+                    )
+                }
+                ModelCapabilityField.WIRE -> ChoiceDialog(
+                    title = title,
+                    options = listOf(null to auto) + ReasoningWire.entries.map { it to reasoningWireLabel(it) },
+                    selected = manual.reasoningWire,
+                    onDismiss = back,
+                    onSelect = { value -> save { it.copy(reasoningWire = value) } },
+                )
+                ModelCapabilityField.VISION, ModelCapabilityField.THINKING -> {
+                    val vision = activeDialog.field == ModelCapabilityField.VISION
+                    ChoiceDialog(
+                        title = title,
+                        options = listOf(null to auto, true to stringResource(R.string.api_model_enabled),
+                            false to stringResource(R.string.api_model_disabled)),
+                        selected = if (vision) manual.vision else manual.thinking,
+                        onDismiss = back,
+                        onSelect = { value -> save { if (vision) it.copy(vision = value) else it.copy(thinking = value) } },
+                    )
+                }
+            }
+        }
+
         SettingsDialog.ApiKey -> TextInputDialog(
             title = "API Key",
-            initial = stored.apiKey,
+            initial = keyDialogValue,
             placeholder = "sk-…",
             secret = true,
             /*
@@ -807,21 +1139,22 @@ fun SettingsScreen(
                     )
                 }
             },
-            onDismiss = { dialog = null },
+            onDismiss = { dialog = null; keyDialogValue = "" },
             onConfirm = { value ->
                 dialog = null
-                updateProfile { store.setApiKey(value) }
+                keyDialogValue = ""
+                editProfile { it.copy(apiKeyEncrypted = if (ApiKey.normalize(value).isEmpty()) "" else store.encryptServiceKey(value), modelIds = emptyList(), modelContextWindows = emptyMap(), modelMetadata = emptyMap()) }
             },
         )
 
         SettingsDialog.ApiStyle -> ChoiceDialog(
             title = stringResource(R.string.settings_api_style),
             options = ApiStylePreference.entries.map { it to stringResource(it.labelRes) },
-            selected = ApiStylePreference.fromId(stored.apiStyleId),
+            selected = ApiStylePreference.fromId(profileSettings.apiStyleId),
             onDismiss = { dialog = null },
             onSelect = { picked ->
                 dialog = null
-                scope.launch { store.setApiStyle(picked.name) }
+                editProfile { if (it.apiStyleId == picked.name) it else it.copy(apiStyleId = picked.name, modelIds = emptyList(), modelContextWindows = emptyMap(), modelMetadata = emptyMap()) }
             },
         )
 
@@ -834,52 +1167,6 @@ fun SettingsScreen(
             onConfirm = { value ->
                 dialog = null
                 scope.launch { store.setLocationRegion(value) }
-            },
-        )
-
-        SettingsDialog.SyncServer -> TextInputDialog(
-            title = stringResource(R.string.sync_server),
-            initial = stored.davUrl,
-            placeholder = "https://dav.jianguoyun.com/dav/",
-            onDismiss = { dialog = null },
-            onConfirm = { value ->
-                dialog = null
-                scope.launch { store.setDavUrl(value) }
-            },
-        )
-
-        SettingsDialog.SyncUser -> TextInputDialog(
-            title = stringResource(R.string.sync_account),
-            initial = stored.davUser,
-            placeholder = "you@example.com",
-            onDismiss = { dialog = null },
-            onConfirm = { value ->
-                dialog = null
-                scope.launch { store.setDavUser(value) }
-            },
-        )
-
-        SettingsDialog.SyncPassword -> TextInputDialog(
-            title = stringResource(R.string.sync_password),
-            initial = stored.davPassword,
-            // 坚果云的"应用密码"是 16 位随机串，不是账号密码
-            placeholder = stringResource(R.string.sync_password),
-            secret = true,
-            onDismiss = { dialog = null },
-            onConfirm = { value ->
-                dialog = null
-                scope.launch { store.setDavPassword(value) }
-            },
-        )
-
-        SettingsDialog.SyncPath -> TextInputDialog(
-            title = stringResource(R.string.sync_path),
-            initial = stored.davPath,
-            placeholder = DEFAULT_DAV_PATH,
-            onDismiss = { dialog = null },
-            onConfirm = { value ->
-                dialog = null
-                scope.launch { store.setDavPath(value) }
             },
         )
 
@@ -985,103 +1272,249 @@ fun SettingsScreen(
 //  一级页面
 // ══════════════════════════════════════════════════════════
 
+/**
+ * 设置首页：**只放大类**。
+ *
+ * ### 为什么改成这样
+ *
+ * 上一版首页是"三张卡 + 十来行"：主题、语言、主题色、预设、字号、两个对话开关、
+ * 朗读音色、数据、API 交错排在一起。想改一个开关，得从头扫到尾，而且
+ * 「改界面」和「改对话」两种意图混在同一张卡里 —— 这不是信息密度高，是没有分类。
+ *
+ * 现在首页一屏就是十个入口，每行只回答两件事：**这一类是什么**、**现在是什么值**。
+ * 具体开关全部收进二级页 —— 这也正是系统设置与这类客户端的通行结构：
+ * 分类是导航，不是内容。
+ */
 @Composable
 private fun RootPage(
     stored: StoredSettings,
     presetCount: Int,
     themeMode: ThemeMode,
     accentColor: AccentColor,
-    language: AppLanguage,
+    appLockType: AppLockType,
     onOpen: (SettingsPage) -> Unit,
-    onThemeChange: (ThemeMode) -> Unit,
-    onAccentChange: (AccentColor) -> Unit,
-    onPureBlackChange: (Boolean) -> Unit,
-    onLanguageChange: (AppLanguage) -> Unit,
-    onToggleAutoCollapse: (Boolean) -> Unit,
 ) {
-    var themeMenuOpen by remember { mutableStateOf(false) }
-    var accentMenuOpen by remember { mutableStateOf(false) }
-    var languageMenuOpen by remember { mutableStateOf(false) }
+    val lockSummary = when (appLockType) {
+        AppLockType.NONE -> stringResource(R.string.settings_app_lock_off)
+        AppLockType.PIN -> stringResource(R.string.settings_lock_pin)
+        AppLockType.DEVICE -> stringResource(R.string.settings_lock_device)
+    }
 
-    SettingsSectionLabel(stringResource(R.string.settings_group_account))
+    SettingsSectionLabel(stringResource(R.string.settings_group_general))
 
     SettingsCard {
         SettingsNavRow(
-            icon = AppIcons.Database,
-            label = stringResource(R.string.settings_data),
-            value = stringResource(R.string.settings_data_summary),
-            onClick = { onOpen(SettingsPage.DATA) },
+            icon = AppIcons.Contrast,
+            label = stringResource(R.string.settings_appearance),
+            value = "${themeModeLabel(themeMode)} · ${accentColor.label}",
+            onClick = { onOpen(SettingsPage.APPEARANCE) },
+        )
+        RowDivider()
+        SettingsNavRow(
+            icon = AppIcons.Sliders,
+            label = stringResource(R.string.settings_chat_and_input),
+            value = null,
+            onClick = { onOpen(SettingsPage.CHAT) },
+        )
+        RowDivider()
+        SettingsNavRow(
+            icon = AppIcons.Volume,
+            label = stringResource(R.string.settings_read_aloud),
+            value = if (stored.readAloudEnabled) {
+                stored.ttsVoiceLabel.ifBlank { stringResource(R.string.tts_voice_default) }
+            } else {
+                stringResource(R.string.settings_read_aloud_off)
+            },
+            onClick = { onOpen(SettingsPage.VOICE) },
+        )
+        RowDivider()
+        SettingsNavRow(
+            icon = AppIcons.Prompt,
+            label = stringResource(R.string.settings_presets),
+            value = if (presetCount == 0) {
+                stringResource(R.string.preset_count_empty)
+            } else {
+                stringResource(R.string.preset_count, presetCount)
+            },
+            onClick = { onOpen(SettingsPage.PRESETS) },
         )
         RowDivider()
         SettingsNavRow(
             icon = AppIcons.Server,
-            label = stringResource(R.string.settings_api),
-            value = null,
-            onClick = { onOpen(SettingsPage.API) },
-        )
-        RowDivider()
-        SettingsNavRow(
-            icon = AppIcons.Cloud,
-            label = stringResource(R.string.settings_sync),
-            // 只给"配没配"，不显示地址 —— 那一行是给人扫一眼的，不是配置面板
-            // 只给状态，不给协议名 —— 那一行是"扫一眼"用的，详情在二级页
-            value = if (stored.syncConfigured) {
-                stringResource(R.string.sync_status_on)
-            } else {
-                stringResource(R.string.sync_status_off)
-            },
-            onClick = { onOpen(SettingsPage.SYNC) },
+            label = stringResource(R.string.settings_tools_and_api),
+            value = stored.apiProfiles.firstOrNull { it.id == stored.activeApiProfileId }?.name,
+            onClick = { onOpen(SettingsPage.API_PROFILES) },
         )
     }
 
-    SettingsSectionLabel(stringResource(R.string.settings_group_personal))
+    SettingsSectionLabel(stringResource(R.string.settings_group_data_security))
 
     SettingsCard {
-        // 外观：三个互斥选项，直接弹菜单
-        Box {
-            SettingsNavRow(
-                icon = AppIcons.Contrast,
-                label = stringResource(R.string.settings_appearance),
-                value = when (themeMode) {
-                    ThemeMode.SYSTEM -> stringResource(R.string.value_follow_system)
-                    ThemeMode.LIGHT -> stringResource(R.string.value_light)
-                    ThemeMode.DARK -> stringResource(R.string.value_dark)
-                },
-                onClick = { themeMenuOpen = true },
+        SettingsNavRow(
+            icon = AppIcons.Database,
+            label = stringResource(R.string.settings_data_sync),
+            value = null,
+            onClick = { onOpen(SettingsPage.DATA) },
+        )
+        RowDivider()
+        SettingsNavRow(
+            icon = AppIcons.Lock,
+            label = stringResource(R.string.settings_group_security),
+            value = lockSummary,
+            onClick = { onOpen(SettingsPage.SECURITY) },
+        )
+        RowDivider()
+        SettingsNavRow(
+            icon = AppIcons.Wallet,
+            label = stringResource(R.string.settings_usage_only),
+            value = null,
+            onClick = { onOpen(SettingsPage.USAGE) },
+        )
+    }
+
+    SettingsSectionLabel(stringResource(R.string.settings_group_other))
+
+    SettingsCard {
+        SettingsNavRow(
+            icon = AppIcons.FileText,
+            label = stringResource(R.string.settings_diagnostics),
+            value = null,
+            onClick = { onOpen(SettingsPage.DIAGNOSTICS) },
+        )
+        RowDivider()
+        SettingsNavRow(
+            icon = AppIcons.Info,
+            label = stringResource(R.string.settings_about_title),
+            value = BuildConfig.VERSION_NAME,
+            onClick = { onOpen(SettingsPage.ABOUT) },
+        )
+    }
+}
+
+@Composable
+private fun themeModeLabel(mode: ThemeMode): String = when (mode) {
+    ThemeMode.SYSTEM -> stringResource(R.string.value_follow_system)
+    ThemeMode.LIGHT -> stringResource(R.string.value_light)
+    ThemeMode.DARK -> stringResource(R.string.value_dark)
+}
+
+// ══════════════════════════════════════════════════════════
+//  二级：外观
+// ══════════════════════════════════════════════════════════
+
+/**
+ * 外观：主题模式、主题色、字体大小。
+ *
+ * 主题模式与主题色原来在一级页各弹一个菜单 —— 这两项本来就要「看着挑」，
+ * 藏在菜单里每次都得点开才知道当前是哪个。现在平铺成单选行与一排色块，一眼可见。
+ */
+@Composable
+private fun AppearancePage(
+    stored: StoredSettings,
+    themeMode: ThemeMode,
+    accentColor: AccentColor,
+    onThemeChange: (ThemeMode) -> Unit,
+    onAccentChange: (AccentColor) -> Unit,
+    onIconChange: (MainActivity, Boolean) -> Unit,
+    onOpenFont: () -> Unit,
+    language: AppLanguage,
+    onLanguageChange: (AppLanguage) -> Unit,
+) {
+    val activity = LocalActivity.current as? MainActivity
+    var pendingIcon by rememberSaveable { mutableStateOf<Boolean?>(null) }
+
+    pendingIcon?.let { enabled ->
+        AppConfirmDialog(
+            title = stringResource(R.string.settings_icon_restart_title),
+            message = stringResource(R.string.settings_icon_restart_message),
+            confirmText = stringResource(R.string.settings_icon_exit),
+            onDismiss = { pendingIcon = null },
+            onConfirm = {
+                pendingIcon = null
+                activity?.let { onIconChange(it, enabled) }
+            },
+        )
+    }
+
+    SettingsSectionLabel(stringResource(R.string.settings_theme_mode))
+
+    SettingsCard {
+        listOf(
+            ThemeMode.SYSTEM to AppIcons.Monitor,
+            ThemeMode.LIGHT to AppIcons.Sun,
+            ThemeMode.DARK to AppIcons.Moon,
+        ).forEachIndexed { i, (mode, icon) ->
+            if (i > 0) RowDivider()
+            SettingsChoiceRow(
+                icon = icon,
+                label = themeModeLabel(mode),
+                selected = mode == themeMode,
+                onClick = { onThemeChange(mode) },
             )
-            AppMenu(
-                expanded = themeMenuOpen,
-                onDismissRequest = { themeMenuOpen = false },
-            ) {
-                ThemeMode.entries.forEach { mode ->
-                    AppMenuItem(
-                        label = when (mode) {
-                            ThemeMode.SYSTEM -> stringResource(R.string.value_follow_system)
-                            ThemeMode.LIGHT -> stringResource(R.string.value_light)
-                            ThemeMode.DARK -> stringResource(R.string.value_dark)
-                        },
-                        selected = mode == themeMode,
-                        onClick = {
-                            themeMenuOpen = false
-                            onThemeChange(mode)
-                        },
-                    )
-                }
+        }
+    }
+
+    SettingsSectionLabel(stringResource(R.string.settings_icon))
+
+    SettingsCard {
+        SettingsChoiceRow(
+            icon = AppIcons.ClassicMessageSquare,
+            label = stringResource(R.string.settings_icon_classic),
+            selected = !stored.useSimpleCatIcon,
+            onClick = { if (stored.useSimpleCatIcon) pendingIcon = false },
+        )
+        RowDivider()
+        SettingsChoiceRow(
+            icon = AppIcons.SimpleCat,
+            label = stringResource(R.string.settings_icon_simple_cat),
+            selected = stored.useSimpleCatIcon,
+            onClick = { if (!stored.useSimpleCatIcon) pendingIcon = true },
+        )
+    }
+
+    SettingsSectionLabel(stringResource(R.string.settings_accent))
+
+    SettingsCard {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = Space.Screen, vertical = Space.RowPadY),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            AccentColor.entries.forEach { color ->
+                AccentSwatch(
+                    color = color,
+                    selected = color == accentColor,
+                    onClick = { onAccentChange(color) },
+                )
             }
         }
+    }
 
-        RowDivider()
+    SettingsSectionLabel(stringResource(R.string.settings_group_text))
 
-        SettingsSwitchRow(
-            label = stringResource(R.string.settings_pure_black),
-            hint = stringResource(R.string.settings_pure_black_hint),
-            checked = stored.pureBlack,
-            onCheckedChange = onPureBlackChange,
+    SettingsCard {
+        SettingsNavRow(
+            icon = AppIcons.FontSize,
+            label = stringResource(R.string.settings_font_size),
+            value = if (stored.followSystemFont) {
+                stringResource(R.string.value_follow_system)
+            } else {
+                stringResource(
+                    fontSizeSteps
+                        .minByOrNull { kotlin.math.abs(it.first - stored.fontScale) }
+                        ?.second ?: R.string.font_step_standard,
+                )
+            },
+            onClick = onOpenFont,
         )
+    }
 
-        RowDivider()
+    SettingsSectionLabel(stringResource(R.string.settings_group_language))
 
-        // 语言：三个互斥选项，弹菜单。换语言 = 改缓存 + 整页重建（见 MainActivity）
+    var languageMenuOpen by remember { mutableStateOf(false) }
+    SettingsCard {
         Box {
             SettingsNavRow(
                 icon = AppIcons.Globe,
@@ -1113,103 +1546,332 @@ private fun RootPage(
                 }
             }
         }
+    }
+}
 
+// ══════════════════════════════════════════════════════════
+//  二级：安全与隐私
+// ══════════════════════════════════════════════════════════
+
+/**
+ * 安全与隐私：应用锁 + 保险箱。
+ *
+ * 这一页只放"谁能打开这个应用 / 谁能看到这些会话"，不放任何内容管理 ——
+ * 后者属于「数据与同步」。分类不清楚时，用户会开始怀疑"我锁的到底是哪一层"。
+ */
+@Composable
+private fun SecurityPage(
+    stored: StoredSettings,
+    lockType: AppLockType,
+    onSetLockType: (AppLockType) -> Unit,
+    onSetTimeout: (Int) -> Unit,
+    onChangePin: () -> Unit,
+    onOpenVault: () -> Unit,
+) {
+    val colors = LocalChatColors.current
+
+    Text(
+        text = stringResource(R.string.settings_security_desc),
+        style = MaterialTheme.typography.bodySmall,
+        color = colors.placeholder,
+        modifier = Modifier.padding(top = 12.dp),
+    )
+
+    SettingsSectionLabel(stringResource(R.string.settings_lock_section))
+
+    SettingsCard {
+        SettingsChoiceRow(
+            icon = AppIcons.Close,
+            label = stringResource(R.string.settings_lock_none),
+            selected = lockType == AppLockType.NONE,
+            onClick = { onSetLockType(AppLockType.NONE) },
+        )
         RowDivider()
+        SettingsChoiceRow(
+            icon = AppIcons.Key,
+            label = stringResource(R.string.settings_lock_pin),
+            selected = lockType == AppLockType.PIN,
+            onClick = { onSetLockType(AppLockType.PIN) },
+        )
+        RowDivider()
+        SettingsChoiceRow(
+            icon = AppIcons.Lock,
+            label = stringResource(R.string.settings_lock_device),
+            selected = lockType == AppLockType.DEVICE,
+            onClick = { onSetLockType(AppLockType.DEVICE) },
+        )
+    }
 
-        // 主题色：点开弹一排色块
-        Box {
-            SettingsNavRow(
-                icon = AppIcons.Palette,
-                label = stringResource(R.string.settings_accent),
-                value = accentColor.label,
-                onClick = { accentMenuOpen = true },
-            )
-            AppMenu(
-                expanded = accentMenuOpen,
-                onDismissRequest = { accentMenuOpen = false },
-                // 七个色块横排，比默认菜单宽
-                width = AccentMenuWidth,
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 8.dp, vertical = 6.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    AccentColor.entries.forEach { color ->
-                        AccentSwatch(
-                            color = color,
-                            selected = color == accentColor,
-                            onClick = {
-                                accentMenuOpen = false
-                                onAccentChange(color)
-                            },
-                        )
-                    }
-                }
+    if (lockType != AppLockType.NONE) {
+        SettingsSectionLabel(stringResource(R.string.settings_lock_timeout_section))
+
+        SettingsCard {
+            listOf(
+                0 to R.string.settings_lock_timeout_immediate,
+                60 to R.string.settings_lock_timeout_1m,
+                300 to R.string.settings_lock_timeout_5m,
+            ).forEachIndexed { index, (seconds, label) ->
+                if (index > 0) RowDivider()
+                SettingsChoiceRow(
+                    icon = null,
+                    label = stringResource(label),
+                    selected = stored.appLockTimeoutSeconds == seconds,
+                    onClick = { onSetTimeout(seconds) },
+                )
             }
         }
+    }
 
-        RowDivider()
+    if (lockType == AppLockType.PIN) {
+        SettingsSectionLabel(stringResource(R.string.settings_lock_section))
 
+        SettingsCard {
+            SettingsActionRow(
+                label = stringResource(R.string.settings_lock_change_pin),
+                hint = if (stored.hasVaultPin) {
+                    stringResource(R.string.settings_lock_pin_locked_hint)
+                } else {
+                    stringResource(R.string.settings_lock_no_pin)
+                },
+                onClick = onChangePin,
+            )
+        }
+    }
+
+    SettingsSectionLabel(stringResource(R.string.settings_vault_section))
+
+    SettingsCard {
         SettingsNavRow(
-            icon = AppIcons.Prompt,
-            label = stringResource(R.string.settings_presets),
-            value = if (presetCount == 0) stringResource(R.string.preset_count_empty) else stringResource(R.string.preset_count, presetCount),
-            onClick = { onOpen(SettingsPage.PRESETS) },
+            icon = AppIcons.EyeOff,
+            label = stringResource(R.string.vault_title),
+            value = if (stored.hasVaultPin) {
+                stringResource(R.string.settings_vault_summary_on)
+            } else {
+                stringResource(R.string.settings_vault_summary_off)
+            },
+            onClick = onOpenVault,
         )
+    }
+}
 
-        RowDivider()
+// ══════════════════════════════════════════════════════════
+//  二级：对话行为
+// ══════════════════════════════════════════════════════════
 
-        SettingsNavRow(
-            icon = AppIcons.FontSize,
-            label = stringResource(R.string.settings_font_size),
-            value = stringResource(
-                fontSizeSteps
-                    .minByOrNull { kotlin.math.abs(it.first - stored.fontScale) }
-                    ?.second ?: R.string.font_step_standard,
-            ),
-            onClick = { onOpen(SettingsPage.FONT) },
-        )
+@Composable
+private fun ChatBehaviorPage(
+    stored: StoredSettings,
+    onToggleAutoCollapse: (Boolean) -> Unit,
+    onOpenSearch: () -> Unit,
+    onToggleHoldToTalk: (Boolean) -> Unit,
+    onOpenLoadingWords: () -> Unit,
+) {
 
-        RowDivider()
+    SettingsSectionLabel(stringResource(R.string.settings_group_display))
 
+    SettingsCard {
         SettingsSwitchRow(
             icon = AppIcons.Collapse,
             label = stringResource(R.string.settings_auto_collapse),
             checked = stored.autoCollapseThinking,
             onCheckedChange = onToggleAutoCollapse,
         )
-
         RowDivider()
-
-        // 朗读音色：系统 TTS 引擎提供，进二级页挑选（见 VoicePage）
+        SettingsSwitchRow(
+            icon = AppIcons.Mic,
+            label = stringResource(R.string.settings_hold_to_talk),
+            checked = stored.holdToTalk,
+            onCheckedChange = onToggleHoldToTalk,
+        )
+        RowDivider()
         SettingsNavRow(
-            icon = AppIcons.Volume,
-            label = stringResource(R.string.tts_voice),
-            /*
-             * 只显示音色名。
-             *
-             * 完整标签是「Tide（男声 · DeepSeek 官方）」这种，在列表行里放不下，
-             * 截断成「Tide（男…」既难看也没信息量。括号里的内容在二级页完整可看。
-             */
-            value = stored.ttsVoiceLabel
-                .substringBefore("（")
-                .trim()
-                .ifBlank { stringResource(R.string.tts_voice_default) },
-            onClick = { onOpen(SettingsPage.VOICE) },
+            icon = AppIcons.Edit,
+            label = stringResource(R.string.settings_loading_words),
+            value = if (stored.loadingWords.isEmpty()) stringResource(R.string.loading_words_default)
+                else stringResource(R.string.loading_words_count, stored.loadingWords.size),
+            onClick = onOpenLoadingWords,
         )
     }
 
-    SettingsSectionLabel(stringResource(R.string.settings_about))
-
+    SettingsSectionLabel(stringResource(R.string.settings_group_search))
     SettingsCard {
-        SettingsNavRow(
-            icon = AppIcons.Info,
-            label = stringResource(R.string.settings_about_title),
-            value = null,
-            onClick = { onOpen(SettingsPage.ABOUT) },
+        SettingsNavRow(AppIcons.Search, stringResource(R.string.settings_search_options), null, onOpenSearch)
+    }
+}
+
+@Composable
+private fun SearchSettingsPage(
+    stored: StoredSettings,
+    onToggleSearchInactiveBranches: (Boolean) -> Unit,
+    onToggleSearchReasoning: (Boolean) -> Unit,
+) {
+    SettingsCard {
+        SettingsSwitchRow(
+            label = stringResource(R.string.settings_search_inactive_branches),
+            checked = stored.searchInactiveBranches,
+            onCheckedChange = onToggleSearchInactiveBranches,
         )
+        RowDivider(inset = Space.Screen)
+        SettingsSwitchRow(
+            label = stringResource(R.string.settings_search_reasoning),
+            checked = stored.searchReasoning,
+            onCheckedChange = onToggleSearchReasoning,
+        )
+    }
+
+}
+
+@Composable
+private fun LoadingWordsPage(
+    words: List<String>,
+    useThemeColor: Boolean,
+    onUseThemeColorChange: (Boolean) -> Unit,
+    error: String?,
+    onChange: ((List<String>) -> List<String>) -> Unit,
+) {
+    // Null closes the editor. An empty initial value opens it in add mode.
+    var editing by rememberSaveable { mutableStateOf<String?>(null) }
+    var deleting by rememberSaveable { mutableStateOf<String?>(null) }
+    val colors = LocalChatColors.current
+
+    Text(
+        text = stringResource(if (words.isEmpty()) R.string.loading_words_empty else R.string.loading_words_hint),
+        style = MaterialTheme.typography.bodySmall,
+        color = colors.placeholder,
+        modifier = Modifier.padding(horizontal = 8.dp, vertical = 12.dp),
+    )
+    SettingsCard {
+        SettingsSwitchRow(
+            icon = AppIcons.Palette,
+            label = stringResource(R.string.loading_words_use_theme_color),
+            checked = useThemeColor,
+            onCheckedChange = onUseThemeColorChange,
+        )
+        RowDivider()
+        SettingsNavRow(
+            icon = AppIcons.PlusCircle,
+            label = stringResource(R.string.loading_words_add),
+            value = null,
+            onClick = { editing = "" },
+        )
+        words.forEach { word ->
+            RowDivider(inset = Space.Screen)
+            Row(
+                modifier = Modifier.fillMaxWidth().heightIn(min = Space.Row)
+                    .padding(start = Space.Screen, end = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = word,
+                    style = MaterialTheme.typography.titleSmall,
+                    modifier = Modifier.weight(1f).padding(vertical = Space.RowPadY),
+                )
+                IconCircleButton(
+                    icon = AppIcons.Edit,
+                    contentDescription = stringResource(R.string.loading_words_edit_item, word),
+                    onClick = { editing = word },
+                    size = 48.dp,
+                    iconSize = 18.dp,
+                )
+                IconCircleButton(
+                    icon = AppIcons.Trash,
+                    contentDescription = stringResource(R.string.loading_words_delete_item, word),
+                    onClick = { deleting = word },
+                    size = 48.dp,
+                    iconSize = 18.dp,
+                    tint = colors.danger,
+                )
+            }
+        }
+    }
+    error?.let {
+        Text(it, color = colors.danger, style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 12.dp))
+    }
+    Spacer(Modifier.height(24.dp))
+
+    editing?.let { original ->
+        val blank = stringResource(R.string.loading_words_invalid)
+        val duplicate = stringResource(R.string.loading_words_duplicate)
+        TextInputDialog(
+            title = stringResource(if (original.isEmpty()) R.string.loading_words_add else R.string.loading_words_edit),
+            initial = original,
+            placeholder = stringResource(R.string.loading_words_placeholder),
+            onDismiss = { editing = null },
+            validate = { raw ->
+                val word = normalizeLoadingWord(raw)
+                when {
+                    word.isEmpty() -> blank
+                    word != original && word in words -> duplicate
+                    else -> null
+                }
+            },
+            onConfirm = { raw ->
+                val word = normalizeLoadingWord(raw)
+                onChange { current ->
+                    when {
+                        word == original || word in current -> current
+                        original.isEmpty() -> current + word
+                        else -> current.map { if (it == original) word else it }
+                    }
+                }
+                editing = null
+            },
+        )
+    }
+    deleting?.let { word ->
+        AppConfirmDialog(
+            title = stringResource(R.string.loading_words_delete_item, word),
+            confirmText = stringResource(R.string.action_delete),
+            onDismiss = { deleting = null },
+            onConfirm = {
+                onChange { it - word }
+                deleting = null
+            },
+            destructive = true,
+        )
+    }
+}
+
+/** 单选行：图标 + 标题 + 选中时行尾一个主色对勾。 */
+@Composable
+internal fun SettingsChoiceRow(
+    icon: ImageVector?,
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .selectable(selected = selected, role = Role.RadioButton, onClick = onClick)
+            .heightIn(min = Space.Row)
+            .padding(horizontal = Space.Screen, vertical = Space.RowPadY),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(Space.IconGap),
+    ) {
+        if (icon != null) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.size(Space.Icon),
+            )
+        }
+        Text(
+            text = label,
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.weight(1f),
+        )
+        if (selected) {
+            Icon(
+                imageVector = AppIcons.Check,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(Space.Icon),
+            )
+        }
     }
 }
 
@@ -1226,6 +1888,8 @@ private fun RootPage(
  */
 @Composable
 private fun VoicePage(
+    enabled: Boolean,
+    onToggle: (Boolean) -> Unit,
     selectedName: String,
     voices: List<SpeechVoice>?,
     /** DeepSeek 官方音色；空 = 当前服务商不支持官方朗读（整块不显示）。 */
@@ -1236,6 +1900,9 @@ private fun VoicePage(
     onSelect: (SpeechVoice?) -> Unit,
     onPreview: (SpeechVoice?) -> Unit,
 ) {
+    SettingsCard { SettingsSwitchRow(stringResource(R.string.tts_enabled), enabled, onToggle) }
+    if (!enabled) return
+
     SettingsSectionLabel(stringResource(R.string.tts_voice))
 
     SettingsCard {
@@ -1315,7 +1982,8 @@ private fun VoiceRow(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 14.dp),
+            .heightIn(min = Space.Row)
+            .padding(horizontal = Space.Screen, vertical = Space.RowPadY),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
@@ -1367,8 +2035,7 @@ private fun DataPage(
     exportSaving: Boolean = false,
     onExport: () -> Unit,
     onExportArchive: () -> Unit,
-    onExportReport: () -> Unit,
-    onExportCrash: () -> Unit,
+    onExportDeepSeek: () -> Unit,
     onImport: () -> Unit,
     onDeleteAll: () -> Unit,
 ) {
@@ -1390,10 +2057,20 @@ private fun DataPage(
         )
         RowDivider()
         SettingsActionRow(
+            label = stringResource(R.string.settings_export_deepseek),
+            hint = stringResource(R.string.settings_export_deepseek_hint),
+            onClick = onExportDeepSeek,
+            enabled = !reading && progress == null && exportProgress == null,
+        )
+    }
+
+    SettingsSectionLabel(stringResource(R.string.settings_import_all))
+    SettingsCard {
+        SettingsActionRow(
             label = stringResource(R.string.settings_import_all),
             hint = stringResource(R.string.settings_import_all_summary),
             onClick = onImport,
-            // 导入期间不能重复点：同一份包并发解析会把内存和数据库都顶爆
+            icon = AppIcons.Import,
             enabled = !reading && progress == null && exportProgress == null,
         )
     }
@@ -1452,28 +2129,6 @@ private fun DataPage(
         }
     }
 
-    /*
-     * 诊断：导入对账报告与崩溃诊断都是"出了问题才用"的东西，和日常的备份 / 导入
-     * 不是同一类操作。混在备份卡片里，看起来会像"又一个常规导出"。
-     */
-    SettingsSectionLabel(stringResource(R.string.settings_group_diagnostics))
-
-    SettingsCard {
-        SettingsActionRow(
-            label = stringResource(R.string.import_report_export),
-            hint = stringResource(R.string.import_report_hint),
-            onClick = onExportReport,
-            enabled = !reading && progress == null && exportProgress == null,
-        )
-        RowDivider()
-        SettingsActionRow(
-            label = stringResource(R.string.crash_report_export),
-            hint = stringResource(R.string.crash_report_hint),
-            onClick = onExportCrash,
-            enabled = !reading && progress == null && exportProgress == null,
-        )
-    }
-
     SettingsSectionLabel(stringResource(R.string.settings_group_reset))
 
     SettingsCard {
@@ -1498,198 +2153,28 @@ private fun DataPage(
 }
 
 // ══════════════════════════════════════════════════════════
-//  二级：云端同步（WebDAV）
-// ══════════════════════════════════════════════════════════
-
-/**
- * 同步设置。
- *
- * 四行服务器信息 + 两个动作 + 一个开关，底下是状态与说明。
- * 刻意**不做**"选网盘服务商"这类向导：WebDAV 的参数就四个，填一次之后
- * 一年都不会再进来，向导只是把四行拉成四步。
- */
-@Composable
-private fun SyncPage(
-    stored: StoredSettings,
-    state: SyncState,
-    testing: Boolean,
-    testMessage: String?,
-    onEdit: (SettingsDialog) -> Unit,
-    onSyncNow: () -> Unit,
-    onTest: () -> Unit,
-    onAutoSync: (Boolean) -> Unit,
-) {
-    val colors = LocalChatColors.current
-    val unset = stringResource(R.string.api_key_unset)
-
-    SettingsSectionLabel(stringResource(R.string.sync_group_server))
-
-    SettingsCard {
-        SettingsNavRow(
-            icon = AppIcons.Cloud,
-            label = stringResource(R.string.sync_server),
-            value = stored.davUrl.ifBlank { unset },
-            onClick = { onEdit(SettingsDialog.SyncServer) },
-        )
-        RowDivider()
-        SettingsNavRow(
-            icon = null,
-            label = stringResource(R.string.sync_account),
-            value = stored.davUser.ifBlank { unset },
-            onClick = { onEdit(SettingsDialog.SyncUser) },
-        )
-        RowDivider()
-        SettingsNavRow(
-            icon = null,
-            label = stringResource(R.string.sync_password),
-            // 只显示"设没设"，永不回显明文（与 API Key 一个规矩）
-            value = if (stored.davPassword.isBlank()) {
-                stringResource(R.string.sync_password_unset)
-            } else {
-                maskKey(stored.davPassword)
-            },
-            onClick = { onEdit(SettingsDialog.SyncPassword) },
-        )
-        RowDivider()
-        SettingsNavRow(
-            icon = null,
-            label = stringResource(R.string.sync_path),
-            value = stored.davPath,
-            onClick = { onEdit(SettingsDialog.SyncPath) },
-        )
-    }
-
-    SettingsSectionLabel(stringResource(R.string.settings_group_sync))
-
-    SettingsCard {
-        SettingsActionRow(
-            label = stringResource(R.string.sync_now),
-            hint = stringResource(R.string.sync_now_summary),
-            onClick = onSyncNow,
-            enabled = !state.running,
-        )
-        RowDivider()
-        SettingsActionRow(
-            label = stringResource(R.string.sync_test),
-            hint = null,
-            onClick = onTest,
-            enabled = !state.running && !testing,
-        )
-        RowDivider()
-        SettingsSwitchRow(
-            label = stringResource(R.string.sync_auto),
-            checked = stored.davAutoSync,
-            onCheckedChange = onAutoSync,
-        )
-    }
-
-    Spacer(Modifier.size(12.dp))
-
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 4.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        if (state.running) {
-            /*
-             * 有总数就给**确定进度**（几百个会话要传好几分钟，光转圈让人以为卡死），
-             * 没有总数（下载 meta、列目录那种瞬间动作）才转圈。
-             */
-            if (state.total > 0) {
-                LinearProgressIndicator(
-                    modifier = Modifier.fillMaxWidth(),
-                    progress = { (state.done.toFloat() / state.total).coerceIn(0f, 1f) },
-                )
-            } else {
-                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-            }
-        }
-
-        /*
-         * 一句话的状态：跑起来时是阶段，跑完是结果，试连时是试连结果。
-         *
-         * 优先级**从上往下**：正在发生的事 > 刚做过的事 > 上一次同步的结论。
-         * 反过来写的话，同步失败之后那句旧的成功文案会一直压在上面。
-         */
-        val status = when {
-            state.running -> when (state.stage) {
-                SyncStage.DOWNLOAD -> stringResource(R.string.sync_stage_download)
-                SyncStage.MERGE -> if (state.total > 0) {
-                    stringResource(R.string.sync_progress_pull, state.done, state.total)
-                } else {
-                    stringResource(R.string.sync_stage_merge)
-                }
-
-                SyncStage.UPLOAD -> if (state.total > 0) {
-                    stringResource(R.string.sync_progress_upload, state.done, state.total)
-                } else {
-                    stringResource(R.string.sync_stage_upload)
-                }
-
-                null -> stringResource(R.string.sync_now)
-            }
-
-            testing -> stringResource(R.string.api_testing)
-            testMessage != null -> testMessage
-            state.message != null -> state.message
-            else -> stringResource(R.string.sync_never)
-        }
-        Text(
-            text = status,
-            style = MaterialTheme.typography.labelMedium,
-            color = if (state.failed && !state.running) colors.danger else colors.placeholder,
-        )
-
-        // 上次成功同步的时间单独一行 —— 它是"数据到底同没同步"的锚点
-        Text(
-            text = if (stored.davLastSyncAt > 0) {
-                stringResource(
-                    R.string.sync_last_at,
-                    SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
-                        .format(Date(stored.davLastSyncAt)),
-                )
-            } else {
-                stringResource(R.string.sync_never)
-            },
-            style = MaterialTheme.typography.labelSmall,
-            color = colors.placeholder,
-        )
-
-        Text(
-            text = stringResource(R.string.sync_hint),
-            style = MaterialTheme.typography.labelSmall,
-            color = colors.placeholder,
-        )
-    }
-}
-
-// ══════════════════════════════════════════════════════════
 //  二级：API 配置
 // ══════════════════════════════════════════════════════════
 
 @Composable
 private fun ApiPage(
     stored: StoredSettings,
+    profile: ApiProfile,
+    onRename: () -> Unit,
     provider: ProviderKind,
     testing: Boolean,
     testResult: String?,
     onPick: (SettingsDialog) -> Unit,
-    onProfiles: () -> Unit,
     profileError: String?,
     onTest: () -> Unit,
     onWebSearch: (Boolean) -> Unit,
 ) {
     val colors = LocalChatColors.current
 
-    SettingsSectionLabel(stringResource(R.string.api_profiles_title))
-    SettingsCard {
-        SettingsNavRow(null, stringResource(R.string.api_profile_current),
-            stored.apiProfiles.firstOrNull { it.id == stored.activeApiProfileId }?.name, onProfiles)
-    }
-    Text(stringResource(R.string.api_profiles_hint), style = MaterialTheme.typography.labelSmall,
-        color = colors.placeholder, modifier = Modifier.padding(horizontal = 4.dp, vertical = 10.dp))
     profileError?.let { Text(it, color = colors.danger, style = MaterialTheme.typography.labelMedium) }
+    SettingsCard {
+        SettingsNavRow(null, stringResource(R.string.api_profile_rename), profile.name, onRename)
+    }
 
     SettingsSectionLabel(stringResource(R.string.settings_group_service))
 
@@ -1715,6 +2200,12 @@ private fun ApiPage(
             value = stored.modelId.ifBlank { stringResource(R.string.api_model_unset) },
             onClick = { onPick(SettingsDialog.Model) },
         )
+        if (stored.modelId.isNotBlank()) {
+            RowDivider(inset = 16.dp)
+            SettingsNavRow(null, stringResource(R.string.api_model_capabilities), null) {
+                onPick(SettingsDialog.ModelCapabilities)
+            }
+        }
     }
 
     SettingsSectionLabel(stringResource(R.string.settings_group_auth))
@@ -1723,7 +2214,7 @@ private fun ApiPage(
         SettingsNavRow(
             icon = null,
             label = "API Key",
-            value = if (stored.hasKey) maskKey(stored.apiKey) else stringResource(R.string.api_key_unset),
+            value = stringResource(if (profile.apiKeyEncrypted.isNotBlank()) R.string.api_profile_key_saved else R.string.api_key_unset),
             onClick = { onPick(SettingsDialog.ApiKey) },
         )
         RowDivider(inset = 16.dp)
@@ -1773,6 +2264,8 @@ private fun ApiPage(
                 checked = stored.webSearch,
                 onCheckedChange = onWebSearch,
             )
+        } else if (com.simplechat.app.net.isOfficialDeepSeekEndpoint(stored.baseUrl) && stored.modelId == com.simplechat.app.net.DEEPSEEK_PRO) {
+            Text(stringResource(R.string.deepseek_pro_search_hint), modifier = Modifier.padding(16.dp), style = MaterialTheme.typography.bodySmall)
         }
         RowDivider(inset = 16.dp)
         SettingsNavRow(
@@ -1789,7 +2282,7 @@ private fun ApiPage(
 @Composable
 internal fun ApiProfilesPage(
     stored: StoredSettings, error: String?, onSelect: (ApiProfile) -> Unit,
-    onNew: () -> Unit, onCopy: () -> Unit, onRename: (ApiProfile) -> Unit, onDelete: (ApiProfile) -> Unit,
+    onNew: () -> Unit, onCopy: () -> Unit, onEdit: (ApiProfile) -> Unit, onDelete: (ApiProfile) -> Unit,
 ) {
     val colors = LocalChatColors.current
     SettingsSectionLabel(stringResource(R.string.api_profiles_title))
@@ -1800,7 +2293,7 @@ internal fun ApiProfilesPage(
         stored.apiProfiles.forEachIndexed { index, profile ->
             if (index > 0) RowDivider(inset = 16.dp)
             Row(Modifier.fillMaxWidth().padding(end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f).clickable { onSelect(profile) }.padding(16.dp)) {
+                Column(Modifier.weight(1f).clickable { onSelect(profile) }.padding(horizontal = Space.Screen, vertical = Space.RowPadY)) {
                     Text(profile.name, style = MaterialTheme.typography.titleSmall,
                         color = if (profile.id == stored.activeApiProfileId) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
                     val provider = ProviderKind.entries.firstOrNull { it.name == profile.providerId }
@@ -1814,7 +2307,7 @@ internal fun ApiProfilesPage(
                         else if (profile.apiKeyEncrypted.isNotBlank()) R.string.api_profile_key_saved else R.string.api_key_unset),
                         style = MaterialTheme.typography.labelSmall, color = colors.placeholder)
                 }
-                IconCircleButton(AppIcons.Edit, stringResource(R.string.api_profile_rename), { onRename(profile) }, size = 36.dp, iconSize = 18.dp)
+                IconCircleButton(AppIcons.Edit, stringResource(R.string.api_profile_edit), { onEdit(profile) }, size = 36.dp, iconSize = 18.dp)
                 if (stored.apiProfiles.size > 1) IconCircleButton(AppIcons.Trash,
                     stringResource(R.string.api_profile_delete), { onDelete(profile) }, size = 36.dp, iconSize = 18.dp)
             }
@@ -1822,7 +2315,7 @@ internal fun ApiProfilesPage(
     }
     Spacer(Modifier.size(16.dp))
     SettingsCard {
-        SettingsActionRow(stringResource(R.string.api_profile_new), stringResource(R.string.api_profile_new_hint), onNew)
+        SettingsActionRow(stringResource(R.string.api_profile_new), stringResource(R.string.api_profile_new_hint), onNew, icon = AppIcons.PlusCircle)
         RowDivider(inset = 16.dp)
         SettingsActionRow(stringResource(R.string.api_profile_copy), stringResource(R.string.api_profile_copy_hint), onCopy)
     }
@@ -1907,7 +2400,7 @@ private fun PresetRow(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onEdit)
-            .padding(start = 16.dp, end = 8.dp, top = 14.dp, bottom = 14.dp),
+            .padding(start = 16.dp, end = 8.dp, top = Space.RowPadY, bottom = Space.RowPadY),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(modifier = Modifier.weight(1f)) {
@@ -2168,22 +2661,15 @@ private fun FontPage(
 // ══════════════════════════════════════════════════════════
 
 @Composable
-private fun AboutPage(onOpenLicenses: () -> Unit) {
+private fun AboutPage(
+    onOpenLicenses: () -> Unit,
+    onOpenDiagnostics: () -> Unit = {},
+) {
     val colors = LocalChatColors.current
     val scope = rememberCoroutineScope()
+    var showProjectLicense by rememberSaveable { mutableStateOf(false) }
     var checking by remember { mutableStateOf(false) }
     var checkResult by remember { mutableStateOf<UpdateChecker.Result?>(null) }
-
-    /*
-     * 一句话说清这是什么。不写"基于 XX 二次开发"这类像免责声明的话 ——
-     * 它就是一个独立应用，只是把出处标在下面的「参考实现」里。
-     */
-    Text(
-        text = stringResource(R.string.about_intro),
-        style = MaterialTheme.typography.bodyMedium,
-        color = MaterialTheme.colorScheme.onBackground,
-        modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
-    )
 
     SettingsSectionLabel(stringResource(R.string.about_version))
 
@@ -2191,19 +2677,7 @@ private fun AboutPage(onOpenLicenses: () -> Unit) {
         InfoRow(label = stringResource(R.string.about_version), value = "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
         RowDivider(inset = 16.dp)
         InfoRow(label = stringResource(R.string.about_package), value = BuildConfig.APPLICATION_ID)
-        RowDivider(inset = 16.dp)
-        InfoRow(label = stringResource(R.string.license_type), value = APP_LICENSE)
-        RowDivider(inset = 16.dp)
-        InfoRow(label = stringResource(R.string.license_copyright), value = APP_COPYRIGHT)
-    }
-
-    /*
-     * 「检查更新」单独一张卡：上面几行是只读信息，这一行是**可点**的 ——
-     * 混排会出现"有的能点有的不能点"。
-     */
-    SettingsSectionLabel(stringResource(R.string.about_update))
-
-    SettingsCard {
+        RowDivider()
         SettingsActionRow(
             label = stringResource(R.string.about_check_update),
             hint = stringResource(R.string.about_current_version, BuildConfig.VERSION_NAME),
@@ -2220,41 +2694,55 @@ private fun AboutPage(onOpenLicenses: () -> Unit) {
         )
     }
 
-    /*
-     * 项目地址单独一组，不与上面的版本信息混排：
-     * 这一行是**可点**的（点开跳到仓库），而上面几行是只读信息 ——
-     * 混在一张卡里会出现「有的能点有的不能点」。
-     */
     SettingsSectionLabel(stringResource(R.string.about_project))
-
     SettingsCard {
-        LinkRow(
-            label = stringResource(R.string.about_project_url),
-            value = ProjectUrl,
-            url = ProjectUrl,
-        )
+        LinkRow(label = stringResource(R.string.about_project_url), value = ProjectUrl, url = ProjectUrl)
         RowDivider(inset = 16.dp)
-        LinkRow(
-            label = stringResource(R.string.about_reference),
-            value = ReferenceUrl,
-            url = ReferenceUrl,
-        )
+        SettingsNavRow(icon = null, label = stringResource(R.string.license_type), value = APP_LICENSE,
+            onClick = { showProjectLicense = true })
+        RowDivider(inset = 16.dp)
+        SettingsNavRow(icon = null, label = stringResource(R.string.about_licenses),
+            value = stringResource(R.string.licenses_count, thirdPartyLicenses.size), onClick = onOpenLicenses)
+    }
+    if (showProjectLicense) {
+        val context = LocalContext.current
+        val license = remember(context) { context.resources.openRawResource(R.raw.simplechat_license).bufferedReader().use { it.readText() } }
+        val colors = LocalChatColors.current
+        Dialog(onDismissRequest = { showProjectLicense = false }) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .widthIn(max = 560.dp)
+                    .clip(ContainerShape)
+                    .background(colors.card)
+                    .padding(20.dp),
+            ) {
+                Text("SimpleChat · MIT", style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface)
+                Spacer(Modifier.size(12.dp))
+                Text(license, Modifier.weight(1f, fill = false).heightIn(max = 520.dp)
+                    .verticalScroll(rememberScrollState()),
+                    style = MaterialTheme.typography.bodySmall, color = colors.processText)
+                Spacer(Modifier.size(16.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    TextAction(stringResource(R.string.action_close), onClick = { showProjectLicense = false })
+                }
+            }
+        }
     }
 
-    SettingsSectionLabel(stringResource(R.string.about_licenses))
+    SettingsSectionLabel(stringResource(R.string.about_diagnostics_group))
 
     /*
-     * 只放一行入口，不把十几个组件铺在「关于」页里。
-     *
-     * 合规要看的是**每个组件的五项信息**（名称与版本 / 许可证 / 版权 / 官方链接 /
-     * 许可证全文），那必须是一页能逐条读的清单，而不是几张 `名字 (MIT)` 的便签。
+     * 诊断日志：出问题时让用户把「刚才那一段」直接复制给我们。
+     * 只统计当前进程的内存缓冲，不落盘，退出即清 —— 页面里会写明。
      */
     SettingsCard {
         SettingsNavRow(
-            icon = AppIcons.FileText,
-            label = stringResource(R.string.about_licenses),
-            value = stringResource(R.string.licenses_count, thirdPartyLicenses.size),
-            onClick = onOpenLicenses,
+            icon = AppIcons.Info,
+            label = stringResource(R.string.about_diagnostics_group),
+            value = null,
+            onClick = onOpenDiagnostics,
         )
     }
 
@@ -2376,7 +2864,7 @@ private fun LicensesPage() {
                 text = stringResource(textRes),
                 style = MaterialTheme.typography.bodyMedium,
                 color = colors.processText,
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = Space.Screen, vertical = Space.RowPadY),
             )
         }
     }
@@ -2394,7 +2882,8 @@ private fun LicenseRow(entry: LicenseEntry, onClick: () -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 14.dp),
+            .heightIn(min = Space.Row)
+            .padding(horizontal = Space.Screen, vertical = Space.RowPadY),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(modifier = Modifier.weight(1f)) {
@@ -2480,17 +2969,6 @@ private fun LicenseDetailDialog(entry: LicenseEntry, onDismiss: () -> Unit) {
 //  基础组件
 // ══════════════════════════════════════════════════════════
 
-/**
- * 设置页的顶部：**大标题 + 填充式圆形返回键**。
- *
- * 按 M3 的 Large top app bar 排：返回键在上、标题在下一行、左对齐、28sp。
- * 与"一行里塞下返回键和小标题"的老版相比，这一版的层级更清楚 ——
- * 用户一眼知道自己在哪一页，而不是先看见一颗按钮再去找标题。
- *
- * 不做折叠（滚动时收缩）：二级页的滚动容器在 `AnimatedContent` 里，
- * 每页各有一份 `ScrollState`，把折叠接进来得给每页都挂 `nestedScroll`，
- * 换来的只是一个动效 —— 不值。
- */
 @Composable
 fun SettingsTopBar(
     title: String,
@@ -2498,15 +2976,24 @@ fun SettingsTopBar(
     /** 标题的共享元素修饰符（页面转场用）。 */
     titleModifier: Modifier = Modifier,
 ) {
-    Column(
+    /*
+     * 64dp + 填充式圆形返回键：M3 的 Small top app bar 排法。
+     *
+     * 早先是 56dp 的裸图标 —— 能点，但触控区只有 32dp，拇指边缘经常点不中。
+     * `FilledIconButton` 自带 40dp 容器 + 48dp 触控区与按下叠色，
+     * 与对话页顶栏是同一颗按钮。
+     */
+    Box(
         modifier = Modifier
             .fillMaxWidth()
             .statusBarsPadding()
-            .padding(start = 16.dp, end = 16.dp, top = 8.dp),
+            .height(64.dp),
     ) {
-        // 与对话页顶栏同一颗：官方 FilledIconButton（tonal 圆容器 + 48dp 触控区）
         FilledIconButton(
             onClick = onBack,
+            modifier = Modifier
+                .align(Alignment.CenterStart)
+                .padding(start = 12.dp),
             colors = IconButtonDefaults.filledIconButtonColors(
                 containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
                 contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -2519,96 +3006,58 @@ fun SettingsTopBar(
             )
         }
 
-        Spacer(Modifier.size(4.dp))
-
         Text(
             text = title,
-            style = MaterialTheme.typography.headlineMedium,
+            style = MaterialTheme.typography.titleLarge,
             color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier
+                .align(Alignment.Center)
+                .then(titleModifier)
+                .padding(horizontal = 56.dp),
             maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            // 与返回键色块的左缘对齐
-            modifier = Modifier.padding(start = 4.dp).then(titleModifier),
+            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
         )
-
-        Spacer(Modifier.size(8.dp))
     }
 }
 
-/**
- * 分组小标题。
- *
- * 用**主色**而不是灰色（`labelMedium` 13sp）：设置页里分组标题是唯一
- * 需要"被扫到"的层级，灰色小字在一屏十几行里根本读不出来。
- * 这也正是 M3 设置类界面的常规做法 —— 分组标题承担导航，不承担正文。
- */
+private fun Modifier.settingsSectionGrid(): Modifier =
+    padding(start = 4.dp, top = Space.Section, bottom = Space.Gap)
+
 @Composable
 fun SettingsSectionLabel(text: String) {
+    val colors = LocalChatColors.current
     Text(
         text = text,
         style = MaterialTheme.typography.labelMedium,
-        color = MaterialTheme.colorScheme.primary,
-        modifier = Modifier.padding(start = 10.dp, top = 16.dp, bottom = 8.dp),
+        color = colors.placeholder,
+        modifier = Modifier.settingsSectionGrid(),
     )
 }
 
-/**
- * 设置卡片：**一张 24dp 圆角的整块**，里面的行之间用小间隙隔开。
- *
- * 行与行的分隔由 [RowDivider] 画成"一条页面底色的缝"，而不是一条 1dp 细线 ——
- * 于是这一块看起来是**一组相连的行**（M3 的 connected list），
- * 而不是一张带表格线的卡。
- */
 @Composable
 fun SettingsCard(content: @Composable () -> Unit) {
     val colors = LocalChatColors.current
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(SettingsCardShape)
+            .clip(MenuShape)
             .background(colors.card),
     ) {
         content()
     }
 }
 
-/** 卡片圆角：M3 的 large 档（24dp）。 */
-private val SettingsCardShape = RoundedCornerShape(24.dp)
-
-/**
- * 行之间的分割。
- *
- * 两种形态，**同名的原因是调用点太多**（三十多处），逐个改会引入更多风险：
- *
- * - **不带参数**（卡片里）：一条 **2dp 的页面底色**。卡片里的每一行都被这条缝切开，
- *   整块读起来是"几行连在一起"（M3 的 connected list），而不是一张带表格线的卡。
- *   左侧不留白 —— 缝通到两边，连接感才成立。
- * - **`inset = 16.dp`**（对话框、非卡片的区域）：仍然是一条 1dp 细线并缩进，
- *   那是"M3 的列表分隔线"，与上面那种"缝"是两种东西，不该混用。
- */
 @Composable
-private fun RowDivider(inset: androidx.compose.ui.unit.Dp = 0.dp) {
+internal fun RowDivider(inset: androidx.compose.ui.unit.Dp = Space.Screen + Space.Icon + Space.IconGap) {
     val colors = LocalChatColors.current
-    if (inset > 0.dp) {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(start = inset)
-                .height(1.dp)
-                .background(colors.divider),
-        )
-    } else {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(2.dp)
-                .background(colors.settingsBackground),
-        )
-    }
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = inset)
+            .height(1.dp)
+            .background(colors.divider),
+    )
 }
-
-/** 主题色菜单的宽度：七个 40dp 色块 + 8dp 间距，比默认菜单宽。 */
-private val AccentMenuWidth = 352.dp
 
 /**
  * 读系统音色列表的超时。
@@ -2637,19 +3086,19 @@ private fun AccentSwatch(
     val dark = LocalIsDarkTheme.current
     val swatchDesc = stringResource(R.string.a11y_accent_color, color.label)
     Box(
-        modifier = Modifier.size(40.dp),
+        modifier = Modifier.size(30.dp),
         contentAlignment = Alignment.Center,
     ) {
         Box(
             modifier = Modifier
-                .size(30.dp)
+                .size(22.dp)
                 .clip(CircleShape)
                 .background(color.primary(dark)),
         )
         if (selected) {
             Box(
                 modifier = Modifier
-                    .size(34.dp)
+                    .size(30.dp)
                     .border(2.dp, MaterialTheme.colorScheme.onSurface, CircleShape),
             )
         }
@@ -2670,19 +3119,95 @@ private fun AccentSwatch(
     }
 }
 
+/** 余额行的状态。 */
+private sealed interface BalanceRowState {
+    /** 正在查。 */
+    data object Loading : BalanceRowState
+
+    /** 查到了：币种 + 总额。服务端给的是字符串，原样显示，避免浮点误差。 */
+    data class Balance(val currency: String, val total: String) : BalanceRowState
+
+    /** 还没配 API Key。 */
+    data object NoKey : BalanceRowState
+
+    /** 当前端点不是 DeepSeek 官方端点，没有 `/user/balance`。 */
+    data object Unsupported : BalanceRowState
+
+    /** 查失败：网络、鉴权、响应结构不认识都落这里。 */
+    data object Failed : BalanceRowState
+}
+
+/** 币种符号。认不出来就不加符号，只显示数字。 */
+private fun balanceSymbol(currency: String): String = when (currency.uppercase()) {
+    "CNY", "RMB" -> "¥"
+    "USD" -> "$"
+    "EUR" -> "€"
+    "JPY" -> "JP¥"
+    else -> ""
+}
+
+/**
+ * 「账户余额」行：图标 + 标题 + 右侧余额 + 刷新图标。
+ *
+ * 与 [SettingsNavRow] 不同，这行**不是导航**，所以右侧不带箭头 —— 放刷新图标，
+ * 点整行即重新查询。查询中 / 失败态同样可点，方便网络恢复后重试。
+ */
+@Composable
+private fun BalanceRow(
+    state: BalanceRowState,
+    onClick: () -> Unit,
+) {
+    val colors = LocalChatColors.current
+    val value: String = when (state) {
+        BalanceRowState.Loading -> stringResource(R.string.settings_balance_loading)
+        is BalanceRowState.Balance -> balanceSymbol(state.currency) + state.total
+        BalanceRowState.NoKey -> stringResource(R.string.settings_balance_no_key)
+        BalanceRowState.Unsupported -> stringResource(R.string.settings_balance_unsupported)
+        BalanceRowState.Failed -> stringResource(R.string.settings_balance_failed)
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .heightIn(min = Space.Row)
+            .padding(horizontal = Space.Screen, vertical = Space.RowPadY),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(Space.IconGap),
+    ) {
+        val contentTint = MaterialTheme.colorScheme.onSurface
+        Icon(
+            imageVector = AppIcons.Wallet,
+            contentDescription = null,
+            tint = contentTint,
+            modifier = Modifier.size(Space.Icon),
+        )
+        Text(
+            text = stringResource(R.string.settings_balance),
+            style = MaterialTheme.typography.titleSmall,
+            color = contentTint,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodyMedium,
+            color = colors.placeholder,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.End,
+        )
+        Icon(
+            imageVector = AppIcons.ChevronRight,
+            contentDescription = null,
+            tint = colors.placeholder,
+            modifier = Modifier.size(16.dp),
+        )
+    }
+}
+
 /**
  * 一级入口行：图标 + 标题 +（可选）当前值 + 箭头。
  * 图标传 `null` 即为二级页面里的行 —— 二级不配图标。
  */
-/**
- * 右侧值分到的宽度权重（标题是 1）。
- *
- * 0.5 ≈ 标题 2/3 / 值 1/3：手机宽度下标题能完整显示六到八个汉字，
- * 「云端同步」「朗读音色」「自动折叠思考内容」都在安全区内；
- * 值那边放"跟随系统""简体中文""已配置"也够。
- */
-private const val ValueWeight = 0.5f
-
 @Composable
 fun SettingsNavRow(
     icon: ImageVector?,
@@ -2695,38 +3220,23 @@ fun SettingsNavRow(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            /*
-             * 行高 18dp × 2 + 内容 ≈ 64dp。M3 的单行列表项是 56dp，
-             * 这里带图标 + 右侧值，64 才不挤；触控区也稳过 48dp。
-             */
-            .padding(horizontal = 18.dp, vertical = 18.dp),
+            .heightIn(min = Space.Row)
+            .padding(horizontal = Space.Screen, vertical = Space.RowPadY),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(16.dp),
+        horizontalArrangement = Arrangement.spacedBy(Space.IconGap),
     ) {
         if (icon != null) {
             Icon(
                 imageVector = icon,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurface,
-                modifier = Modifier.size(22.dp),
+                modifier = Modifier.size(Space.Icon),
             )
         }
         Text(
             text = label,
-            // bodyLarge(16sp) 是 M3 列表项标题的标准字号；titleSmall(14) 偏小
-            style = MaterialTheme.typography.bodyLarge,
+            style = MaterialTheme.typography.titleSmall,
             color = MaterialTheme.colorScheme.onSurface,
-            /*
-             * ⚠️ **标题必须单行 + 省略号。**
-             *
-             * 这行原先只有 `weight(1f)`，而右侧的值是"按内容测量"的
-             * （`widthIn(max = 200.dp)`）—— 长值会先吃掉 200dp，标题被压到
-             * 只剩一个字宽，中文于是逐字换行，变成竖排的"云端同步"。
-             *
-             * 单行之后最坏情况是省略号，读起来仍是"云端同…"，比竖排强得多。
-             */
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
             // 标题吃掉全部剩余空间 → 值 + 箭头被顶到最右，形成一条整齐的右边线
             modifier = Modifier.weight(1f),
         )
@@ -2738,122 +3248,103 @@ fun SettingsNavRow(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 textAlign = TextAlign.End,
-                /*
-                 * 值改用**按比例**分配（0.62 : 1），不再用固定上限。
-                 *
-                 * 固定 200dp 的问题与上面同源：它只看自己，不看标题还剩多少。
-                 * 比例分配把"标题 vs 值"变成一个确定的分割，无论屏幕多窄，
-                 * 标题都能拿到约 2/3 的宽度。
-                 *
-                 * ⚠️ 必须是 `fill = true`（默认）：`fill = false` 时短值只占内容宽，
-                 * 它后面的剩余空间**不会还给标题**，而是变成值右侧的一块空隙 ——
-                 * 表现就是"值和箭头没贴到右边"。填充之后，`textAlign = End`
-                 * 让文字紧贴箭头左侧，右边线始终整齐。
-                 */
-                modifier = Modifier.weight(ValueWeight),
+                modifier = Modifier.widthIn(max = 190.dp),
             )
         }
         Icon(
             imageVector = AppIcons.ChevronRight,
             contentDescription = null,
             tint = colors.placeholder,
-            modifier = Modifier.size(18.dp),
+            modifier = Modifier.size(16.dp),
         )
     }
 }
 
 /** 二级页面的动作行：标题 +（可选）说明，无图标。 */
 @Composable
-private fun SettingsActionRow(
+internal fun SettingsActionRow(
     label: String,
     hint: String?,
     onClick: () -> Unit,
     destructive: Boolean = false,
     /** 导入进行中之类的"暂时不能点"。 */
     enabled: Boolean = true,
+    icon: ImageVector? = null,
 ) {
     val colors = LocalChatColors.current
-    Column(
+    Row(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 18.dp, vertical = 16.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
+            .heightIn(min = Space.Row)
+            .padding(horizontal = Space.Screen, vertical = Space.RowPadY),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(Space.IconGap),
     ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.bodyLarge,
-            color = if (destructive) colors.danger else MaterialTheme.colorScheme.onSurface,
-        )
-        if (hint != null) {
+        if (icon != null) Icon(icon, contentDescription = null, modifier = Modifier.size(Space.Icon))
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
             Text(
-                text = hint,
-                style = MaterialTheme.typography.labelSmall,
-                color = colors.placeholder,
+                text = label,
+                style = MaterialTheme.typography.titleSmall,
+                color = if (destructive) colors.danger else MaterialTheme.colorScheme.onSurface,
             )
+            if (hint != null) {
+                Text(
+                    text = hint,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = colors.placeholder,
+                )
+            }
         }
     }
 }
 
 /** 开关行。 */
 @Composable
-private fun SettingsSwitchRow(
+internal fun SettingsSwitchRow(
     label: String,
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
     icon: ImageVector? = null,
-    /** 第二行灰字说明。M3 的列表项就是"标题 + 支持文本"两行结构。 */
-    hint: String? = null,
+    enabled: Boolean = true,
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { onCheckedChange(!checked) }
-            .padding(horizontal = 18.dp, vertical = 14.dp),
+            .clickable(enabled = enabled) { onCheckedChange(!checked) }
+            .heightIn(min = Space.Row)
+            .padding(horizontal = Space.Screen, vertical = Space.RowPadY),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(16.dp),
+        horizontalArrangement = Arrangement.spacedBy(Space.IconGap),
     ) {
         if (icon != null) {
             Icon(
                 imageVector = icon,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurface,
-                modifier = Modifier.size(21.dp),
+                modifier = Modifier.size(Space.Icon),
             )
         }
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = label,
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onSurface,
-            )
-            if (hint != null) {
-                Text(
-                    text = hint,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
-        AppSwitch(checked = checked, onCheckedChange = onCheckedChange)
+        Text(
+            text = label,
+            style = MaterialTheme.typography.titleSmall,
+            color = if (enabled) MaterialTheme.colorScheme.onSurface else LocalChatColors.current.placeholder,
+            modifier = Modifier.weight(1f),
+        )
+        AppSwitch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            enabled = enabled,
+            modifier = Modifier.semantics { contentDescription = label },
+        )
     }
 }
 
 /**
- * 本应用的仓库地址。
- *
- * 写成常量而不是资源：它是**代码里的一个事实**，不随界面语言变，也不该被翻译
- * （翻成别的语言反而点不开）。改仓库时只改这一处（另见 `UpdateChecker`）。
+ * 仓库地址。写成常量而不是资源：它是**代码里的一个事实**，不随界面语言变，
+ * 也不该被翻译（翻成别的语言反而点不开）。改仓库时只改这一处。
  */
-private const val ProjectUrl = "https://github.com/ZhuNemo/mydeepseek"
-
-/**
- * 参考实现（上游）。
- *
- * 这个应用不是从零写的：界面骨架、消息树、Markdown 渲染这些都来自 Simple Chat。
- * 留一行链接是对原作者的交代，也让想追根溯源的人找得到起点。
- */
-private const val ReferenceUrl = "https://github.com/Pokanshuu/Simple-Chat"
+private const val ProjectUrl = "https://github.com/Pokanshuu/Simple-Chat"
 
 /**
  * 可点击的信息行 —— 样式与 [InfoRow] 一致，只是值用主色、整行可点。
@@ -2873,7 +3364,8 @@ private fun LinkRow(label: String, value: String, url: String) {
                 // 没有浏览器时不要崩：提示一句就够了
                 runCatching { context.startActivity(intent) }
             }
-            .padding(horizontal = 16.dp, vertical = 16.dp),
+            .heightIn(min = Space.Row)
+            .padding(horizontal = Space.Screen, vertical = Space.RowPadY),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
@@ -2901,7 +3393,8 @@ private fun InfoRow(label: String, value: String) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 16.dp),
+            .heightIn(min = Space.Row)
+            .padding(horizontal = Space.Screen, vertical = Space.RowPadY),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
@@ -2932,7 +3425,20 @@ private fun InfoRow(label: String, value: String) {
 // ══════════════════════════════════════════════════════════
 
 @Composable
-private fun <T> ChoiceDialog(
+private fun capabilityLabel(manual: Boolean?, automatic: Boolean): String {
+    val status = stringResource(if (manual ?: automatic) R.string.api_model_enabled else R.string.api_model_disabled)
+    return if (manual == null) "${stringResource(R.string.api_model_automatic)} ($status)" else status
+}
+
+private fun reasoningWireLabel(wire: ReasoningWire): String = when (wire) {
+    ReasoningWire.DEEPSEEK -> "thinking (DeepSeek)"
+    ReasoningWire.EFFORT -> "reasoning_effort"
+    ReasoningWire.REASONING_OBJECT -> "reasoning"
+    ReasoningWire.ENABLE_THINKING -> "enable_thinking"
+}
+
+@Composable
+internal fun <T> ChoiceDialog(
     title: String,
     options: List<Pair<T, String>>,
     selected: T?,
@@ -2956,7 +3462,7 @@ private fun <T> ChoiceDialog(
                 text = title,
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.onSurface,
-                modifier = Modifier.padding(horizontal = 20.dp, vertical = 14.dp),
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = Space.RowPadY),
             )
 
             if (options.isEmpty()) {
@@ -2981,7 +3487,8 @@ private fun <T> ChoiceDialog(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clickable { onSelect(item) }
-                                .padding(horizontal = 20.dp, vertical = 14.dp),
+                                .heightIn(min = Space.Row)
+                                .padding(horizontal = 20.dp, vertical = Space.RowPadY),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Text(
@@ -3006,7 +3513,8 @@ private fun <T> ChoiceDialog(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clickable(onClick = onClick)
-                        .padding(horizontal = 20.dp, vertical = 14.dp),
+                        .heightIn(min = Space.Row)
+                        .padding(horizontal = 20.dp, vertical = Space.RowPadY),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
@@ -3021,7 +3529,7 @@ private fun <T> ChoiceDialog(
 }
 
 @Composable
-private fun TextInputDialog(
+internal fun TextInputDialog(
     title: String,
     initial: String,
     placeholder: String,
@@ -3160,3 +3668,347 @@ private fun maskKey(key: String): String {
 
 
 
+
+// ══════════════════════════════════════════════════════════
+//  用量与余额
+// ══════════════════════════════════════════════════════════
+
+/** 全库累计消耗的展示状态。 */
+private data class UsageTotalsUi(
+    val loading: Boolean = true,
+    val replies: Int = 0,
+    val promptTokens: Int = 0,
+    val completionTokens: Int = 0,
+    val cacheHitTokens: Int = 0,
+    val failed: Boolean = false,
+)
+
+/**
+ * 「用量与余额」页：账户余额 + 全部会话的累计 token 消耗与估算费用。
+ *
+ * 余额只对官方端点可查（`/user/balance`）；消耗统计是本地库里的服务端 usage，
+ * 与余额无关 —— 所以即使余额查不到，消耗也能显示。
+ */
+@Composable
+private fun UsagePage(
+    stored: StoredSettings,
+    loadTotals: suspend () -> com.simplechat.app.db.UsageTotals,
+    loadDaily: suspend (Long) -> List<com.simplechat.app.db.DailyUsage>,
+) {
+    val colors = LocalChatColors.current
+    val context = LocalContext.current
+    var refreshTick by remember { mutableIntStateOf(0) }
+    var balance by remember { mutableStateOf<BalanceRowState>(BalanceRowState.Loading) }
+    var totals by remember { mutableStateOf(UsageTotalsUi()) }
+    val today = java.time.LocalDate.now()
+    val firstDay = today.minusDays(29)
+    var daily by remember(firstDay) { mutableStateOf<List<com.simplechat.app.db.DailyUsage>?>(null) }
+
+    LaunchedEffect(stored.baseUrl, stored.apiKey, refreshTick) {
+        balance = BalanceRowState.Loading
+        balance = when {
+            !isOfficialDeepSeekEndpoint(stored.baseUrl) -> BalanceRowState.Unsupported
+            stored.apiKey.isBlank() -> BalanceRowState.NoKey
+            else -> {
+                when (val result = DeepSeekBalance.fetch(stored.baseUrl, stored.apiKey)) {
+                    is DeepSeekBalance.Result.Ok ->
+                        result.snapshot.primary
+                            ?.let { BalanceRowState.Balance(it.currency, it.totalBalance) }
+                            ?: BalanceRowState.Failed
+                    is DeepSeekBalance.Result.Failed -> BalanceRowState.Failed
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(firstDay, refreshTick) {
+        val since = firstDay.atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+        daily = try {
+            loadDaily(since)
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    LaunchedEffect(refreshTick) {
+        totals = runCatching { loadTotals() }.fold(
+            onSuccess = { t ->
+                UsageTotalsUi(
+                    loading = false,
+                    replies = t.replies,
+                    promptTokens = t.promptTokens,
+                    completionTokens = t.completionTokens,
+                    cacheHitTokens = t.cacheHitTokens,
+                )
+            },
+            onFailure = { UsageTotalsUi(loading = false, failed = true) },
+        )
+    }
+
+    val cost = com.simplechat.app.data.Pricing.cost(
+        promptTokens = totals.promptTokens,
+        completionTokens = totals.completionTokens,
+        cacheHitTokens = totals.cacheHitTokens.takeIf { it > 0 },
+    )
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = Space.Screen),
+    ) {
+        Spacer(Modifier.size(Space.Section))
+
+        if (isOfficialDeepSeekEndpoint(stored.baseUrl)) {
+            SettingsSectionLabel(stringResource(R.string.settings_deepseek_balance))
+            SettingsCard {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = Space.Screen, vertical = Space.RowPadY),
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = when (val state = balance) {
+                                BalanceRowState.Loading -> "…"
+                                is BalanceRowState.Balance -> balanceSymbol(state.currency) + state.total
+                                BalanceRowState.NoKey -> stringResource(R.string.settings_balance_no_key)
+                                BalanceRowState.Unsupported -> stringResource(R.string.settings_balance_unsupported)
+                                BalanceRowState.Failed -> stringResource(R.string.settings_balance_failed)
+                            },
+                            style = MaterialTheme.typography.headlineSmall,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.weight(1f),
+                        )
+                        IconCircleButton(
+                            icon = AppIcons.Refresh,
+                            contentDescription = stringResource(R.string.settings_balance_refresh),
+                            onClick = { refreshTick++ },
+                            size = 36.dp,
+                            iconSize = 18.dp,
+                            tint = MaterialTheme.colorScheme.onSurface,
+                        )
+                        IconCircleButton(
+                            icon = AppIcons.ExternalLink,
+                            contentDescription = stringResource(R.string.settings_balance_top_up),
+                            onClick = { openInBrowser(context, "https://platform.deepseek.com/usage") },
+                            size = 36.dp,
+                            iconSize = 18.dp,
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.size(Space.Section))
+        }
+
+        SettingsSectionLabel(stringResource(R.string.stats_usage_title_all))
+        SettingsCard {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = Space.Screen, vertical = Space.RowPadY),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                UsageStatRow(
+                    label = stringResource(R.string.stats_usage_requests),
+                    value = stringResource(R.string.stats_usage_requests_value, totals.replies),
+                )
+                UsageStatRow(
+                    label = stringResource(R.string.stats_usage_input),
+                    value = "${TokenEstimate.format(totals.promptTokens)} tokens",
+                )
+                UsageStatRow(
+                    label = stringResource(R.string.stats_usage_output),
+                    value = "${TokenEstimate.format(totals.completionTokens)} tokens",
+                )
+                if (totals.cacheHitTokens > 0) {
+                    UsageStatRow(
+                        label = stringResource(R.string.stats_usage_cache_hit),
+                        value = "${TokenEstimate.format(totals.cacheHitTokens)} tokens",
+                    )
+                }
+                if (isOfficialDeepSeekEndpoint(stored.baseUrl)) {
+                    UsageStatRow(
+                        label = stringResource(R.string.stats_usage_cost),
+                        value = com.simplechat.app.data.Pricing.format(cost),
+                    )
+                    Text(
+                        text = stringResource(R.string.stats_usage_note),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = colors.placeholder,
+                    )
+                }
+            }
+        }
+
+        daily?.let { rows ->
+            SettingsSectionLabel(stringResource(R.string.stats_usage_recent))
+            SettingsCard { DailyUsageChart(firstDay, rows) }
+        }
+        Spacer(Modifier.size(Space.Section))
+    }
+}
+
+@Composable
+private fun UsageStatRow(label: String, value: String) {
+    val colors = LocalChatColors.current
+    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium,
+            color = colors.placeholder,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+    }
+}
+// ══════════════════════════════════════════════════════════
+//  诊断日志
+// ══════════════════════════════════════════════════════════
+
+/**
+ * 将当前运行日志与最近一次崩溃堆栈作为同一份诊断内容导出。
+ * 运行日志保存在进程内存，崩溃堆栈单独保存在本地文件；清空操作同时删除两者。
+ */
+@Composable
+private fun DiagnosticsPage(
+    exportMessage: String?,
+    exportBusy: Boolean,
+    onExportReport: () -> Unit,
+) {
+    val colors = LocalChatColors.current
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    var exportMenuOpen by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    var lines by remember { mutableStateOf(Diagnostics.snapshot()) }
+    fun fullDiagnosticText(): String = buildString {
+        append(Diagnostics.exportText())
+        val crash = com.simplechat.app.data.CrashDiagnostics.text(context)
+        if (crash != null) {
+            appendLine()
+            appendLine("Latest crash report")
+            appendLine("----------")
+            append(crash)
+        }
+    }
+
+    // 日志是活的：停在页面上时每秒拉一次，用户一边复现一边就能看到新行。
+    LaunchedEffect(Unit) {
+        while (true) {
+            lines = Diagnostics.snapshot()
+            kotlinx.coroutines.delay(1000)
+        }
+    }
+
+    val saveFile = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain"),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val ok = runCatching {
+                withContext(Dispatchers.IO) {
+                    val text = fullDiagnosticText()
+                    val stream = context.contentResolver.openOutputStream(uri, "wt")
+                        ?: error("no output stream")
+                    stream.use { it.write(text.toByteArray()) }
+                }
+            }.isSuccess
+            android.widget.Toast.makeText(
+                context,
+                Res.get(if (ok) R.string.diagnostics_saved else R.string.diagnostics_save_failed),
+                android.widget.Toast.LENGTH_SHORT,
+            ).show()
+        }
+    }
+    SettingsSectionLabel(stringResource(R.string.about_diagnostics_group))
+
+    SettingsCard {
+        Box {
+            SettingsActionRow(
+                label = stringResource(R.string.diagnostics_export),
+                hint = stringResource(R.string.diagnostics_count, lines.size),
+                onClick = { exportMenuOpen = true },
+            )
+            AppMenu(expanded = exportMenuOpen, onDismissRequest = { exportMenuOpen = false }) {
+                AppMenuItem(stringResource(R.string.diagnostics_copy), AppIcons.Copy) {
+                    exportMenuOpen = false
+                    clipboard.setText(AnnotatedString(fullDiagnosticText()))
+                    android.widget.Toast.makeText(context, Res.get(R.string.diagnostics_copied), android.widget.Toast.LENGTH_SHORT).show()
+                }
+                AppMenuItem(stringResource(R.string.diagnostics_export), AppIcons.Share) {
+                    exportMenuOpen = false
+                    val send = Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_SUBJECT, "SimpleChat diagnostics")
+                        putExtra(Intent.EXTRA_TEXT, fullDiagnosticText())
+                    }
+                    context.startActivity(Intent.createChooser(send, Res.get(R.string.diagnostics_export)))
+                }
+                AppMenuItem(stringResource(R.string.diagnostics_save_file), AppIcons.Download) {
+                    exportMenuOpen = false
+                    val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.ROOT).format(java.util.Date())
+                    saveFile.launch("SimpleChat-diagnostics-$stamp.txt")
+                }
+            }
+        }
+        RowDivider()
+        SettingsActionRow(
+            label = stringResource(R.string.diagnostics_clear),
+            hint = null,
+            onClick = {
+                Diagnostics.clear()
+                com.simplechat.app.data.CrashDiagnostics.clear(context)
+                lines = emptyList()
+            },
+        )
+    }
+
+    SettingsSectionLabel(stringResource(R.string.diagnostics_backup_title))
+    SettingsCard {
+        SettingsActionRow(
+            label = stringResource(R.string.import_report_export),
+            hint = stringResource(R.string.import_report_hint),
+            onClick = onExportReport,
+            enabled = !exportBusy,
+        )
+    }
+
+    if (exportBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
+    exportMessage?.let {
+        Text(it, modifier = Modifier.padding(horizontal = Space.Screen, vertical = Space.RowPadY),
+            style = MaterialTheme.typography.bodySmall, color = colors.processText)
+    }
+
+    SettingsSectionLabel(stringResource(R.string.diagnostics_log_section))
+
+    if (lines.isEmpty()) {
+        Text(
+            text = stringResource(R.string.diagnostics_empty),
+            style = MaterialTheme.typography.labelMedium,
+            color = colors.placeholder,
+            modifier = Modifier.padding(horizontal = Space.Screen, vertical = Space.RowPadY),
+        )
+    } else {
+        /*
+         * 只渲染最近 300 行：环形缓冲有 2000 条，全画出来会让这一页变成卡顿现场。
+         * 复制 / 导出仍是完整内容 —— 看的是样本，交出去的是全量。
+         */
+        lines.takeLast(300).asReversed().forEach { line ->
+            Text(
+                text = line,
+                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                color = colors.processText,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = Space.Screen, vertical = 2.dp),
+            )
+        }
+    }
+}

@@ -1,13 +1,18 @@
 package com.simplechat.app.ui.common
 
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.PathBuilder
+import androidx.compose.ui.graphics.vector.addPathNodes
 import androidx.compose.ui.graphics.vector.path
 import androidx.compose.ui.unit.dp
+
+internal val LocalUseSimpleCatIcon = compositionLocalOf { true }
 
 /**
  * 图标集。
@@ -381,6 +386,26 @@ object AppIcons {
     }
 
     /** 重新生成（Lucide: refresh-cw） */
+    val ExternalLink: ImageVector by lazy {
+        vector("ExternalLink") {
+            stroke {
+                moveTo(15f, 3f)
+                horizontalLineTo(21f)
+                verticalLineTo(9f)
+                moveTo(10f, 14f)
+                lineTo(21f, 3f)
+                moveTo(18f, 13f)
+                verticalLineTo(19f)
+                arcToRelative(2f, 2f, 0f, false, true, -2f, 2f)
+                horizontalLineTo(5f)
+                arcToRelative(2f, 2f, 0f, false, true, -2f, -2f)
+                verticalLineTo(8f)
+                arcToRelative(2f, 2f, 0f, false, true, 2f, -2f)
+                horizontalLineTo(11f)
+            }
+        }
+    }
+
     val Refresh: ImageVector by lazy {
         vector("Refresh") {
             stroke {
@@ -398,6 +423,26 @@ object AppIcons {
                 moveTo(8f, 16f)
                 horizontalLineTo(3f)
                 verticalLineToRelative(5f)
+            }
+        }
+    }
+
+    /** 余额（Lucide: credit-card） */
+    val Wallet: ImageVector by lazy {
+        vector("Wallet") {
+            stroke {
+                moveTo(6f, 5f)
+                horizontalLineTo(18f)
+                arcToRelative(4f, 4f, 0f, false, true, 4f, 4f)
+                verticalLineTo(15f)
+                arcToRelative(4f, 4f, 0f, false, true, -4f, 4f)
+                horizontalLineTo(6f)
+                arcToRelative(4f, 4f, 0f, false, true, -4f, -4f)
+                verticalLineTo(9f)
+                arcToRelative(4f, 4f, 0f, false, true, 4f, -4f)
+                close()
+                moveTo(2f, 10f)
+                horizontalLineTo(22f)
             }
         }
     }
@@ -604,6 +649,30 @@ object AppIcons {
         }
     }
 
+    val ImageEdit: ImageVector by lazy {
+        vector("ImageEdit") {
+            stroke {
+                moveTo(13f, 21f); horizontalLineTo(5f); arcToRelative(2f, 2f, 0f, false, true, -2f, -2f)
+                verticalLineTo(5f); arcToRelative(2f, 2f, 0f, false, true, 2f, -2f); horizontalLineTo(19f)
+                arcToRelative(2f, 2f, 0f, false, true, 2f, 2f); verticalLineTo(8f)
+                moveTo(3f, 17f); lineTo(8f, 12f); lineTo(11f, 15f)
+                moveTo(8.5f, 7.5f); lineTo(8.5f, 8f)
+                moveTo(14f, 17f); lineTo(19f, 12f); lineTo(22f, 15f)
+                lineTo(17f, 20f); lineTo(13f, 21f); close()
+            }
+        }
+    }
+
+    val Import: ImageVector by lazy {
+        vector("Import") {
+            stroke {
+                moveTo(4f, 15f); verticalLineTo(20f); horizontalLineTo(20f); verticalLineTo(15f)
+                moveTo(12f, 3f); verticalLineTo(15f)
+                moveTo(7f, 10f); lineTo(12f, 15f); lineTo(17f, 10f)
+            }
+        }
+    }
+
     /** 拍照（Lucide: camera） */
     val Camera: ImageVector by lazy {
         vector("Camera") {
@@ -662,7 +731,8 @@ object AppIcons {
         }
     }
 
-    /** 思考过程（Lucide: brain） */    val Brain: ImageVector by lazy {
+    /** 思考过程（Lucide: brain） */
+    val Brain: ImageVector by lazy {
         vector("Brain") {
             stroke {
                 moveTo(12f, 18f)
@@ -976,6 +1046,18 @@ object AppIcons {
     }
 
     /** 保险箱（Lucide: lock） */
+    val Share: ImageVector by lazy {
+        vector("Share") {
+            stroke {
+                moveTo(8.6f, 10.5f); lineTo(15.4f, 6.5f)
+                moveTo(8.6f, 13.5f); lineTo(15.4f, 17.5f)
+                moveTo(3f, 12f); arcToRelative(3f, 3f, 0f, true, true, 6f, 0f); arcToRelative(3f, 3f, 0f, true, true, -6f, 0f)
+                moveTo(15f, 5f); arcToRelative(3f, 3f, 0f, true, true, 6f, 0f); arcToRelative(3f, 3f, 0f, true, true, -6f, 0f)
+                moveTo(15f, 19f); arcToRelative(3f, 3f, 0f, true, true, 6f, 0f); arcToRelative(3f, 3f, 0f, true, true, -6f, 0f)
+            }
+        }
+    }
+
     val Lock: ImageVector by lazy {
         vector("Lock") {
             stroke {
@@ -1103,6 +1185,28 @@ object AppIcons {
         }
     }
 
+    val ExpandComposer: ImageVector by lazy {
+        vector("ExpandComposer") {
+            stroke {
+                moveTo(8f, 3f); lineTo(3f, 3f); lineTo(3f, 8f)
+                moveTo(16f, 3f); lineTo(21f, 3f); lineTo(21f, 8f)
+                moveTo(21f, 16f); lineTo(21f, 21f); lineTo(16f, 21f)
+                moveTo(8f, 21f); lineTo(3f, 21f); lineTo(3f, 16f)
+            }
+        }
+    }
+
+    val CollapseComposer: ImageVector by lazy {
+        vector("CollapseComposer") {
+            stroke {
+                moveTo(3f, 8f); lineTo(8f, 8f); lineTo(8f, 3f)
+                moveTo(21f, 8f); lineTo(16f, 8f); lineTo(16f, 3f)
+                moveTo(16f, 21f); lineTo(16f, 16f); lineTo(21f, 16f)
+                moveTo(8f, 21f); lineTo(8f, 16f); lineTo(3f, 16f)
+            }
+        }
+    }
+
     /**
      * 自动折叠思考内容（Lucide: fold-vertical）
      *
@@ -1144,7 +1248,10 @@ object AppIcons {
      * 与 [Bubble] 的区别：那个是**实心**的品牌标识，属于启动图与 App 图标；
      * 这里是描边的，跟界面其余图标是一套。
      */
-    val MessageSquare: ImageVector by lazy {
+    val MessageSquare: ImageVector
+        @Composable get() = if (LocalUseSimpleCatIcon.current) SimpleCat else ClassicMessageSquare
+
+    val ClassicMessageSquare: ImageVector by lazy {
         vector("MessageSquare") {
             stroke {
                 moveTo(21f, 15f)
@@ -1190,7 +1297,27 @@ object AppIcons {
      * 描边风格，与设置页其它一级入口（Palette / FontSize / Collapse / Info）
      * 是一套。实心的 [Bubble] 那个是品牌标识，混在描边图标里会显得很重。
      */
-    val Prompt: ImageVector get() = MessageSquare
+    val Prompt: ImageVector
+        @Composable get() = MessageSquare
+
+    // Visible paths from simple-cat.svg, using its 24 × 24 viewBox.
+    val SimpleCat: ImageVector by lazy {
+        vector("SimpleCat") {
+            addPath(
+                pathData = addPathNodes(
+                    "M5.9,19.2l-2.8,2.3c-.3.3-.6.3-1,0,0,0-.2-.3-.2-.4V3.1" +
+                        "c0-.2,0-.4.3-.6.4-.3,1-.3,1.4,0l2.7,2.2.5.3" +
+                        "c.5.4,1.1.7,1.8.7h6.6c.6,0,1.3-.3,1.8-.7l.5-.3,2.7-2.2" +
+                        "c.4-.3,1-.3,1.4,0,.2.2.3.3.3.6v14.6c0,.9-.9,1.7-1.9,1.7h-4.6" +
+                        "M8.3,11.1V13.7M15.7,11.1V13.7",
+                ),
+                stroke = SolidColor(Color.Black),
+                strokeLineWidth = 2f,
+                strokeLineCap = StrokeCap.Round,
+                strokeLineJoin = StrokeJoin.Round,
+            )
+        }
+    }
 
     /** 关于（Lucide: info） */
     val Info: ImageVector by lazy {

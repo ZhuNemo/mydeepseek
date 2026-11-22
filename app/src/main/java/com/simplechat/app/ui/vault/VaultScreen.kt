@@ -54,6 +54,7 @@ import com.simplechat.app.data.Res
 import com.simplechat.app.data.StoredSettings
 import com.simplechat.app.db.ConversationEntity
 import com.simplechat.app.ui.common.AppIcons
+import com.simplechat.app.ui.lock.PinLockScreen
 import com.simplechat.app.ui.theme.LocalChatColors
 import kotlinx.coroutines.launch
 
@@ -89,15 +90,27 @@ fun VaultScreen(
     onVerifyPin: suspend (String) -> Boolean,
     onSetPin: suspend (String) -> Unit,
     onVerifyAnswer: suspend (String) -> Boolean,
+    /**
+     * 整机应用锁已经解开时传 true：进入保险箱不再要求再输一次。
+     *
+     * 两者共用同一把 PIN —— 同一把密码连输两遍不增加安全性，只是摩擦。
+     * 整机锁没开时保持默认 false，保险箱仍单独解锁。
+     */
+    preUnlocked: Boolean = false,
 ) {
     val colors = LocalChatColors.current
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
 
-    var stage by remember {
-        mutableStateOf(if (stored.hasVaultPin) VaultStage.UNLOCK else VaultStage.SET_PIN)
+    var stage by remember(preUnlocked) {
+        mutableStateOf(
+            when {
+                preUnlocked -> VaultStage.LIST
+                stored.hasVaultPin -> VaultStage.UNLOCK
+                else -> VaultStage.SET_PIN
+            },
+        )
     }
-    var entry by remember { mutableStateOf("") }
     var firstPin by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
@@ -138,48 +151,49 @@ fun VaultScreen(
         }
     }
 
-    /** 六位输满就提交。放在 Effect 里而不是按键回调里：粘贴 / 自动填充也要走到。 */
-    LaunchedEffect(entry, stage) {
-        if (entry.length < PinLength || busy) return@LaunchedEffect
-        busy = true
-        try {
-            when (stage) {
-                VaultStage.SET_PIN -> {
-                    firstPin = entry
-                    entry = ""
-                    error = null
-                    stage = VaultStage.CONFIRM_PIN
-                }
-
-                VaultStage.CONFIRM_PIN -> {
-                    if (entry == firstPin) {
-                        onSetPin(entry)
-                        entry = ""
-                        error = null
-                        stage = VaultStage.LIST
-                    } else {
-                        entry = ""
-                        firstPin = ""
-                        error = Res.get(R.string.vault_pin_mismatch)
-                        stage = VaultStage.SET_PIN
+    /**
+     * 校验并推进阶段。
+     *
+     * ⚠️ 必须挂在**提交回调**里，不能用 `LaunchedEffect(entry)`：后者按"值有没有变"
+     * 触发，用户输错后重输同一个密码时 `entry` 与上一次完全相同，Effect 不会重跑 ——
+     * 表现就是"第二次输对了却没反应"。
+     */
+    fun submit(pin: String) {
+        if (busy) return
+        scope.launch {
+            busy = true
+            error = null
+            try {
+                when (stage) {
+                    VaultStage.SET_PIN -> {
+                        firstPin = pin
+                        stage = VaultStage.CONFIRM_PIN
                     }
-                }
 
-                VaultStage.UNLOCK -> {
-                    val ok = onVerifyPin(entry)
-                    entry = ""
-                    if (ok) {
-                        error = null
-                        stage = VaultStage.LIST
-                    } else {
-                        error = Res.get(R.string.vault_wrong_pin)
+                    VaultStage.CONFIRM_PIN -> {
+                        if (pin == firstPin) {
+                            onSetPin(pin)
+                            stage = VaultStage.LIST
+                        } else {
+                            firstPin = ""
+                            error = Res.get(R.string.vault_pin_mismatch)
+                            stage = VaultStage.SET_PIN
+                        }
                     }
-                }
 
-                else -> Unit
+                    VaultStage.UNLOCK -> {
+                        if (onVerifyPin(pin)) {
+                            stage = VaultStage.LIST
+                        } else {
+                            error = Res.get(R.string.vault_wrong_pin)
+                        }
+                    }
+
+                    else -> Unit
+                }
+            } finally {
+                busy = false
             }
-        } finally {
-            busy = false
         }
     }
 
@@ -217,7 +231,7 @@ fun VaultScreen(
             )
             Spacer(Modifier.weight(1f))
             if (stage == VaultStage.LIST) {
-                TextButton(onClick = { stage = VaultStage.UNLOCK; entry = ""; error = null }) {
+                TextButton(onClick = { stage = VaultStage.UNLOCK; error = null }) {
                     Text(Res.get(R.string.vault_lock))
                 }
             }
@@ -253,18 +267,40 @@ fun VaultScreen(
                 },
             )
 
-            else -> PinPanel(
-                stage = stage,
-                filled = entry.length,
+            else -> PinLockScreen(
+                title = stringResourceTitle(stage),
+                subtitle = if (stage == VaultStage.SET_PIN) {
+                    Res.get(R.string.lock_pin_hint)
+                } else {
+                    null
+                },
                 error = error,
-                canUseScreenLock = stage != VaultStage.SET_PIN && stage != VaultStage.CONFIRM_PIN,
-                canRecover = stage == VaultStage.UNLOCK && stored.hasVaultRecovery,
-                onDigit = { if (entry.length < PinLength) entry += it },
-                onBackspace = { entry = entry.dropLast(1) },
-                onScreenLock = ::tryScreenLock,
-                onForgot = {
-                    error = null
-                    stage = VaultStage.RESET
+                busy = busy,
+                onPinComplete = { pin -> submit(pin) },
+                footer = when {
+                    stage == VaultStage.SET_PIN || stage == VaultStage.CONFIRM_PIN -> null
+                    else -> {
+                        {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                TextButton(onClick = ::tryScreenLock) {
+                                    Text(Res.get(R.string.vault_use_screen_lock))
+                                }
+                                if (stored.hasVaultRecovery) {
+                                    TextButton(
+                                        onClick = {
+                                            error = null
+                                            stage = VaultStage.RESET
+                                        },
+                                    ) {
+                                        Text(Res.get(R.string.vault_forgot))
+                                    }
+                                }
+                            }
+                        }
+                    }
                 },
             )
         }
@@ -282,161 +318,6 @@ private fun stringResourceTitle(stage: VaultStage): String = when (stage) {
 
 // ══════════════════════════════════════════════════════════
 //  PIN 输入
-// ══════════════════════════════════════════════════════════
-
-@Composable
-private fun PinPanel(
-    stage: VaultStage,
-    filled: Int,
-    error: String?,
-    canUseScreenLock: Boolean,
-    canRecover: Boolean,
-    onDigit: (Char) -> Unit,
-    onBackspace: () -> Unit,
-    onScreenLock: () -> Unit,
-    onForgot: () -> Unit,
-) {
-    val colors = LocalChatColors.current
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Spacer(Modifier.height(24.dp))
-
-        // 圆底锁形图标，呼应系统解锁界面
-        Box(
-            modifier = Modifier
-                .size(64.dp)
-                .clip(CircleShape)
-                .background(MaterialTheme.colorScheme.primaryContainer),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(
-                imageVector = AppIcons.Lock,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                modifier = Modifier.size(28.dp),
-            )
-        }
-
-        Spacer(Modifier.height(18.dp))
-
-        Text(
-            text = Res.get(
-                if (stage == VaultStage.SET_PIN) R.string.vault_set_pin_hint else R.string.vault_unlock,
-            ),
-            style = MaterialTheme.typography.bodyMedium,
-            color = colors.placeholder,
-            textAlign = TextAlign.Center,
-        )
-
-        Spacer(Modifier.height(28.dp))
-
-        // 六个点
-        Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-            repeat(PinLength) { index ->
-                Box(
-                    modifier = Modifier
-                        .size(14.dp)
-                        .clip(CircleShape)
-                        .background(
-                            if (index < filled) {
-                                MaterialTheme.colorScheme.primary
-                            } else {
-                                MaterialTheme.colorScheme.outlineVariant
-                            },
-                        ),
-                )
-            }
-        }
-
-        Spacer(Modifier.height(12.dp))
-
-        Text(
-            // 错误位常驻：没有错误时占同样高度，键盘不会因此上下跳
-            text = error.orEmpty(),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.error,
-            textAlign = TextAlign.Center,
-            modifier = Modifier.height(20.dp),
-        )
-
-        Spacer(Modifier.height(16.dp))
-
-        Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            listOf("123", "456", "789").forEach { row ->
-                Row(horizontalArrangement = Arrangement.spacedBy(18.dp)) {
-                    row.forEach { digit ->
-                        PinKey(label = digit.toString()) { onDigit(digit) }
-                    }
-                }
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(18.dp)) {
-                PinKey(icon = AppIcons.Backspace, onClick = onBackspace)
-                PinKey(label = "0") { onDigit('0') }
-                if (canUseScreenLock) {
-                    PinKey(icon = AppIcons.Key, onClick = onScreenLock)
-                } else {
-                    Spacer(Modifier.size(72.dp))
-                }
-            }
-        }
-
-        Spacer(Modifier.weight(1f))
-
-        if (canRecover) {
-            TextButton(onClick = onForgot) {
-                Text(Res.get(R.string.vault_forgot))
-            }
-        }
-
-        Text(
-            text = Res.get(R.string.vault_not_encrypted),
-            style = MaterialTheme.typography.labelSmall,
-            color = colors.placeholder,
-            textAlign = TextAlign.Center,
-            modifier = Modifier.padding(bottom = 20.dp),
-        )
-    }
-}
-
-@Composable
-private fun PinKey(
-    label: String? = null,
-    icon: ImageVector? = null,
-    onClick: () -> Unit,
-) {
-    Box(
-        modifier = Modifier
-            .size(72.dp)
-            .clip(CircleShape)
-            .background(MaterialTheme.colorScheme.surfaceContainerHigh)
-            .clickable(onClick = onClick),
-        contentAlignment = Alignment.Center,
-    ) {
-        if (label != null) {
-            Text(
-                text = label,
-                fontSize = 26.sp,
-                fontWeight = FontWeight.Normal,
-                color = MaterialTheme.colorScheme.onSurface,
-            )
-        } else if (icon != null) {
-            Icon(
-                imageVector = icon,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.size(24.dp),
-            )
-        }
-    }
-}
-
-// ══════════════════════════════════════════════════════════
-//  密保重置
 // ══════════════════════════════════════════════════════════
 
 @Composable

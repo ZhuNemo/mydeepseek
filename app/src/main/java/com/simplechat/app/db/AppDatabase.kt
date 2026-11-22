@@ -25,7 +25,13 @@ import androidx.sqlite.db.SupportSQLiteDatabase
     // v7：messages 增加 timeline / stopReason（Anthropic 兼容通道的内容块时间线）
     // v8：新增 attachment_refs（落盘图片的引用，删会话时据此清理文件）
     // v9：附件可被多个会话引用（分叉后删除原会话不能丢图）
-    version = 10,
+    /*
+     * 版本 14 = 上游的 13 + 本仓库自己的 v10（保险箱标记）。
+     *
+     * 两条版本线在这里交汇：上游 9→10 加 `tokens_cache_hit`，我们把自己的
+     * `hidden` 放到 13→14 —— 这样从任何一边升上来的库都能走通。
+     */
+    version = 14,
     exportSchema = true,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -153,18 +159,58 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
-        /**
-         * 9 → 10：会话加「保险箱」标记。
-         *
-         * 只加一列、带默认值 —— 老会话自动是"不在保险箱"。
-         * 不重建表：这一列的默认值就是全部语义，没有需要回填的东西。
-         */
+        /** v9 → v10：只加一列，老消息保持 null（= 那轮没有服务端用量，界面按"未知"处理）。 */
         private val MIGRATION_9_10 = object : Migration(9, 10) {
             override fun migrate(db: SupportSQLiteDatabase) {
-                db.execSQL("ALTER TABLE conversations ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE messages ADD COLUMN tokens_cache_hit INTEGER")
             }
         }
 
+        private val MIGRATION_10_11 = object : Migration(10, 11) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE messages ADD COLUMN imageGeneration INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
+        private val MIGRATION_11_12 = object : Migration(11, 12) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE messages ADD COLUMN imageRequest TEXT")
+            }
+        }
+
+        private val MIGRATION_12_13 = object : Migration(12, 13) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE conversations ADD COLUMN memoryEnabled INTEGER NOT NULL DEFAULT 1")
+                db.execSQL("ALTER TABLE drafts ADD COLUMN memoryEnabled INTEGER NOT NULL DEFAULT 1")
+            }
+        }
+
+        /**
+         * v13 → v14：会话加「保险箱」标记（本仓库自己的那一列）。
+         *
+         * ⚠️ **必须容忍列已存在。** 本仓库从上游合并之前，自己的数据库版本号
+         * 就叫 10，而那一版已经把 `hidden` 加进去了。这次合并把版本号带到 14，
+         * 老用户从 10 一路升上来时，这条 13→14 会第二次碰到同一列 ——
+         * 直接 `ALTER TABLE ... ADD COLUMN` 会报 `duplicate column name: hidden`，
+         * 迁移失败等于启动即崩。所以先查 `PRAGMA table_info`，有就跳过。
+         */
+        private val MIGRATION_13_14 = object : Migration(13, 14) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                if (!db.hasColumn("conversations", "hidden")) {
+                    db.execSQL("ALTER TABLE conversations ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+                }
+            }
+        }
+
+        /** 这一列在不在（迁移里用来做"可重复执行"的守卫）。 */
+        private fun SupportSQLiteDatabase.hasColumn(table: String, column: String): Boolean =
+            query("PRAGMA table_info(`$table`)").use { cursor ->
+                val nameIndex = cursor.getColumnIndex("name")
+                while (cursor.moveToNext()) {
+                    if (nameIndex >= 0 && cursor.getString(nameIndex) == column) return true
+                }
+                false
+            }
         fun build(context: Context, name: String = "simplechat.db"): AppDatabase =
             Room.databaseBuilder(
                 context.applicationContext,
@@ -180,6 +226,10 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_7_8,
                     MIGRATION_8_9,
                     MIGRATION_9_10,
+                    MIGRATION_10_11,
+                    MIGRATION_11_12,
+                    MIGRATION_12_13,
+                    MIGRATION_13_14,
                 )
                 .build()
     }

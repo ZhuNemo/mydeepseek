@@ -3,6 +3,7 @@ package com.simplechat.app.ui.chat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.ui.layout.Layout
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -15,6 +16,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -38,36 +40,48 @@ import com.simplechat.app.ui.common.AppIcons
 @Composable
 fun EmptyState(
     modifier: Modifier = Modifier,
+    bottomObstruction: () -> Int = { 0 },
 ) {
-    Column(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(horizontal = 32.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
-    ) {
-        Box(
-            modifier = Modifier
-                .size(96.dp)
-                .background(MaterialTheme.colorScheme.surfaceContainer, IconContainerShape),
-            contentAlignment = Alignment.Center,
+    Layout(modifier = modifier, content = {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Icon(
-                imageVector = AppIcons.MessageSquare,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.size(44.dp),
+            /*
+             * 图标加一块**色块底座**（M3 的 empty state 惯例）：
+             * 裸图标在大片空白里会显得"没画完"，一块 96dp 的容器把它锚住。
+             */
+            Box(
+                modifier = Modifier
+                    .size(96.dp)
+                    .background(MaterialTheme.colorScheme.surfaceContainer, IconContainerShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = AppIcons.MessageSquare,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(44.dp),
+                )
+            }
+            Spacer(Modifier.size(24.dp))
+            Text(
+                text = stringResource(R.string.empty_greeting),
+                style = MaterialTheme.typography.titleLarge,
+                color = MaterialTheme.colorScheme.onBackground,
+                textAlign = TextAlign.Center,
             )
         }
-
-        Spacer(Modifier.size(24.dp))
-
-        Text(
-            text = stringResource(R.string.empty_greeting),
-            style = MaterialTheme.typography.titleLarge,
-            color = MaterialTheme.colorScheme.onBackground,
-            textAlign = TextAlign.Center,
-        )
+    }) { measurables, constraints ->
+        val greeting = measurables.single().measure(constraints.copy(minHeight = 0, maxHeight = Constraints.Infinity))
+        val height = constraints.maxHeight
+        layout(greeting.width, height) {
+            val available = (height - bottomObstruction()).coerceAtLeast(0)
+            val opacity = ((available - greeting.height) / 64.dp.toPx()).coerceIn(0f, 1f)
+            if (opacity > 0f) {
+                greeting.placeRelativeWithLayer(0, (available - greeting.height) / 2) { alpha = opacity }
+            }
+        }
     }
 }
 

@@ -1,6 +1,8 @@
 package com.simplechat.app.net
 
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
@@ -58,24 +60,74 @@ internal class SseLineParser(private val json: Json) {
         val events = mutableListOf<StreamEvent>()
 
         chunk.choices.firstOrNull()?.delta?.let { delta ->
-            delta.reasoningContent
-                ?.takeIf { it.isNotEmpty() }
-                ?.let { events += StreamEvent.Reasoning(it) }
-            delta.content
-                ?.takeIf { it.isNotEmpty() }
+            delta.toolCalls.forEach { call ->
+                events += StreamEvent.ToolCallDelta(call.index, call.id, call.function?.name, call.function?.arguments)
+            }
+            events += citationEvents(delta.annotations)
+            delta.title?.takeIf(String::isNotBlank)?.let { events += StreamEvent.Title(it) }
+            delta.displayReasoning()?.let { events += StreamEvent.Reasoning(it) }
+            // 有些兼容端点通过独立字段返回拒绝文本。
+            (delta.content?.takeIf(String::isNotEmpty) ?: delta.refusal.refusalDelta())
                 ?.let { events += StreamEvent.Content(it) }
         }
 
         chunk.usage?.let {
             events += StreamEvent.Usage(
-                promptTokens = it.promptTokens,
-                completionTokens = it.completionTokens,
-                cacheHitTokens = it.cacheHitTokens,
+                promptTokens = it.promptTokens ?: 0,
+                completionTokens = it.completionTokens ?: 0,
+                cacheHitTokens = it.cacheHitTokens ?: it.promptTokensDetails?.cachedTokens,
             )
         }
 
         return events
     }
+
+    private fun DeltaDto.displayReasoning(): String? {
+        // 兼容网关可能在同一帧重复发送别名。沿用传统字段优先级，只派发一份。
+        val primary = reasoningContent.stringDelta()
+        val alias = reasoning.stringDelta()
+        val textAlias = reasoningText.stringDelta()
+        if (primary != null && primary.isNotBlank()) return primary
+        if (alias != null && alias.isNotBlank()) return alias
+        if (textAlias != null && textAlias.isNotBlank()) return textAlias
+
+        val summary = reasoningSummary.summaryDelta()
+            ?: (reasoning as? JsonObject)?.get("summary").summaryDelta()
+            ?: (reasoningContent as? JsonObject)?.get("summary").summaryDelta()
+            ?: (reasoningDetails as? JsonArray)?.let { details ->
+                joinDeltas(details) { detail ->
+                    val item = detail as? JsonObject
+                    item?.get("summary").summaryDelta()
+                        ?.takeIf { item?.get("type").stringDelta() == "reasoning.summary" }
+                }
+            }
+        // 独立的空白增量可能是词间空格或换行，留给累加器合并。
+        return summary ?: primary ?: alias ?: textAlias
+    }
+
+    private fun JsonElement?.summaryDelta(): String? = when (this) {
+        is JsonArray -> joinDeltas(this) { part ->
+            val item = part as? JsonObject
+            part.stringDelta() ?: item?.get("text").stringDelta()
+                ?.takeIf { item?.get("type").stringDelta() == "summary_text" }
+        }
+        is JsonObject -> this["text"].stringDelta()
+            ?.takeIf { this["type"].stringDelta() == "summary_text" }
+        else -> stringDelta()
+    }
+
+    private fun joinDeltas(parts: JsonArray, extract: (JsonElement) -> String?): String? =
+        buildString { parts.forEach { part -> extract(part)?.let { append(it) } } }.takeIf(String::isNotEmpty)
+
+    private fun JsonElement?.refusalDelta(): String? {
+        val item = this as? JsonObject ?: return stringDelta()
+        val type = item["type"].stringDelta()
+        return item["refusal"].stringDelta()
+            ?: item["text"].stringDelta()?.takeIf { type == "refusal" }
+    }
+
+    private fun JsonElement?.stringDelta(): String? =
+        (this as? JsonPrimitive)?.takeIf { it.isString }?.content?.takeIf(String::isNotEmpty)
 
     private fun extractErrorMessage(obj: JsonObject): String? =
         (obj["error"] as? JsonObject)
@@ -97,3 +149,14 @@ internal class SseLineParser(private val json: Json) {
         const val MAX_RAW_ERROR_LENGTH = 300
     }
 }
+
+/** Chat Completions nests the citation payload. Responses puts the same fields on the annotation. */
+internal fun citationEvents(annotations: JsonElement?): List<StreamEvent.CitationDelta> =
+    (annotations as? JsonArray).orEmpty().mapNotNull { value ->
+        val annotation = value as? JsonObject ?: return@mapNotNull null
+        if ((annotation["type"] as? JsonPrimitive)?.contentOrNull != "url_citation") return@mapNotNull null
+        val fields = annotation["url_citation"] as? JsonObject ?: annotation
+        val url = (fields["url"] as? JsonPrimitive)?.contentOrNull ?: return@mapNotNull null
+        if (!url.startsWith("https://") && !url.startsWith("http://")) return@mapNotNull null
+        StreamEvent.CitationDelta(0, Citation(url, (fields["title"] as? JsonPrimitive)?.contentOrNull))
+    }

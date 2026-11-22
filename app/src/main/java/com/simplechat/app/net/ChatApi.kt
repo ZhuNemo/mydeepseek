@@ -42,11 +42,15 @@ class ChatApi(
         apiKey: String,
         request: AnthropicRequest,
         extraHeaders: Map<String, String> = emptyMap(),
+        contextWindow: Int? = null,
+        retryBeforeContent: Boolean = true,
     ): Flow<StreamEvent> = anthropicApi.streamMessage(
         url = anthropicMessagesUrl(baseUrl),
         apiKey = apiKey,
         request = request,
         extraHeaders = extraHeaders,
+        contextWindow = contextWindow,
+        retryBeforeContent = retryBeforeContent,
     )
 
     /**
@@ -68,29 +72,61 @@ class ChatApi(
         temperature: Double? = null,
         topP: Double? = null,
         extraHeaders: Map<String, String> = emptyMap(),
+        retryBeforeContent: Boolean = true,
+        apiStyle: ApiStyle = ApiStyle.OPENAI,
+        search: Boolean = false,
+        openAiSearch: Boolean = false,
+        readLink: Boolean = false,
+        requestTitle: Boolean = false,
+        generateImageTool: Boolean = false,
     ): Flow<StreamEvent> {
-        val thinkingActive = model.supportsThinking && thinkingEnabled
+        val flash = isOfficialDeepSeekEndpoint(baseUrl) && model.id == DEEPSEEK_FLASH
+        val tools = if (flash) buildList {
+            // Flash accepts client tools alongside built-in search only in thinking mode.
+            if (search && (!generateImageTool || thinkingEnabled)) add(DeepSeekTool("deepseek_web_search"))
+            if (readLink && !generateImageTool) add(DeepSeekTool("deepseek_read_url"))
+        }.ifEmpty { null } else null
+        val requestMessages = if (generateImageTool) {
+            listOf(OutMessageDto("system", MessageContent.text(imageToolInstruction))) + messages
+        } else messages
+        val title = if (flash && requestTitle && messages.sumOf {
+            ((it.content as? JsonPrimitive)?.content?.length ?: 8_001).toLong() + 32
+        } <= 8_000) DeepSeekTitle() else null
+        if (apiStyle == ApiStyle.OPENAI_RESPONSES) {
+            return sseClient.streamResponses(
+                url = responsesUrl(baseUrl), apiKey = apiKey,
+                request = buildResponsesRequest(model, requestMessages, thinkingEnabled, reasoningEffort, maxTokens, temperature).let { request ->
+                    val imageTool = imageToolDefinition.takeIf { generateImageTool }?.let {
+                        DeepSeekTool("function", name = it.name, description = it.description, parameters = it.parameters)
+                    }
+                    val searchTool = DeepSeekTool("web_search").takeIf {
+                        openAiSearch && supportsOpenAiSearchTool(baseUrl, model.id, apiStyle)
+                    }
+                    request.copy(
+                        tools = (tools.orEmpty() + listOfNotNull(imageTool, searchTool)).ifEmpty { null },
+                        title = title,
+                        reasoning = if (isOfficialDeepSeekEndpoint(baseUrl) && !thinkingEnabled) ResponsesReasoningDto("none") else request.reasoning,
+                    )
+                },
+                messages = requestMessages, model = model, extraHeaders = extraHeaders, retryBeforeContent = retryBeforeContent,
+            )
+        }
+        val imageTool = if (generateImageTool) DeepSeekTool("function", imageToolDefinition) else null
+        val allTools = (tools.orEmpty() + listOfNotNull(imageTool)).ifEmpty { null }
+        val request = buildChatRequest(model, requestMessages, thinkingEnabled, reasoningEffort, maxTokens, temperature, topP, isOfficialDeepSeekEndpoint(baseUrl))
+            .let { if (allTools == null && title == null) it else it.copy(tools = allTools, toolChoice = if (imageTool != null) "auto" else null, title = title, temperature = null, topP = null) }
 
-        val request = ChatRequestDto(
-            model = model.id,
-            messages = messages,
-            stream = true,
-            thinking = when {
-                !model.supportsThinking -> null
-                thinkingEnabled -> ThinkingDto.Enabled
-                else -> ThinkingDto.Disabled
-            },
-            reasoningEffort = if (thinkingActive) reasoningEffort else null,
-            maxTokens = maxTokens,
-            temperature = if (thinkingActive) null else temperature,
-            topP = if (thinkingActive) topP else null,
-        )
-
+        val automaticSearch = usesAutomaticOpenAiSearch(model.id, apiStyle)
         return sseClient.stream(
             url = chatCompletionsUrl(baseUrl),
             apiKey = apiKey,
-            request = request,
+            request = if (automaticSearch && isOfficialOpenAiEndpoint(baseUrl)) {
+                request.copy(webSearchOptions = buildJsonObject {})
+            } else request,
             extraHeaders = extraHeaders,
+            contextWindow = model.contextWindow,
+            retryBeforeContent = retryBeforeContent,
+            maxOutputTokens = model.maxOutputTokens,
         )
     }
 
@@ -99,20 +135,22 @@ class ChatApi(
      * 失败不抛异常，由调用方决定提示方式。
      */
     suspend fun fetchModels(baseUrl: String, apiKey: String): Result<List<String>> =
+        fetchModelCatalog(baseUrl, apiKey).map { it.ids }
+
+    internal suspend fun fetchModelCatalog(
+        baseUrl: String,
+        apiKey: String,
+        apiStyle: ApiStyle = ApiStyle.OPENAI,
+    ): Result<RemoteModelCatalog> =
         withContext(Dispatchers.IO) {
             runCatching {
-                val builder = Request.Builder().url(modelsUrl(baseUrl)).get()
-                if (apiKey.isNotBlank()) {
-                    builder.header("Authorization", "Bearer $apiKey")
-                }
-                client.newCall(builder.build()).execute().use { response ->
+                val builder = modelListingRequest(baseUrl, apiKey, apiStyle)
+                client.newCall(builder).execute().use { response ->
                     if (!response.isSuccessful) {
                         error("HTTP ${response.code}")
                     }
                     val text = response.body?.string().orEmpty()
-                    json.decodeFromString(ModelListDto.serializer(), text)
-                        .data
-                        .map { it.id }
+                    parseRemoteModelCatalog(json, text)
                 }
             }
         }
@@ -125,7 +163,7 @@ class ChatApi(
          * 版本号**从 BuildConfig 取**，不写死 —— 写死之后每次改版本都会忘记同步，
          * 服务端看到的客户端版本就成了假的（改包名 / 定 0.9.0-beta 那次就漏了）。
          */
-        val USER_AGENT: String = "myDeepSeek/${BuildConfig.VERSION_NAME} (Android)"
+        val USER_AGENT: String = "SimpleChat/${BuildConfig.VERSION_NAME} (Android)"
 
         /**
          * 本地 OkHttpClient。
@@ -139,7 +177,11 @@ class ChatApi(
             .readTimeout(0, TimeUnit.MILLISECONDS)
             .retryOnConnectionFailure(true)
             .addInterceptor { chain ->
-                chain.proceed(
+                val requestBody = chain.request().body
+                val sending = if (requestBody is StreamingRequestBody<*> && requestBody.contentLength() >= LargeRequestBytes) {
+                    chain.withWriteTimeout(LargeRequestWriteTimeoutSeconds, TimeUnit.SECONDS)
+                } else chain
+                sending.proceed(
                     chain.request().newBuilder()
                         .header("User-Agent", USER_AGENT)
                         .build(),
@@ -156,6 +198,60 @@ class ChatApi(
             explicitNulls = false
         }
     }
+}
+
+internal fun modelListingRequest(baseUrl: String, apiKey: String, apiStyle: ApiStyle): Request {
+    val official = isOfficialDeepSeekEndpoint(baseUrl)
+    val nativeAnthropic = apiStyle == ApiStyle.ANTHROPIC && !official
+    val url = when {
+        nativeAnthropic -> anthropicMessagesUrl(baseUrl).removeSuffix("/messages") + "/models"
+        official -> modelsUrl(officialChatRoot(baseUrl) ?: baseUrl)
+        else -> modelsUrl(baseUrl)
+    }
+    return Request.Builder().url(url).get().header("Accept", "application/json").apply {
+        if (nativeAnthropic) {
+            header("anthropic-version", com.simplechat.app.net.anthropic.claudeVersionFor(baseUrl) ?: "2023-06-01")
+            if (apiKey.isNotBlank()) header("x-api-key", apiKey)
+        } else if (apiKey.isNotBlank()) {
+            header("Authorization", "Bearer $apiKey")
+        }
+    }.build()
+}
+
+/** Build only the reasoning fields understood by the configured OpenAI-compatible route. */
+internal fun buildChatRequest(
+    model: ModelInfo,
+    messages: List<OutMessageDto>,
+    thinkingEnabled: Boolean,
+    reasoningEffort: String? = null,
+    maxTokens: Int? = null,
+    temperature: Double? = null,
+    topP: Double? = null,
+    officialDeepSeek: Boolean = false,
+): ChatRequestDto {
+    val wire = model.reasoningWire.takeIf { model.supportsThinking }
+    val effort = when {
+        wire == null -> null
+        thinkingEnabled -> model.resolveReasoningEffort(reasoningEffort ?: "high")
+        wire == ReasoningWire.EFFORT -> model.disabledReasoningEffort()
+        else -> null
+    }
+    val output = model.clampOutputTokens(maxTokens)
+    return ChatRequestDto(
+        model = model.id,
+        messages = messages,
+        stream = true,
+        thinking = if (wire == ReasoningWire.DEEPSEEK) {
+            if (thinkingEnabled) ThinkingDto.Enabled else ThinkingDto.Disabled
+        } else null,
+        reasoningEffort = effort.takeIf { wire == ReasoningWire.DEEPSEEK || wire == ReasoningWire.EFFORT },
+        reasoning = if (wire == ReasoningWire.REASONING_OBJECT) ReasoningDto(thinkingEnabled, effort) else null,
+        enableThinking = thinkingEnabled.takeIf { wire == ReasoningWire.ENABLE_THINKING },
+        maxTokens = output.takeUnless { model.completionTokenField },
+        maxCompletionTokens = output.takeIf { model.completionTokenField },
+        temperature = temperature.takeUnless { model.completionTokenField || (wire != null && thinkingEnabled) },
+        topP = topP.takeIf { wire == ReasoningWire.DEEPSEEK && if (officialDeepSeek) adjustableTopP(model.id, thinkingEnabled) else thinkingEnabled },
+    )
 }
 
 /** 构造消息 `content`。文本 → 字符串；带图 → content block 数组。 */
@@ -201,4 +297,22 @@ object MessageContent {
 data class ImageInput(
     val dataUrl: String,
     val detail: String = "high",
+)
+
+internal const val imageToolInstruction = "For requests to create, regenerate, or edit an image, call generate_image. The app displays the image after the tool succeeds. Never say an image was generated or edited in a text-only reply."
+
+internal val imageToolDefinition = FunctionDefinitionDto(
+    name = "generate_image",
+    description = "Generate an image for an explicit request to create, redraw, or edit one. Describe the intended visual result and relevant details from any references. Do not call for image analysis or discussion.",
+    parameters = buildJsonObject {
+        put("type", "object")
+        putJsonObject("properties") {
+            putJsonObject("prompt") {
+                put("type", "string")
+                put("description", "Visual description of the requested image")
+            }
+        }
+        put("required", buildJsonArray { add(JsonPrimitive("prompt")) })
+        put("additionalProperties", false)
+    },
 )

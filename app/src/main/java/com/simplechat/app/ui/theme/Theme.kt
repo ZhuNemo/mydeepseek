@@ -7,6 +7,7 @@ import androidx.compose.ui.graphics.luminance
 import com.materialkolor.PaletteStyle
 import com.materialkolor.dynamicColorScheme
 import androidx.compose.material3.ColorScheme
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Shapes
 import androidx.compose.material3.darkColorScheme
@@ -235,6 +236,15 @@ private fun chatColors(scheme: ColorScheme): ChatColors = ChatColors(
 val LocalIsDarkTheme = staticCompositionLocalOf { false }
 
 /**
+ * 当前选中的主题色（设置页的「个性化 → 主题色」）。
+ *
+ * 与 `MaterialTheme.colorScheme.primary` 的区别：primary 是**算出来的**色板成员，
+ * 会被 tonal palette 调整过；有些地方（分享图片的背景、保险箱的锁形标识）
+ * 需要"用户当初选的那个色"本身，而不是它的某个 tonal 变体。
+ */
+val LocalAccentColor = staticCompositionLocalOf { AccentColor.BLUE }
+
+/**
  * 用 Material Color Utilities 生成整套 M3 色板。
  *
  * 关键：**seed 只有一个**（取浅色那档的品牌色）。早先的写法给深浅两套颜色，
@@ -368,6 +378,7 @@ fun SimpleChatTheme(
     CompositionLocalProvider(
         LocalChatColors provides colors,
         LocalIsDarkTheme provides dark,
+        LocalAccentColor provides accent,
         LocalDensity provides Density(
             density = baseDensity.density,
             fontScale = baseDensity.fontScale * fontScale,
@@ -377,7 +388,8 @@ fun SimpleChatTheme(
             colorScheme = scheme,
             shapes = SimpleChatShapes,
             typography = SimpleChatTypography,
-            content = content,
-        )
+        ) {
+            CompositionLocalProvider(LocalContentColor provides scheme.onBackground, content = content)
+        }
     }
 }

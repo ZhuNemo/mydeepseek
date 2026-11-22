@@ -12,7 +12,12 @@ import kotlinx.coroutines.flow.Flow
 @Dao
 interface ConversationDao {
 
-    /** 列表页主查询：置顶优先，其次按最近更新。 */
+    /**
+     * 列表页主查询：置顶优先，其次按最近更新。
+     *
+     * **不进保险箱**（`hidden = 0`）：这一条写在 SQL 里而不是界面过滤 ——
+     * 保险箱的内容不该出现在主列表的数据源里，哪怕只多存在一帧。
+     */
     @Query(
         """
         SELECT * FROM conversations
@@ -38,29 +43,45 @@ interface ConversationDao {
     @Query("UPDATE conversations SET hidden = :hidden, updatedAt = :now WHERE id = :id")
     suspend fun setHidden(id: String, hidden: Boolean, now: Long)
 
-    /** One bounded preview per matching message, including inactive variants; title-only hits remain visible. */
+    /** One bounded preview per matching message; title-only hits remain visible. */
     @Query(
         """
         SELECT c.*,
-            CASE WHEN m.id IS NULL THEN NULL ELSE
-                substr(m.content, max(1, instr(lower(m.content), lower(:query)) - 60), max(180, length(:query) + 120))
+            CASE WHEN m.id IS NULL THEN NULL
+                 WHEN instr(lower(m.content), lower(:query)) > 0 THEN
+                    substr(m.content, max(1, instr(lower(m.content), lower(:query)) - 60), max(180, length(:query) + 120))
+                 ELSE substr(m.reasoning, max(1, instr(lower(m.reasoning), lower(:query)) - 60), max(180, length(:query) + 120))
             END AS snippet,
+            CASE WHEN m.id IS NOT NULL AND instr(lower(m.content), lower(:query)) = 0
+                THEN 1 ELSE 0 END AS reasoningMatch,
             m.id AS messageId, m.role AS messageRole, m.createdAt AS messageCreatedAt,
-            m.variantIndex AS variantIndex,
+            CASE WHEN m.id IS NOT NULL THEN
+                (SELECT count(*) FROM messages sibling WHERE sibling.conversationId = m.conversationId
+                 AND sibling.parentId = m.parentId AND sibling.variantIndex < m.variantIndex)
+            END AS variantIndex,
             CASE WHEN m.id IS NULL THEN 0 ELSE
                 (SELECT count(*) FROM messages sibling WHERE sibling.conversationId = m.conversationId
                  AND sibling.parentId = m.parentId)
             END AS variantCount
         FROM conversations c
-        LEFT JOIN messages m ON m.conversationId = c.id AND instr(lower(m.content), lower(:query)) > 0
-        WHERE c.hidden = 0 AND length(:query) > 0 AND (m.id IS NOT NULL OR instr(lower(c.title), lower(:query)) > 0)
+        LEFT JOIN messages m ON m.conversationId = c.id
+            AND (instr(lower(m.content), lower(:query)) > 0
+                 OR (:includeReasoning AND instr(lower(m.reasoning), lower(:query)) > 0))
+            AND (:includeInactiveBranches OR m.active = 1)
+        WHERE c.hidden = 0 AND length(:query) > 0
+            AND (m.id IS NOT NULL OR instr(lower(c.title), lower(:query)) > 0)
         ORDER BY c.pinned DESC,
                  CASE WHEN c.pinned THEN c.pinnedAt ELSE c.updatedAt END DESC,
                  c.id ASC, m.createdAt DESC, m.id ASC
         LIMIT :limit
         """,
     )
-    fun search(query: String, limit: Int = Int.MAX_VALUE): Flow<List<ConversationSearchHit>>
+    fun search(
+        query: String,
+        includeInactiveBranches: Boolean = false,
+        limit: Int = Int.MAX_VALUE,
+        includeReasoning: Boolean = false,
+    ): Flow<List<ConversationSearchHit>>
 
     @Query("SELECT * FROM conversations WHERE id = :id")
     suspend fun findById(id: String): ConversationEntity?
@@ -94,10 +115,10 @@ interface ConversationDao {
     suspend fun count(): Int
 
     /**
-     * 同步只需要"有哪些会话、各自什么时候改的"。
+     * 同步用的清单：`id + updatedAt`，**排除保险箱**。
      *
-     * 刻意**不查整行**：同步要先知道"远端哪些更新"，而那是一个 id+时间戳的
-     * 小表；把 `systemPrompt` 之类一起读回来纯属浪费。返回顺序固定，导出可复现。
+     * 只取两列是因为同步的判定是"远端这条要不要拉、本地这条要不要推"，
+     * 与正文无关；把标题和正文一起读出来只会在几千条会话时白占内存。
      */
     @Query(
         "SELECT id, updatedAt FROM conversations WHERE hidden = 0 ORDER BY updatedAt DESC, id ASC",
@@ -163,6 +184,7 @@ data class ConversationSearchHit(
     val messageCreatedAt: Long? = null,
     val variantIndex: Int? = null,
     val variantCount: Int = 0,
+    val reasoningMatch: Boolean = false,
 )
 
 /** Bounded fields for lossless export of messages larger than CursorWindow. */
@@ -190,6 +212,18 @@ interface MessageDao {
     @Query("SELECT * FROM messages WHERE conversationId = :conversationId")
     suspend fun getAllFor(conversationId: String): List<MessageEntity>
 
+    @Query("UPDATE messages SET attachments = :attachments, status = :status WHERE id = :id AND status = 'STREAMING'")
+    suspend fun attachGeneratedImage(id: String, attachments: String?, status: String): Int
+
+    @Query("UPDATE messages SET status = :status, errorMessage = :error WHERE id = :id AND status = 'STREAMING'")
+    suspend fun settleImageGeneration(id: String, status: String, error: String?): Int
+
+    @Query("UPDATE messages SET imageGeneration = 1, imageRequest = :request WHERE id = :id")
+    suspend fun markImageGeneration(id: String, request: String)
+
+    @Query("SELECT conversationId FROM messages WHERE id = :id")
+    suspend fun conversationIdOf(id: String): String?
+
     /**
      * 同 [getAllFor]，但把 `attachments` 截断到 [cap] 字符。
      *
@@ -202,8 +236,8 @@ interface MessageDao {
         SELECT id, conversationId, parentId, variantIndex, active, role, content,
                substr(attachments, 1, :cap) AS attachments,
                reasoning, status, errorMessage, model, excluded,
-               thinkingMs, ttftMs, tps, tokens_in, tokens_out,
-               timeline, stopReason, createdAt
+               thinkingMs, ttftMs, tps, tokens_in, tokens_out, tokens_cache_hit,
+               timeline, stopReason, imageGeneration, imageRequest, createdAt
         FROM messages WHERE conversationId = :conversationId
         """,
     )
@@ -215,8 +249,8 @@ interface MessageDao {
      * 刻意**不**用 `getAllFor`：附件列里可能躺着几百 KB 的图片 base64，
      * 而数版本号只需要这一个字段。这个方法会在每次追加消息时被调用。
      */
-    @Query("SELECT parentId FROM messages WHERE conversationId = :conversationId")
-    suspend fun parentIds(conversationId: String): List<String>
+    @Query("SELECT id FROM messages WHERE conversationId = :conversationId AND parentId = :parentId ORDER BY variantIndex")
+    suspend fun siblingIds(conversationId: String, parentId: String): List<String>
 
     @Query("SELECT * FROM messages WHERE id = :id")
     suspend fun findById(id: String): MessageEntity?
@@ -226,8 +260,8 @@ interface MessageDao {
         SELECT id, conversationId, parentId, variantIndex, active, role,
                '' AS content, NULL AS attachments, NULL AS reasoning,
                status, NULL AS errorMessage,
-               model, excluded, thinkingMs, ttftMs, tps, tokens_in, tokens_out,
-               NULL AS timeline, stopReason, createdAt
+               model, excluded, thinkingMs, ttftMs, tps, tokens_in, tokens_out, tokens_cache_hit,
+               NULL AS timeline, stopReason, imageGeneration, imageRequest, createdAt
         FROM messages WHERE id = :id
         """,
     )
@@ -271,6 +305,13 @@ interface MessageDao {
     )
     suspend fun getLightFor(conversationId: String): List<MessageLight>
 
+    /*
+     * 跨对话记忆的检索查询（`memoryMessages` / `memorySessions`）已随功能一起移除。
+     * 保留会是一段永远不执行的 SQL，而它的 CTE 还绑着 `memoryEnabled` 这一列 ——
+     * 读代码的人会以为这个功能还在。
+     */
+
+
     /** 按 id 批量取整条消息（活跃路径上的那些）。 */
     @Query("SELECT * FROM messages WHERE id IN (:ids)")
     suspend fun getByIds(ids: List<String>): List<MessageEntity>
@@ -287,8 +328,8 @@ interface MessageDao {
         SELECT id, conversationId, parentId, variantIndex, active, role, content,
                substr(attachments, 1, :cap) AS attachments,
                reasoning, status, errorMessage, model, excluded,
-               thinkingMs, ttftMs, tps, tokens_in, tokens_out,
-               timeline, stopReason, createdAt
+               thinkingMs, ttftMs, tps, tokens_in, tokens_out, tokens_cache_hit,
+               timeline, stopReason, imageGeneration, imageRequest, createdAt
         FROM messages WHERE id IN (:ids)
         """,
     )
@@ -332,14 +373,17 @@ interface MessageDao {
     @Query(
         """
         UPDATE messages
-        SET status = :status, errorMessage = :error,
+        SET content = :content, reasoning = :reasoning, status = :status, errorMessage = :error,
             ttftMs = :ttftMs, tps = :tps, thinkingMs = :thinkingMs,
-            timeline = :timeline, stopReason = :stopReason
+            timeline = :timeline, stopReason = :stopReason,
+            tokens_in = :tokensIn, tokens_out = :tokensOut, tokens_cache_hit = :cacheHitTokens
         WHERE id = :id
         """,
     )
     suspend fun finish(
         id: String,
+        content: String,
+        reasoning: String?,
         status: String,
         error: String?,
         ttftMs: Long?,
@@ -347,7 +391,40 @@ interface MessageDao {
         thinkingMs: Long?,
         timeline: String?,
         stopReason: String?,
+        tokensIn: Int?,
+        tokensOut: Int?,
+        cacheHitTokens: Int?,
     )
+
+    /**
+     * 全库累计用量（设置 → 用量与余额）。
+     *
+     * 只统计服务端回报过用量的回复：老数据 tokens_in 为 null，算进来会让"总消耗"
+     * 被大量 0 稀释。每轮请求的 prompt 都含前面全部上下文，所以直接求和就是
+     * 真实计费口径，不需要去重。
+     */
+    @Query(
+        """
+        SELECT COUNT(*) AS replies,
+               COALESCE(SUM(tokens_in), 0) AS promptTokens,
+               COALESCE(SUM(tokens_out), 0) AS completionTokens,
+               COALESCE(SUM(tokens_cache_hit), 0) AS cacheHitTokens
+        FROM messages
+        WHERE role = 'assistant' AND tokens_in IS NOT NULL
+        """,
+    )
+    suspend fun usageTotals(): UsageTotals
+
+    @Query(
+        """
+        SELECT date(createdAt / 1000, 'unixepoch', 'localtime') AS day,
+               SUM(tokens_in + COALESCE(tokens_out, 0)) AS tokens
+        FROM messages
+        WHERE role = 'assistant' AND tokens_in IS NOT NULL AND createdAt >= :since
+        GROUP BY day
+        """,
+    )
+    suspend fun dailyUsage(since: Long): List<DailyUsage>
 
     /**
      * 「保存」编辑后的消息：**原地**换掉正文（可连同附件与内容块）。
@@ -565,14 +642,18 @@ interface AttachmentRefDao {
     @Query("DELETE FROM attachment_refs WHERE conversationId IN (:ids)")
     suspend fun clearAll(ids: List<String>)
 
-    /**
-     * 删掉单条消息时按**路径**清登记 —— 会话还在，不能按会话清。
-     *
-     * 不清的话，`containsPath` 会永远返回 true，那些图片文件就再也回收不掉。
-     */
-    @Query("DELETE FROM attachment_refs WHERE path IN (:paths)")
-    suspend fun clearPaths(paths: List<String>)
-
     @Query("DELETE FROM attachment_refs")
     suspend fun clearEverything()
 }
+
+/** 全库累计用量投影（见 [MessageDao.usageTotals]）。 */
+data class UsageTotals(
+    /** 有服务端用量回报的回复条数。 */
+    val replies: Int,
+    val promptTokens: Int,
+    val completionTokens: Int,
+    val cacheHitTokens: Int,
+)
+
+/** Local date and reported input plus output tokens. */
+data class DailyUsage(val day: String, val tokens: Long)

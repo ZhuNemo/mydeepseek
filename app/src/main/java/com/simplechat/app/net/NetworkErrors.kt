@@ -49,6 +49,10 @@ internal fun networkFailureRes(error: Throwable): Int = when (error) {
 /** 常见的 HTTP 状态码给一句人话；没覆盖到返回 null（交给服务端文案 / 兜底句）。 */
 @StringRes
 internal fun httpStatusRes(code: Int): Int? = when (code) {
+    400, 422 -> R.string.error_http_bad_request
+    408 -> R.string.error_network_timeout
+    415 -> R.string.service_file_format
+    410 -> R.string.service_file_expired
     401 -> R.string.error_http_unauthorized
     402 -> R.string.error_http_payment_required
     403 -> R.string.error_http_forbidden
@@ -81,15 +85,68 @@ internal fun providerHintRes(serverMessage: String?): Int? {
     val text = serverMessage?.trim()?.lowercase()
     if (text.isNullOrEmpty()) return null
     return when {
+        text.containsAny(CONTENT_RISK_KEYWORDS) -> R.string.error_provider_content_risk
+        "deepseek-v4-pro" in text && "unavailable" in text &&
+            text.containsAny(listOf("deepseek_web_search", "deepseek_read_url", "title generation")) -> R.string.error_deepseek_flash_feature
+        text.contains("file") && text.containsAny(listOf("not found", "expired", "does not exist")) -> R.string.service_file_expired
+        text.containsAny(listOf("unsupported file", "password-protected", "failed to parse", "file format")) -> R.string.service_file_format
+        text.contains("purpose") -> R.string.error_http_bad_request
+        text.containsAny(INVALID_API_KEY_KEYWORDS) -> R.string.error_http_unauthorized
         text.containsAny(AUTH_KEYWORDS) -> R.string.error_provider_auth
         text.containsAny(NO_CHANNEL_KEYWORDS) -> R.string.error_provider_no_channel
         text.containsAny(MODEL_MISSING_KEYWORDS) -> R.string.error_provider_model_not_found
         text.looksLikeQuotaProblem() -> R.string.error_provider_quota
         text.containsAny(RATE_LIMIT_KEYWORDS) -> R.string.error_provider_rate_limit
+        text.containsAny(PAYLOAD_KEYWORDS) -> R.string.error_http_too_large
         text.containsAny(CONTEXT_KEYWORDS) -> R.string.error_provider_context_length
+        isEmptyMessagesRejection(text) -> R.string.error_provider_empty_messages
+        text.contains("invalid_request_error") -> R.string.error_http_bad_request
         else -> null
     }
 }
+
+/** Retry only request-content/tool incompatibilities, never credentials, configuration, or transport errors. */
+internal fun canRetryWithoutAttachmentsAndTools(code: Int?, serverMessage: String?): Boolean {
+    val status = code ?: return false
+    if (status !in 400..499 || status == 401 || status == 403 || status == 408 || status == 429) return false
+    val text = serverMessage?.lowercase().orEmpty()
+    if (text.isBlank()) return false
+    if (text.containsAny(AUTH_KEYWORDS + INVALID_API_KEY_KEYWORDS + QUOTA_KEYWORDS + CONTEXT_KEYWORDS + MODEL_MISSING_KEYWORDS)) {
+        return false
+    }
+    return text.containsAny(OPTIONAL_FEATURE_ERROR_KEYWORDS) ||
+        (status == 413 && text.containsAny(PAYLOAD_KEYWORDS))
+}
+
+private val CONTENT_RISK_KEYWORDS = listOf(
+    "content exists risk",
+    "content risk detected",
+    "content moderation rejected",
+)
+
+private val OPTIONAL_FEATURE_ERROR_KEYWORDS = listOf(
+    "content exists risk",
+    "content risk detected",
+    "content moderation rejected",
+    "deepseek_web_search",
+    "deepseek_read_url",
+    "server-side tool calls",
+    "tool calls are unavailable",
+    "tool is not supported",
+    "unsupported tool",
+    "file_id",
+    "files api",
+    "unsupported image",
+    "images are not supported",
+    "file format",
+    "unsupported file",
+    "payload too large",
+    "request body too large",
+    "request_too_large",
+)
+
+internal fun isEmptyMessagesRejection(message: String?): Boolean =
+    message?.lowercase()?.contains("messages: at least one message is required") == true
 
 private fun String.containsAny(keywords: List<String>): Boolean = keywords.any { contains(it) }
 
@@ -97,6 +154,18 @@ private fun String.containsAny(keywords: List<String>): Boolean = keywords.any {
 private fun String.looksLikeQuotaProblem(): Boolean =
     containsAny(QUOTA_KEYWORDS) ||
         (contains("balance") && containsAny(BALANCE_SHORTFALL_KEYWORDS))
+
+private val INVALID_API_KEY_KEYWORDS = listOf(
+    "invalid api key",
+    "invalid_api_key",
+    "invalid api-key",
+    "incorrect api key",
+    "api key is invalid",
+    "api key is not valid",
+    "api_key_invalid",
+    "invalid key",
+    "key is invalid",
+)
 
 private val AUTH_KEYWORDS = listOf(
     "authentication fails", // OpenCode Zen：`Authentication Fails (governor)`
@@ -160,6 +229,24 @@ private val CONTEXT_KEYWORDS = listOf(
     "maximum context",
     "context window",
     "too many tokens",
+    "prompt is too long",
+    "prompt too long",
+    "input is too long",
+    "input too long",
+    "input token limit",
+    "max model len",
+    "上下文长度",
+    "上下文超",
+    "输入过长",
+)
+
+private val PAYLOAD_KEYWORDS = listOf(
+    "request body too large",
+    "request entity too large",
+    "payload too large",
+    "request_too_large",
+    "request too large",
+    "request size exceeds",
 )
 
 /**
@@ -174,17 +261,26 @@ private val CONTEXT_KEYWORDS = listOf(
  *
  * **认不出任何模式时保持原行为**：状态码提示 → 服务端原文 → 带状态码的兜底句。
  */
-internal fun httpErrorText(code: Int, serverMessage: String?): String {
+internal fun httpErrorText(code: Int, serverMessage: String?, largeRequest: Boolean = false): String {
     val raw = serverMessage?.trim()?.takeIf { it.isNotEmpty() }
     val providerRes = providerHintRes(raw)
+    if (code == 401 || providerRes == R.string.error_http_unauthorized) {
+        return Res.get(R.string.error_http_unauthorized)
+    }
     if (providerRes == null) {
         // 没认出上游原因 → 一字不改地走老逻辑，避免影响现有表现
-        return httpStatusRes(code)?.let { Res.get(it) }
+        if (code in listOf(400, 422) && raw != null) {
+            return Res.get(R.string.error_parameter_detail, code, abbreviateProviderMessage(raw)) + " " + Res.get(R.string.error_http_bad_request)
+        }
+        val hint = httpStatusRes(code)?.let { Res.get(it) }
             ?: raw
             ?: Res.get(R.string.error_http_status, code)
+        return if (largeRequest && code in 500..599) {
+            Res.get(R.string.error_large_request_interrupted, hint)
+        } else hint
     }
 
-    val statusHint = httpStatusRes(code)?.let { Res.get(it) }
+    val statusHint = httpStatusRes(code)?.takeUnless { it == R.string.error_http_bad_request }?.let { Res.get(it) }
     val providerHint = Res.get(providerRes)
     // 原文与提示文字完全一样就不再重复（“与提示不同”才附）
     val rawDetail = raw
@@ -242,6 +338,7 @@ internal fun serverErrorText(serverMessage: String?): String {
     val raw = serverMessage?.trim()?.takeIf { it.isNotEmpty() }
         ?: return Res.get(R.string.error_network)
     val hintRes = providerHintRes(raw) ?: return raw
+    if (hintRes == R.string.error_http_unauthorized) return Res.get(hintRes)
     return composeProviderErrorText(
         statusHint = null,
         providerHint = Res.get(hintRes),
@@ -286,4 +383,13 @@ private val RAW_NETWORK_ERROR_HINTS = listOf(
 )
 
 /** 网络异常落成文字（供流式客户端在 `catch (IOException)` 里用）。 */
-internal fun Throwable.networkText(): String = Res.get(networkFailureRes(this))
+internal fun Throwable.networkText(largeRequestBeforeResponse: Boolean = false, receivedHeaders: Boolean = false): String {
+    val hint = Res.get(networkFailureRes(this))
+    return if (needsLargeRequestHint(this, largeRequestBeforeResponse)) {
+        Res.get(if (receivedHeaders) R.string.error_large_stream_before_reply else R.string.error_large_send_before_reply)
+    } else hint
+}
+
+internal fun needsLargeRequestHint(error: Throwable, largeRequestBeforeResponse: Boolean): Boolean =
+    largeRequestBeforeResponse && error is IOException &&
+        error !is UnknownHostException && error !is SSLException && error !is java.net.ConnectException

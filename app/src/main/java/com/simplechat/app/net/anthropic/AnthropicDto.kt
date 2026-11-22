@@ -1,5 +1,7 @@
 package com.simplechat.app.net.anthropic
 
+import kotlinx.serialization.EncodeDefault
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
@@ -17,7 +19,6 @@ import kotlinx.serialization.json.JsonElement
  *
  * | 字段 | DeepSeek 官方 | 原版 Anthropic / 兼容网关 |
  * |---|---|---|
- * | `safety_check` | 扩展模式开关（`high`） | 未知字段 → 400 |
  * | `title` | 服务端标题 | 未知字段 → 400 |
  * | `tools`（`deepseek_*`） | 搜索 / 读链接 | 未知工具类型 → 400 |
  * | `latest_reminder` 角色 | 时间地点提醒 | 未知角色 → 400 |
@@ -42,8 +43,8 @@ data class AnthropicRequest(
      * - 原版：开启时发 `enabled + budget_tokens`，关闭时**整个字段省略**（null）。
      */
     val thinking: AnthropicThinking? = null,
-    /** 扩展模式的安全档位；原版没有这个字段。 */
-    @SerialName("safety_check") val safetyCheck: AnthropicSafetyCheck? = null,
+    @OptIn(ExperimentalSerializationApi::class)
+    @EncodeDefault(EncodeDefault.Mode.NEVER)
     val tools: List<AnthropicTool> = emptyList(),
     /** 只在"这个会话还没有标题"时传；仅扩展模式。 */
     val title: AnthropicTitle? = null,
@@ -58,7 +59,11 @@ data class AnthropicRequest(
     val temperature: Double? = null,
     @SerialName("top_p") val topP: Double? = null,
     val stream: Boolean = true,
+    @SerialName("output_config") val outputConfig: AnthropicOutputConfig? = null,
 )
+
+@Serializable
+data class AnthropicOutputConfig(val effort: String)
 
 /** 原版 Anthropic 协议要求的默认值。 */
 object AnthropicRequestDefaults {
@@ -100,6 +105,7 @@ data class AnthropicThinking(
      * DeepSeek 官方扩展不认这个字段（官方 demo 也不传），所以扩展模式置空。
      */
     @SerialName("budget_tokens") val budgetTokens: Int? = null,
+    val display: String? = null,
 ) {
     companion object {
         val Enabled = AnthropicThinking("enabled")
@@ -110,12 +116,13 @@ data class AnthropicThinking(
     }
 }
 
-/** 安全审核档位。`high` 即扩展模式 —— 不传这个就拿不到搜索工具。 */
 @Serializable
-data class AnthropicSafetyCheck(val level: String = "high")
-
-@Serializable
-data class AnthropicTool(val type: String, val name: String) {
+data class AnthropicTool(
+    val type: String? = null,
+    val name: String,
+    val description: String? = null,
+    @SerialName("input_schema") val inputSchema: JsonElement? = null,
+) {
     companion object {
         /** 联网搜索（含边想边搜与图搜）。 */
         val WebSearch = AnthropicTool("deepseek_web_search", "deepseek_web_search")

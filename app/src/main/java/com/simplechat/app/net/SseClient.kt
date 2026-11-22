@@ -2,7 +2,6 @@ package com.simplechat.app.net
 
 import java.io.IOException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -11,11 +10,8 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.isActive
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.encodeToStream
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 
 /**
  * OpenAI 兼容的 SSE 流式客户端。
@@ -48,8 +44,37 @@ class SseClient(
         apiKey: String,
         request: ChatRequestDto,
         extraHeaders: Map<String, String> = emptyMap(),
+        contextWindow: Int? = null,
+        retryBeforeContent: Boolean = true,
+        maxOutputTokens: Int? = null,
+    ): Flow<StreamEvent> = streamRequest(url, apiKey, extraHeaders, retryBeforeContent) {
+        validateRequestBudget(estimatedInputTokens(request), request.maxTokens ?: request.maxCompletionTokens, contextWindow, maxOutputTokens)
+        StreamingJsonRequestBody(json, request)
+    }
+
+    internal fun streamResponses(
+        url: String,
+        apiKey: String,
+        request: ResponsesRequestDto,
+        messages: List<OutMessageDto>,
+        model: ModelInfo,
+        extraHeaders: Map<String, String>,
+        retryBeforeContent: Boolean,
+    ): Flow<StreamEvent> = streamRequest(url, apiKey, extraHeaders, retryBeforeContent, responses = true) {
+        validateRequestBudget(estimatedInputTokens(messages), request.maxOutputTokens, model.contextWindow, model.maxOutputTokens)
+        StreamingRequestBody(json, ResponsesRequestDto.serializer(), request)
+    }
+
+    private fun streamRequest(
+        url: String,
+        apiKey: String,
+        extraHeaders: Map<String, String>,
+        retryBeforeContent: Boolean,
+        responses: Boolean = false,
+        prepareBody: () -> StreamingRequestBody<*>,
     ): Flow<StreamEvent> = flow {
-        val body = StreamingJsonRequestBody(json, request)
+        val body = prepareBody()
+        val largeRequest = body.contentLength() >= LargeRequestBytes
 
         val builder = Request.Builder()
             .url(url)
@@ -68,36 +93,48 @@ class SseClient(
             attempt++
             val call = client.newCall(httpRequest)
             val handle = call.cancelWithCoroutine()
+            var receivedHeaders = false
             try {
                 call.execute().use { response ->
-                    val source = response.body?.source()
-                    if (!response.isSuccessful || source == null) {
+                    receivedHeaders = true
+                    if (!response.isSuccessful) {
                         val raw = runCatching { response.body.readErrorText() }.getOrNull()
                         // 已知状态码 → 一句人话；否则用服务端自己给的文案；再否则带状态码兜底
                         val serverMessage = parser.parseErrorMessage(raw)
                         android.util.Log.w(ChatStreamLogTag, "HTTP ${response.code}")
                         emit(
                             StreamEvent.Error(
-                                message = httpErrorText(response.code, serverMessage),
+                                message = httpErrorText(response.code, serverMessage, largeRequest),
                                 code = response.code,
                                 retryable = response.code == 429 || response.code >= 500,
+                                rawMessage = serverMessage,
                             ),
                         )
                         return@use
                     }
 
+                    val source = response.body.source()
+                    val responsesParser = if (responses) ResponsesSseLineParser(json) else null
                     var finished = false
+                    var receivedStop = false
                     while (!finished) {
                         currentCoroutineContext().ensureActive()
 
                         val line = source.readUtf8Line()
                         if (line == null) {
+                            if (!receivedStop) throw java.io.EOFException("Stream ended before completion")
                             finished = true
                         } else {
-                            when (val result = parser.parse(line)) {
+                            when (val result = responsesParser?.parse(line) ?: parser.parse(line)) {
                                 is SseLineParser.Result.Events -> result.events.forEach {
                                     emit(it)
                                     emittedAny = true
+                                    if (it is StreamEvent.Error || (responses && it is StreamEvent.Stopped)) {
+                                        receivedStop = true
+                                        finished = true
+                                    } else if (it is StreamEvent.Stopped) {
+                                        receivedStop = true
+                                    }
                                 }
 
                                 SseLineParser.Result.Done -> finished = true
@@ -113,7 +150,7 @@ class SseClient(
             } catch (e: IOException) {
                 // 用户主动取消造成的 IOException 不应报告为错误
                 if (!currentCoroutineContext().isActive) return@flow
-                if (!emittedAny && attempt < StreamMaxAttempts) {
+                if (retryBeforeContent && !emittedAny && attempt < StreamMaxAttempts && body.canReplayOnDisconnect()) {
                     // 一个字都还没发出去 → 重发是安全的（不会出现两份内容）
                     android.util.Log.w(ChatStreamLogTag, "stream reset before any event; retrying", e)
                     delay(StreamRetryDelayMs)
@@ -121,7 +158,7 @@ class SseClient(
                 }
                 // 原始异常进日志（排查要用），界面拿到的是"连接被中断、请重试"这类人话
                 android.util.Log.w(ChatStreamLogTag, "stream interrupted", e)
-                emit(StreamEvent.Error(e.networkText(), retryable = true))
+                emit(StreamEvent.Error(e.networkText(largeRequest && !emittedAny, receivedHeaders), retryable = true))
                 return@flow
             } finally {
                 handle.cancel()
@@ -129,9 +166,6 @@ class SseClient(
         }
     }.flowOn(Dispatchers.IO)
 
-    private companion object {
-        val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
-    }
 }
 
 /** 流式客户端的日志 tag：原始异常与服务端报文都记在这里，界面上只给人话。 */
@@ -144,14 +178,7 @@ internal const val StreamMaxAttempts = 2
 internal const val StreamRetryDelayMs = 600L
 
 /** Serializes directly to Okio instead of duplicating the full request in a UTF-16 String. */
-@OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
 internal class StreamingJsonRequestBody(
-    private val json: Json,
-    private val request: ChatRequestDto,
-) : okhttp3.RequestBody() {
-    override fun contentType() = "application/json; charset=utf-8".toMediaType()
-    override fun isOneShot() = true
-    override fun writeTo(sink: okio.BufferedSink) {
-        json.encodeToStream(ChatRequestDto.serializer(), request, sink.outputStream())
-    }
-}
+    json: Json,
+    request: ChatRequestDto,
+) : StreamingRequestBody<ChatRequestDto>(json, ChatRequestDto.serializer(), request)

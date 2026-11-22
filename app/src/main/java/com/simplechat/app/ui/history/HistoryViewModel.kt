@@ -1,5 +1,7 @@
 package com.simplechat.app.ui.history
 
+import androidx.annotation.MainThread
+import androidx.annotation.StringRes
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -12,17 +14,21 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import com.simplechat.app.R
 import com.simplechat.app.data.ChatRepository
 import com.simplechat.app.data.Res
+import com.simplechat.app.data.SettingsStore
 import com.simplechat.app.data.userMessage
 import com.simplechat.app.db.ConversationEntity
 import com.simplechat.app.db.ConversationSearchHit
-import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -32,10 +38,17 @@ import kotlinx.coroutines.launch
  * 列表数据直接来自 Room 的 `Flow`，因此重命名 / 置顶 / 删除会自动反映到 UI，
  * 不需要手动刷新。
  */
-data class SearchPage(val hits: List<ConversationSearchHit> = emptyList(), val hasMore: Boolean = false)
+data class SearchPage(
+    val query: String = "",
+    val hits: List<ConversationSearchHit> = emptyList(),
+    val hasMore: Boolean = false,
+    val isLoading: Boolean = false,
+)
 
-@OptIn(ExperimentalCoroutinesApi::class)
-class HistoryViewModel(private val repository: ChatRepository) : ViewModel() {
+class HistoryViewModel(
+    private val repository: ChatRepository,
+    private val settingsStore: SettingsStore? = null,
+) : ViewModel() {
 
     /**
      * 操作失败的提示通道。
@@ -49,15 +62,12 @@ class HistoryViewModel(private val repository: ChatRepository) : ViewModel() {
 
     fun consumeError() { _error.value = null }
 
-    private val queryFlow = MutableStateFlow("")
-    private val searchLimit = MutableStateFlow(100)
-    private var previousSearchQuery = ""
-    fun loadMoreSearchResults() { searchLimit.value += 100 }
+    private var searchLimit = SearchPageSize
+    private var searchJob: Job? = null
+    private var searchOptions: Pair<Boolean, Boolean>? = null
 
-
-    /** 搜索关键词。空串即全量列表。 */
-    var query by mutableStateOf("")
-        private set
+    /** 搜索框内容与结果一起发布，避免用新关键词渲染旧结果。 */
+    val query: String get() = searchPage.value.query
 
     /**
      * 抽屉列表：**全量**，不受搜索框影响。
@@ -72,23 +82,53 @@ class HistoryViewModel(private val repository: ChatRepository) : ViewModel() {
      *
      * 关键词为空时直接给空列表、不查库 —— 搜索页在空关键词下本来就只显示一句提示。
      */
-    val searchPage: StateFlow<SearchPage> = combine(queryFlow, searchLimit) { keyword, limit -> keyword to limit }
-        .flatMapLatest { (keyword, limit) ->
-            val changed = previousSearchQuery != keyword
-            previousSearchQuery = keyword
-            if (keyword.isBlank()) {
-                flowOf(SearchPage())
-            } else {
-                kotlinx.coroutines.flow.flow {
-                    if (changed) emit(SearchPage())
-                    kotlinx.coroutines.delay(180)
-                    repository.searchConversations(keyword, limit + 1).collect { hits ->
-                        emit(SearchPage(hits.take(limit), hits.size > limit))
-                    }
+    private val _searchPage = MutableStateFlow(SearchPage())
+    val searchPage: StateFlow<SearchPage> = _searchPage.asStateFlow()
+
+    init {
+        viewModelScope.launch {
+            (settingsStore?.flow?.map { it.searchInactiveBranches to it.searchReasoning } ?: flowOf(false to false))
+                .distinctUntilChanged()
+                .collect { options ->
+                    searchOptions = options
+                    if (query.isNotBlank()) startSearch(query)
                 }
+        }
+    }
+
+    @MainThread
+    fun loadMoreSearchResults() {
+        val page = _searchPage.value
+        if (page.isLoading || !page.hasMore) return
+        searchLimit += SearchPageSize
+        startSearch(page.query, keepHits = true)
+    }
+
+    private fun startSearch(value: String, keepHits: Boolean = false) {
+        searchJob?.cancel()
+        searchJob = null
+        val keyword = value.trim()
+        _searchPage.value = when {
+            keyword.isEmpty() -> SearchPage(query = value)
+            keepHits -> _searchPage.value.copy(isLoading = true)
+            else -> SearchPage(query = value, isLoading = true)
+        }
+        if (keyword.isEmpty()) return
+        val (includeInactive, includeReasoning) = searchOptions ?: return
+        val limit = searchLimit
+        searchJob = viewModelScope.launch {
+            if (!keepHits) delay(SearchDebounceMs)
+            repository.searchConversations(keyword, limit + 1, includeInactive, includeReasoning).collect { hits ->
+                // A cancelled query may still finish its database read.
+                currentCoroutineContext().ensureActive()
+                _searchPage.value = SearchPage(
+                    query = value,
+                    hits = hits.take(limit),
+                    hasMore = hits.size > limit,
+                )
             }
         }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), SearchPage())
+    }
 
     /** 多选模式。 */
     var selectionMode by mutableStateOf(false)
@@ -96,10 +136,11 @@ class HistoryViewModel(private val repository: ChatRepository) : ViewModel() {
 
     val selectedIds = mutableStateListOf<String>()
 
+    @MainThread
     fun updateQuery(value: String) {
-        query = value
-        searchLimit.value = 100
-        queryFlow.value = value
+        if (value == query) return
+        searchLimit = SearchPageSize
+        startSearch(value)
     }
 
     // ── 多选 ──────────────────────────────────────────────
@@ -181,8 +222,35 @@ class HistoryViewModel(private val repository: ChatRepository) : ViewModel() {
     }
 
     companion object {
-        fun factory(repository: ChatRepository): ViewModelProvider.Factory = viewModelFactory {
-            initializer { HistoryViewModel(repository) }
+        private const val SearchPageSize = 100
+        private const val SearchDebounceMs = 180L
+
+        fun factory(repository: ChatRepository, settingsStore: SettingsStore): ViewModelProvider.Factory = viewModelFactory {
+            initializer { HistoryViewModel(repository, settingsStore) }
         }
+    }
+}
+
+/** 列表分组：置顶 / 今天 / 昨天 / 7 天内 / 更早。文案随界面语言取（`group_*`）。 */
+enum class HistoryGroup(@StringRes private val labelRes: Int) {
+    PINNED(R.string.group_pinned),
+    TODAY(R.string.group_today),
+    YESTERDAY(R.string.group_yesterday),
+    LAST_7_DAYS(R.string.group_week),
+    EARLIER(R.string.group_older),
+    ;
+
+    val label: String get() = Res.get(labelRes)
+}
+
+fun groupOf(conversation: ConversationEntity, now: Long): HistoryGroup {
+    if (conversation.pinned) return HistoryGroup.PINNED
+    val day = 24 * 60 * 60 * 1000L
+    val delta = now - conversation.updatedAt
+    return when {
+        delta < day -> HistoryGroup.TODAY
+        delta < 2 * day -> HistoryGroup.YESTERDAY
+        delta < 7 * day -> HistoryGroup.LAST_7_DAYS
+        else -> HistoryGroup.EARLIER
     }
 }

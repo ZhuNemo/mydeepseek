@@ -2,7 +2,8 @@ name: Android Build
 
 on:
   push:
-    branches: [ main ]
+    # 临时：合并分支也要跑构建，确认无误后再并回 main 并删掉这一项
+    branches: [ main, upstream-1.2.4 ]
     tags: [ 'v*' ]
   pull_request:
     branches: [ main ]

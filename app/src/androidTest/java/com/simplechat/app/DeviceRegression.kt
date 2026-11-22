@@ -31,6 +31,19 @@ class DeviceRegression : Instrumentation() {
     private var searchTests = false
     private var hotfixTests = false
     private var navigationTests = false
+    private var selectionTests = false
+    private var shareTests = false
+    private var nativeShareTests = false
+    private var releaseUiTests = false
+    private var compactionTests = false
+    private var deepSeekLive = false
+    private var serviceTests = false
+    private var mathTests = false
+    private var composerTests = false
+    private var codeFoldTests = false
+    private var historyScrollTests = false
+    private var streamConcurrencyTests = false
+    private var memoryTests = false
     override fun onCreate(arguments: Bundle?) {
         realArchive = arguments?.getString("source")
         uiOnly = arguments?.getString("ui") == "true"
@@ -38,6 +51,19 @@ class DeviceRegression : Instrumentation() {
         searchTests = arguments?.getString("search") == "true"
         hotfixTests = arguments?.getString("hotfix") == "true"
         navigationTests = arguments?.getString("navigation") == "true"
+        selectionTests = arguments?.getString("selection") == "true"
+        shareTests = arguments?.getString("share") == "true"
+        nativeShareTests = arguments?.getString("nativeShare") == "true"
+        releaseUiTests = arguments?.getString("releaseUi") == "true"
+        compactionTests = arguments?.getString("compaction") == "true"
+        deepSeekLive = arguments?.getString("deepSeekLive") == "true"
+        serviceTests = arguments?.getString("services") == "true"
+        mathTests = arguments?.getString("math") == "true"
+        composerTests = arguments?.getString("composer") == "true"
+        codeFoldTests = arguments?.getString("codeFold") == "true"
+        historyScrollTests = arguments?.getString("historyScroll") == "true"
+        streamConcurrencyTests = arguments?.getString("streamConcurrency") == "true"
+        memoryTests = arguments?.getString("crossChatMemory") == "true"
         super.onCreate(arguments)
         start()
     }
@@ -46,7 +72,24 @@ class DeviceRegression : Instrumentation() {
         try {
             runBlocking {
                 val source = realArchive
-                if (navigationTests) {
+                if (memoryTests) CrossChatMemoryRegression.run(this@DeviceRegression, ::passed)
+                else if (streamConcurrencyTests) StreamConcurrencyRegression.run(this@DeviceRegression, ::passed)
+                else if (historyScrollTests) HistoryScrollRegression.run(this@DeviceRegression, ::passed)
+                else if (composerTests) ComposerRegression.run(this@DeviceRegression, ::passed)
+                else if (codeFoldTests) CodeFoldRegression.run(this@DeviceRegression, ::passed)
+                else if (mathTests) MathLayoutRegression.run(this@DeviceRegression, ::passed)
+                else if (serviceTests) {
+                    ServiceApiRegression.run(targetContext, ::passed)
+                    ServiceConfigUiRegression.run(this@DeviceRegression, ::passed)
+                    BackupCompatibilityRegression.run(targetContext, ::passed)
+                }
+                else if (deepSeekLive) DeepSeekLiveRegression.run(targetContext, ::passed)
+                else if (compactionTests) CompactionRegression.run(this@DeviceRegression, ::passed)
+                else if (releaseUiTests) ReleaseUiRegression.run(this@DeviceRegression, ::passed)
+                else if (nativeShareTests) NativeShareRenderRegression.run(this@DeviceRegression, ::passed)
+                else if (shareTests) MessageShareRegression.run(this@DeviceRegression, ::passed)
+                else if (selectionTests) TextSelectionRegression.run(this@DeviceRegression, ::passed)
+                else if (navigationTests) {
                     SearchNavigationRegression.run(this@DeviceRegression, ::passed, com.simplechat.app.ui.theme.ThemeMode.LIGHT)
                     SearchNavigationRegression.run(this@DeviceRegression, ::passed, com.simplechat.app.ui.theme.ThemeMode.DARK)
                 }
@@ -128,9 +171,16 @@ class DeviceRegression : Instrumentation() {
             check(repeated.alreadyPresent == 6 && repeated.conversations == 0)
             passed("repeat incremental import is idempotent")
 
-            val hits = repository.searchConversations("FIND_DEVICE_KEYWORD").first()
+            val hits = repository.searchConversations("FIND_DEVICE_KEYWORD", includeInactiveBranches = true).first()
             val hit = hits.single()
             check(hit.messageId == "deepseek-branches-2")
+            check(repository.searchConversations(
+                "FIND_DEVICE_KEYWORD",
+            ).first().isEmpty())
+            check(repository.searchConversations(
+                "new branch",
+                includeInactiveBranches = false,
+            ).first().single().messageId == "deepseek-branches-3")
             repository.revealSearchMessage(hit.conversation.id, hit.messageId!!)
             check(repository.loadActivePath(hit.conversation.id).last().id == hit.messageId)
             check(repository.searchConversations("%").first().isEmpty())
@@ -205,6 +255,50 @@ class DeviceRegression : Instrumentation() {
             val sentAfterCompact = captured.last()["messages"]!!.jsonArray
             check(sentAfterCompact.any { it.jsonObject["content"]?.toString()?.contains("AFTER_COMPACT_DEVICE") == true })
             passed("context compaction followed by send retains the new user prompt in the real serialized request")
+            for (role in listOf(MessageRole.USER, MessageRole.ASSISTANT)) {
+                val branchId = repository.createConversation(ConversationMode.CREATIVE, "DEEPSEEK", "deepseek-flash", title = "Branch deletion")
+                val parent = if (role == MessageRole.USER) MessageEntity.ROOT_PARENT
+                    else repository.appendUserMessage(branchId, "parent").id
+                val branches = (1..4).map { number ->
+                    val branch = repository.addActiveVariant(branchId, parent, role, "branch-test $number")
+                    val childRole = if (role == MessageRole.USER) MessageRole.ASSISTANT else MessageRole.USER
+                    val child = repository.addActiveVariant(branchId, branch.id, childRole, "child $number")
+                    branch.id to child.id
+                }
+                suspend fun awaitBranch(index: Int, position: Int, count: Int) {
+                    withTimeout(4_000) {
+                        while (!withContext(Dispatchers.Main) {
+                            val active = vm.messages.firstOrNull { it.id == branches[index].first }
+                            active?.variantIndex == position && active.variantCount == count &&
+                                vm.messages.lastOrNull()?.id == branches[index].second
+                        }) delay(20)
+                    }
+                }
+                suspend fun switchTo(position: Int) = withContext(Dispatchers.Main) {
+                    vm.switchVariant(vm.messages.single { it.parentId == parent }, position)
+                }
+                withContext(Dispatchers.Main) { vm.openConversation(branchId) }
+                awaitBranch(3, 3, 4)
+                switchTo(2)
+                awaitBranch(2, 2, 4)
+                withContext(Dispatchers.Main) { vm.deleteMessage(vm.messages.single { it.parentId == parent }) }
+                awaitBranch(3, 2, 3)
+                switchTo(1)
+                awaitBranch(1, 1, 3)
+                switchTo(0)
+                awaitBranch(0, 0, 3)
+                withContext(Dispatchers.Main) { vm.deleteMessage(vm.messages.single { it.parentId == parent }) }
+                awaitBranch(3, 1, 2)
+                switchTo(0)
+                awaitBranch(1, 0, 2)
+                switchTo(1)
+                awaitBranch(3, 1, 2)
+                val hits = db.conversationDao().search("branch-test", includeInactiveBranches = true).first().filter { it.conversation.id == branchId }
+                check(hits.map { it.variantIndex }.sortedBy { it } == listOf(0, 1))
+                val newBranch = repository.addActiveVariant(branchId, parent, role, "new after deletion")
+                check(newBranch.variantIndex == 2 && newBranch.variantCount == 3)
+            }
+            passed("delete middle and first versions, switch both ways, and retain surviving subtrees and search positions")
             withContext(Dispatchers.Main) { vm.newConversation() }
             DataIntegrityRegression.run(ctx, context.assets, repository, db)
             passed("same-title imports, global ID collision rollback, preset links, shared fork images, huge edits and schema 8-to-9 migration")

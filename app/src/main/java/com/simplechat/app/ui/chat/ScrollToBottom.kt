@@ -23,9 +23,11 @@ import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.unit.dp
 import com.simplechat.app.ui.theme.LocalChatColors
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 
 /**
  * 聊天流的滚动助手。
@@ -58,6 +60,18 @@ suspend fun LazyListState.scrollToBottom() {
  * 不依赖任何一条的高度、也不需要减总高。
  */
 fun LazyListState.isAtBottom(): Boolean = !canScrollForward
+
+/** Keep a bottom-aligned conversation in place as the composer takes more space. */
+internal fun LazyListState.advanceBottomForObstruction(growthPx: Int) {
+    val info = layoutInfo
+    val last = info.visibleItemsInfo.lastOrNull() ?: return
+    val unusedSpace = (info.viewportEndOffset - info.afterContentPadding - last.offset - last.size)
+        .coerceAtLeast(0)
+    val advance = growthPx - unusedSpace
+    if (advance > 0) {
+        requestScrollToItem(firstVisibleItemIndex, firstVisibleItemScrollOffset + advance)
+    }
+}
 
 /**
  * 到列表底部还差多少像素。
@@ -144,9 +158,8 @@ private val ScrollBarMinThumb = 28.dp
  * Compose 没给 `LazyColumn` 自带滚动条，这里照原生观感做一个：细、圆头、半透明，
  * 只在滚动时可见。
  *
- * ⚠️ 位置与长度按**条目比例**估算 —— Compose 只暴露条目数，不暴露内容总高度。
- * 聊天流里条目高度差异极大（一条几行 vs 一条几十万字），所以它只是
- * "我大概在读哪一段"的提示，不是精确比例尺。
+ * 用视口两端在各自消息内的像素偏移估算位置和长度。消息高度按需测量，
+ * 但滚过一条消息时，两端的比例会连续过渡。
  *
  * ⚠️ **滚动状态一律在绘制期读，组合期一个都不碰。** `layoutInfo` /
  * `firstVisibleItemIndex` 滚一帧变一次，落在组合里就是**每帧重组**；再叠上
@@ -159,9 +172,9 @@ fun VerticalScrollBar(
     state: LazyListState,
     modifier: Modifier = Modifier,
 ) {
-    var scrolling by remember { mutableStateOf(false) }
+    var scrolling by remember(state) { mutableStateOf(false) }
     LaunchedEffect(state) {
-        snapshotFlow { state.isScrollInProgress }.collect { inProgress ->
+        snapshotFlow { state.isScrollInProgress }.collectLatest { inProgress ->
             if (inProgress) {
                 scrolling = true
             } else {
@@ -181,37 +194,70 @@ fun VerticalScrollBar(
         modifier = modifier
             .padding(horizontal = 3.dp)
             .width(ScrollBarWidth)
+            // Bound draw invalidations from scrolling/fading to this narrow display list.
+            .graphicsLayer()
             .drawWithCache {
-                val radius = size.width / 2
-                val minThumb = ScrollBarMinThumb.toPx()
+                val corner = CornerRadius(size.width / 2)
+                val track = size.height
+                val minThumb = ScrollBarMinThumb.toPx().coerceAtMost(track)
                 onDrawBehind {
                     /*
                      * 这里的快照读（`fade`、`state.layoutInfo`）都落在**绘制阶段**：
                      * 只让这一层重画，不触发重组与重新布局。
                      */
-                    if (fade <= 0.01f) return@onDrawBehind
+                    val alpha = fade
+                    if (alpha <= 0.01f || track <= 0f) return@onDrawBehind
+                    val canScrollBackward = state.canScrollBackward
+                    val canScrollForward = state.canScrollForward
+                    if (!canScrollBackward && !canScrollForward) return@onDrawBehind
                     val info = state.layoutInfo
                     val total = info.totalItemsCount
-                    if (total <= 0) return@onDrawBehind
+                    val visible = info.visibleItemsInfo
+                    if (total <= 0 || visible.isEmpty()) return@onDrawBehind
+                    val first = visible.first()
+                    val last = visible.last()
 
-                    val visibleCount = info.visibleItemsInfo.size.coerceAtLeast(1)
-                    val thumbFraction = (visibleCount.toFloat() / total).coerceIn(0.06f, 1f)
-                    // 顶部为原点：下标 0 在视觉**顶部**，进度正着算
-                    val startFraction = (state.firstVisibleItemIndex.toFloat() / total)
-                        .coerceIn(0f, 1f - thumbFraction)
+                    val start = if (canScrollBackward) scrollBarItemPosition(
+                        index = first.index,
+                        offset = first.offset,
+                        extent = first.size + if (first.index == total - 1) info.afterContentPadding else info.mainAxisItemSpacing,
+                        viewportEdge = info.viewportStartOffset,
+                        leadingPadding = if (first.index == 0) info.beforeContentPadding else 0,
+                    ) else 0f
+                    val end = if (canScrollForward) scrollBarItemPosition(
+                        index = last.index,
+                        offset = last.offset,
+                        extent = last.size + if (last.index == total - 1) info.afterContentPadding else info.mainAxisItemSpacing,
+                        viewportEdge = info.viewportEndOffset,
+                        leadingPadding = if (last.index == 0) info.beforeContentPadding else 0,
+                    ) else total.toFloat()
 
-                    val track = size.height
-                    val thumbHeight = (track * thumbFraction).coerceAtLeast(minThumb)
-                    val top = (track * startFraction).coerceIn(0f, track - thumbHeight)
+                    val visibleSpan = end - start
+                    val visibleFraction = (visibleSpan / total).coerceIn(0f, 1f)
+                    val thumbHeight = (track * visibleFraction).coerceIn(minThumb, track)
+                    val top = scrollBarThumbTop(start, visibleSpan, total, track - thumbHeight)
 
                     drawRoundRect(
                         color = thumbColor,
                         topLeft = Offset(0f, top),
                         size = Size(size.width, thumbHeight),
-                        cornerRadius = CornerRadius(radius),
-                        alpha = 0.38f * fade,
+                        cornerRadius = corner,
+                        alpha = 0.38f * alpha,
                     )
                 }
             },
     )
+}
+
+/** Scale item-space progress to the travel left after reserving the (possibly minimum-size) thumb. */
+internal fun scrollBarThumbTop(start: Float, visibleSpan: Float, total: Int, travel: Float): Float {
+    val scrollableItems = total - visibleSpan
+    return if (scrollableItems > 0f) travel * (start / scrollableItems).coerceIn(0f, 1f) else 0f
+}
+
+/** Map a viewport edge into item units, including the item's share of spacing and padding. */
+internal fun scrollBarItemPosition(index: Int, offset: Int, extent: Int, viewportEdge: Int, leadingPadding: Int): Float {
+    val start = offset - leadingPadding
+    val length = (extent + leadingPadding).coerceAtLeast(1)
+    return index + ((viewportEdge - start).toFloat() / length).coerceIn(0f, 1f)
 }

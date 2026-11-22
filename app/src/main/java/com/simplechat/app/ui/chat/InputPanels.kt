@@ -47,6 +47,8 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import com.simplechat.app.R
@@ -59,6 +61,7 @@ import com.simplechat.app.ui.common.AppIcons
 import com.simplechat.app.ui.common.AppMenu
 import com.simplechat.app.ui.common.AppMenuItem
 import com.simplechat.app.ui.common.AppShadow
+import com.simplechat.app.data.Pricing
 import com.simplechat.app.ui.common.AppSlider
 import com.simplechat.app.ui.common.AppSwitch
 import com.simplechat.app.ui.common.CapsuleButton
@@ -174,9 +177,28 @@ fun ThinkingPanelContent(
     webSearchEnabled: Boolean = false,
     onToggleWebSearch: () -> Unit = {},
     modifier: Modifier = Modifier,
+    supportsExplicitThinkingOff: Boolean = false,
+    automaticWebSearch: Boolean = false,
+    onConfigureApi: (() -> Unit)? = null,
 ) {
     val colors = LocalChatColors.current
-    val levels = ReasoningLevel.sliderOrder
+    val minimumRequiredEffort = settings.model.minimumRequiredEffort()
+    val availableLevels = ReasoningLevel.forModel(settings.model)
+    val levels = if (minimumRequiredEffort != null) availableLevels.filter { it.enabled }.ifEmpty {
+        ReasoningLevel.entries.filter { it.apiValue == minimumRequiredEffort }.ifEmpty { availableLevels }
+    } else availableLevels
+    val selectedLevel = if (settings.reasoningLevel in levels) settings.reasoningLevel else {
+        val effort = settings.model.resolveReasoningEffort(settings.reasoningLevel.apiValue) ?: minimumRequiredEffort
+        levels.firstOrNull { it.apiValue == effort } ?: levels.first()
+    }
+    val selectedTick = levels.indexOf(selectedLevel)
+    val defaultLabel = stringResource(R.string.reasoning_default)
+    val labels = levels.map { level ->
+        val usesDefault = level == ReasoningLevel.OFF && !supportsExplicitThinkingOff && settings.model.effortLevels?.none {
+            it in com.simplechat.app.net.ReasoningWire.offLevels
+        } == true
+        if (usesDefault) defaultLabel else level.label
+    }
     val supportsThinking = settings.model.supportsThinking
 
     Column(modifier = modifier.fillMaxWidth()) {
@@ -193,7 +215,7 @@ fun ThinkingPanelContent(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable(onClick = onToggleWebSearch)
+                    .clickable(enabled = !automaticWebSearch, onClick = onToggleWebSearch)
                     .padding(vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -205,7 +227,8 @@ fun ThinkingPanelContent(
                 )
                 // 全应用同一个 AppSwitch —— 别在这里用 M3 的 Switch（52dp，比行标题还大）
                 AppSwitch(
-                    checked = webSearchEnabled,
+                    checked = automaticWebSearch || webSearchEnabled,
+                    enabled = !automaticWebSearch,
                     onCheckedChange = { onToggleWebSearch() },
                 )
             }
@@ -217,7 +240,7 @@ fun ThinkingPanelContent(
             text = stringResource(R.string.input_thinking),
             trailing = {
                 Text(
-                    text = if (supportsThinking) settings.reasoningLevel.label else stringResource(R.string.input_model_unsupported),
+                    text = if (supportsThinking) labels[selectedTick] else stringResource(R.string.input_model_unsupported),
                     style = MaterialTheme.typography.labelMedium,
                     color = if (supportsThinking) MaterialTheme.colorScheme.primary else colors.placeholder,
                 )
@@ -227,12 +250,12 @@ fun ThinkingPanelContent(
         Spacer(Modifier.size(4.dp))
 
         // 与「字体大小」页用**同一个** AppSlider：正圆指示器、按压缩放、点击可跳档
-        AppSlider(
-            value = ReasoningLevel.sliderPositionOf(settings.reasoningLevel).toFloat(),
+        if (levels.size > 1) AppSlider(
+            value = selectedTick.toFloat(),
             onValueChange = { raw ->
                 onSettingsChange(
                     settings.copy(
-                        reasoningLevel = ReasoningLevel.fromSliderPosition(raw.roundToInt()),
+                        reasoningLevel = levels[raw.roundToInt().coerceIn(levels.indices)],
                     ),
                 )
             },
@@ -240,17 +263,17 @@ fun ThinkingPanelContent(
             intervals = (levels.size - 1).coerceAtLeast(0),
             enabled = supportsThinking,
             // 文案交给滑块自己排，中心才会和刻度严格对齐
-            tickLabels = levels.map { it.label },
-            selectedTick = ReasoningLevel.sliderPositionOf(settings.reasoningLevel),
+            tickLabels = labels,
+            selectedTick = selectedTick,
         )
 
         Spacer(Modifier.size(8.dp))
 
         Text(
-            text = if (supportsThinking) {
-                stringResource(R.string.input_thinking_hint)
-            } else {
-                stringResource(R.string.input_thinking_unsupported)
+            text = when {
+                !supportsThinking -> stringResource(R.string.input_thinking_unsupported)
+                minimumRequiredEffort != null -> stringResource(R.string.input_thinking_minimum)
+                else -> stringResource(R.string.input_thinking_hint)
             },
             style = MaterialTheme.typography.labelSmall,
             color = colors.placeholder,
@@ -298,6 +321,10 @@ fun ThinkingPanelContent(
                     onClick = { onSettingsChange(settings.copy(model = model)) },
                 )
             }
+        }
+        if (onConfigureApi != null) {
+            CapsuleButton(stringResource(R.string.input_configure_api), onClick = onConfigureApi,
+                modifier = Modifier.padding(start = 10.dp, end = 10.dp, top = 8.dp))
         }
     }
 }
@@ -371,7 +398,6 @@ fun ContextPanelContent(
     stats: ContextStats,
     compaction: CompactionEntity?,
     compacting: Boolean,
-    compactPreview: String,
     onCompact: () -> Unit,
     onCancelCompact: () -> Unit,
     onClearCompaction: () -> Unit,
@@ -379,6 +405,8 @@ fun ContextPanelContent(
     modifier: Modifier = Modifier,
     /** 服务端回报的**最近一次**请求用量；没发过请求时为 null。 */
     usage: RequestUsage? = null,
+    showUsageCost: Boolean = false,
+    compactionStatus: String? = null,
 ) {
     val colors = LocalChatColors.current
 
@@ -471,6 +499,45 @@ fun ContextPanelContent(
             )
         }
 
+        /*
+         * 本会话消耗：服务端回报的 usage 逐轮累加。
+         *
+         * 口径与上面「最近一次」不同：这里每轮请求的 prompt 都计入（那才是真实计费，
+         * 上下文每轮都要重发）。老数据没有 usage，则整块不出现，不显示一堆 0。
+         */
+        if (stats.usageReplies > 0) {
+            StatRow(
+                label = stringResource(R.string.stats_usage_requests),
+                value = stringResource(R.string.stats_usage_requests_value, stats.usageReplies),
+            )
+            StatRow(
+                label = stringResource(R.string.stats_usage_input),
+                value = "${TokenEstimate.format(stats.usagePromptTokens)} tokens",
+            )
+            StatRow(
+                label = stringResource(R.string.stats_usage_output),
+                value = "${TokenEstimate.format(stats.usageCompletionTokens)} tokens",
+            )
+            if (stats.usageCacheHitTokens > 0) {
+                StatRow(
+                    label = stringResource(R.string.stats_usage_cache_hit),
+                    value = "${TokenEstimate.format(stats.usageCacheHitTokens)} tokens",
+                )
+            }
+            if (showUsageCost) {
+                StatRow(
+                    label = stringResource(R.string.stats_usage_cost),
+                    value = Pricing.format(stats.usageCost),
+                )
+                Spacer(Modifier.size(4.dp))
+                Text(
+                    text = stringResource(R.string.stats_usage_note),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = colors.placeholder,
+                )
+            }
+        }
+
         Spacer(Modifier.size(16.dp))
         PanelDivider()
         Spacer(Modifier.size(16.dp))
@@ -479,11 +546,11 @@ fun ContextPanelContent(
         CompactionSection(
             compaction = compaction,
             compacting = compacting,
-            compactPreview = compactPreview,
             onCompact = onCompact,
             onCancelCompact = onCancelCompact,
             onClearCompaction = onClearCompaction,
             onUpdateSummary = onUpdateSummary,
+            compactionStatus = compactionStatus,
         )
     }
 }
@@ -538,18 +605,18 @@ private fun StatRow(label: String, value: String) {
 }
 
 @Composable
-private fun CompactionSection(
+internal fun CompactionSection(
     compaction: CompactionEntity?,
     compacting: Boolean,
-    compactPreview: String,
     onCompact: () -> Unit,
     onCancelCompact: () -> Unit,
     onClearCompaction: () -> Unit,
     onUpdateSummary: (String) -> Unit,
+    compactionStatus: String? = null,
 ) {
     val colors = LocalChatColors.current
     var editing by remember { mutableStateOf(false) }
-    var draft by remember(compaction?.id) { mutableStateOf(compaction?.summary.orEmpty()) }
+    var draft by remember(compaction?.id, compaction?.summary) { mutableStateOf(compaction?.summary.orEmpty()) }
 
     PanelSectionTitle(text = stringResource(R.string.compact_title))
 
@@ -570,17 +637,18 @@ private fun CompactionSection(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
+                androidx.compose.material3.CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    strokeWidth = 2.dp,
+                )
+                Spacer(Modifier.size(10.dp))
                 Text(
-                    text = stringResource(R.string.compact_running),
+                    text = compactionStatus ?: stringResource(R.string.compact_running),
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.weight(1f),
                 )
                 CapsuleButton(text = stringResource(R.string.action_cancel), onClick = onCancelCompact)
-            }
-            if (compactPreview.isNotBlank()) {
-                Spacer(Modifier.size(8.dp))
-                ReadOnlyBox(text = compactPreview, maxHeight = 160.dp)
             }
         }
 
@@ -818,6 +886,7 @@ fun ConversationSettingsPanelContent(
     onExportMarkdown: (() -> Unit)? = null,
     onExportJson: (() -> Unit)? = null,
     exportHint: String? = null,
+    officialPro: Boolean = false,
 ) {
     val colors = LocalChatColors.current
     var promptPreviewExpanded by remember { mutableStateOf(false) }
@@ -1018,9 +1087,9 @@ fun ConversationSettingsPanelContent(
             label = "top_p",
             valueText = formatFloat(settings.topP),
             value = settings.topP,
-            range = 0.95f..1f,
-            enabled = settings.thinkingEnabled,
-            disabledHint = stringResource(R.string.input_param_top_p_disabled),
+            range = if (officialPro) 0.01f..1f else 0.95f..1f,
+            enabled = if (officialPro) !settings.thinkingEnabled else settings.thinkingEnabled,
+            disabledHint = stringResource(if (officialPro) R.string.pro_top_p_hint else R.string.input_param_top_p_disabled),
             onValueChange = { onSettingsChange(settings.copy(topP = it)) },
         )
 

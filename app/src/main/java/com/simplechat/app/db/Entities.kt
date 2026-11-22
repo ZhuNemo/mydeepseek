@@ -49,6 +49,14 @@ data class ConversationEntity(
      * 真要防这个，得把正文用密钥加密（见 README「保险箱」一节的说明）。
      */
     val hidden: Boolean = false,
+    /*
+     * 跨对话记忆的开关列**保留**，但本仓库不带这个功能（已按用户要求排除）。
+     *
+     * 之所以不删列：列一旦写进 Room 的 schema，删掉就要重建表 —— 而这张表有
+     * 消息级联外键，重建过程中一旦出错就是整库消息消失。留一列不读不写，
+     * 代价只是一个布尔位；删列的风险是丢数据。
+     */
+    @ColumnInfo(defaultValue = "1") val memoryEnabled: Boolean = true,
 )
 
 /**
@@ -72,6 +80,7 @@ data class DraftEntity(
     val updatedAt: Long,
     /** 「新对话」的待用标题；会话建出来后由 `conversations.title` 接管，此处清空。 */
     val title: String? = null,
+    @ColumnInfo(defaultValue = "1") val memoryEnabled: Boolean = true,
 ) {
     companion object {
         /** 「新对话」的 key —— 会话尚未创建，没有 id 可用。 */
@@ -166,6 +175,8 @@ data class MessageEntity(
     val tps: Float? = null,
     @ColumnInfo(name = "tokens_in") val tokensIn: Int? = null,
     @ColumnInfo(name = "tokens_out") val tokensOut: Int? = null,
+    /** 输入里命中 prompt 缓存的部分（DeepSeek `prompt_cache_hit_tokens`）；服务端没报就是 null。 */
+    @ColumnInfo(name = "tokens_cache_hit") val cacheHitTokens: Int? = null,
     /**
      * 内容块时间线（JSON 数组，见 [com.simplechat.app.net.ReplyBlock]）。
      *
@@ -175,6 +186,8 @@ data class MessageEntity(
     val timeline: String? = null,
     /** 结束原因（`end_turn` / `max_tokens` / `tool_use` / `refusal`），仅 Anthropic 通道写入。 */
     val stopReason: String? = null,
+    @ColumnInfo(defaultValue = "0") val imageGeneration: Boolean = false,
+    val imageRequest: String? = null,
     val createdAt: Long,
 ) {
     companion object {

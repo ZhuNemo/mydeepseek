@@ -41,7 +41,7 @@ internal fun licenseTextUrl(license: String): String = when (license) {
     else -> "https://spdx.org/licenses/"
 }
 
-/** 本应用自己的许可与版权。 */
+/** 本应用的许可证标识。 */
 internal const val APP_LICENSE = "MIT"
 internal const val APP_COPYRIGHT =
     "Copyright © 2026 Nemo（myDeepSeek）· 上游 Simple Chat © Pokanshu（MIT）"
