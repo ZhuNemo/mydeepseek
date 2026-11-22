@@ -193,11 +193,20 @@ abstract class AppDatabase : RoomDatabase() {
          * 老用户从 10 一路升上来时，这条 13→14 会第二次碰到同一列 ——
          * 直接 `ALTER TABLE ... ADD COLUMN` 会报 `duplicate column name: hidden`，
          * 迁移失败等于启动即崩。所以先查 `PRAGMA table_info`，有就跳过。
+         *
+         * ⚠️ **同时补 `messages.tokens_cache_hit`。** 这一列在上游是 9→10 加的，
+         * 但本仓库自己的 version 10 加的是 `hidden`，老库里并没有它。老用户从
+         * 本仓库的 10 升上来时，9→10 那条不会执行，于是到 v14 校验 schema 时
+         * 发现少一列 → 启动即崩。这条 13→14 是 version-10 老库必经的一步，
+         * 在这里补上（同样带守卫，重复执行也不出错）。
          */
         private val MIGRATION_13_14 = object : Migration(13, 14) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 if (!db.hasColumn("conversations", "hidden")) {
                     db.execSQL("ALTER TABLE conversations ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+                }
+                if (!db.hasColumn("messages", "tokens_cache_hit")) {
+                    db.execSQL("ALTER TABLE messages ADD COLUMN tokens_cache_hit INTEGER")
                 }
             }
         }
