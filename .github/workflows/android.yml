@@ -2,7 +2,7 @@ name: Android Build
 
 on:
   push:
-    # 临时：合并分支也要跑构建，确认无误后再并回 main 并删掉这一项
+    # 临时：合并分支也要跑构建，CI 验证通过并并回 main 后删掉这一项
     branches: [ main, upstream-1.2.4 ]
     tags: [ 'v*' ]
   pull_request:
@@ -128,23 +128,6 @@ jobs:
         run: |
           set -o pipefail
           ./gradlew --no-daemon --stacktrace testDebugUnitTest 2>&1 | tee /tmp/unit.log
-
-      # 临时诊断（定位完删掉）：失败时把完整日志提交到当前分支。
-      #
-      # 为什么不贴 commit 注释 / 不上传 artifact：这两样都要仓库读取权限，
-      # 而定位问题的一方往往只有匿名访问。用 GITHUB_TOKEN 触发的 push
-      # **不会**再触发一次 workflow（GitHub 的递归防护），所以不会打转。
-      - name: 诊断：失败日志提交到分支
-        if: failure()
-        run: |
-          set -uo pipefail
-          [ -f /tmp/unit.log ] || exit 0
-          cp /tmp/unit.log ci-unit.log
-          git config user.name "ci-bot"
-          git config user.email "ci-bot@users.noreply.github.com"
-          git add -f ci-unit.log
-          git commit -m "ci: 记录单元测试失败日志（定位用，随后删除）" || exit 0
-          git push origin "HEAD:${{ github.ref_name }}" || true
 
       - name: 构建 Release APK
         run: ./gradlew --no-daemon --stacktrace assembleRelease

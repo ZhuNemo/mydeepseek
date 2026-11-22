@@ -19,31 +19,31 @@ class SmoothRevealTest {
 
     @Test
     fun `一帧之内不算贵，不需要冷却`() {
-        assertEquals(0L, cooldownAfter(0))
-        assertEquals(0L, cooldownAfter(8))
-        assertEquals(0L, cooldownAfter(16))
+        assertEquals(0L, adaptiveCooldownMs(0))
+        assertEquals(0L, adaptiveCooldownMs(8))
+        assertEquals(0L, adaptiveCooldownMs(16))
     }
 
     @Test
     fun `超出预算的部分按两倍冷却`() {
         // 一帧拖到 24ms：超了 8ms → 冷却 16ms
-        assertEquals(16L, cooldownAfter(24))
+        assertEquals(16L, adaptiveCooldownMs(24))
         // 一帧 40ms：超 24 → 48
-        assertEquals(48L, cooldownAfter(40))
+        assertEquals(48L, adaptiveCooldownMs(40))
     }
 
     @Test
     fun `冷却有上限，不会因为一次异常就停更`() {
         // 96ms 是天花板：再慢的帧也只让出这一小段，不会退化成"停更"
-        assertEquals(96L, cooldownAfter(64))
-        assertEquals(96L, cooldownAfter(5_000))
-        assertEquals(96L, cooldownAfter(Long.MAX_VALUE / 2))
+        assertEquals(96L, adaptiveCooldownMs(64))
+        assertEquals(96L, adaptiveCooldownMs(5_000))
+        assertEquals(96L, adaptiveCooldownMs(Long.MAX_VALUE / 2))
     }
 
     @Test
     fun `耗时越长冷却越长（单调不减）`() {
         val samples = listOf(16L, 17L, 24L, 33L, 50L, 120L, 400L)
-        val cooldowns = samples.map(::cooldownAfter)
+        val cooldowns = samples.map(::adaptiveCooldownMs)
         cooldowns.zipWithNext().forEach { (a, b) ->
             assertTrue("冷却应当单调不减：$cooldowns", b >= a)
         }
