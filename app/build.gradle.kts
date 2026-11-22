@@ -31,8 +31,8 @@ val hasReleaseSigning = keystorePropertiesFile.exists()
  * 上游的 48 / 1.2.4 属于另一条发行线（包名 com.simplechat.app），
  * 我们这一条是 com.zhunemo.mydeepseek，不必与之对齐。
  */
-val appVersionCode = 7
-val appVersionName = "1.3.1"
+val appVersionCode = 8
+val appVersionName = "1.3.2"
 android {
     namespace = "com.simplechat.app"
     compileSdk = 37

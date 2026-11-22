@@ -36,9 +36,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.RadioButton
 import kotlinx.coroutines.flow.MutableStateFlow
 import androidx.compose.runtime.collectAsState
 import androidx.compose.material3.LinearProgressIndicator
@@ -93,6 +95,9 @@ import com.simplechat.app.data.StoredSettings
 import com.simplechat.app.data.TokenEstimate
 import com.simplechat.app.data.Diagnostics
 import com.simplechat.app.data.SettingsStore
+import com.simplechat.app.data.DEFAULT_DAV_PATH
+import com.simplechat.app.data.sync.SyncStage
+import com.simplechat.app.data.sync.SyncState
 import com.simplechat.app.data.normalizeLoadingWord
 import com.simplechat.app.data.ApiProfile
 import com.simplechat.app.data.userMessage
@@ -150,6 +155,8 @@ import kotlinx.coroutines.withTimeoutOrNull
 private enum class SettingsPage(private val parentName: String?) {
     ROOT(null),
     DATA("ROOT"),
+    /** 云端同步（WebDAV）：数据与同步 → 二级。 */
+    SYNC("DATA"),
     API_PROFILES("ROOT"),
     API_PROFILE("API_PROFILES"),
     SEARCH_API("API_PROFILES"),
@@ -197,6 +204,11 @@ private sealed interface SettingsDialog {
     data object ApiKey : SettingsDialog
     data class ApiProfileName(val profile: ApiProfile? = null, val copyCurrent: Boolean = false) : SettingsDialog
     data class DeleteApiProfile(val profile: ApiProfile) : SettingsDialog
+    /** 云端同步（WebDAV）的四个参数。 */
+    data object SyncServer : SettingsDialog
+    data object SyncUser : SettingsDialog
+    data object SyncPassword : SettingsDialog
+    data object SyncPath : SettingsDialog
     data object DeleteAll : SettingsDialog
     data object ImportMode : SettingsDialog
     /** 协议通道（自动 / OpenAI 兼容 / Anthropic 兼容）。 */
@@ -314,6 +326,10 @@ internal fun SettingsScreen(
     var testing by remember { mutableStateOf(false) }
     var testResult by remember { mutableStateOf<String?>(null) }
     var profileError by remember { mutableStateOf<String?>(null) }
+    /* 云端同步：进行中状态来自 SyncManager，试连结果只在本次停留期间有效。 */
+    val syncState by container.syncManager.state.collectAsState()
+    var syncTesting by remember { mutableStateOf(false) }
+    var syncTestMessage by remember { mutableStateOf<String?>(null) }
     fun updateProfile(action: suspend () -> Unit) {
         scope.launch {
             try { action(); profileError = null }
@@ -610,6 +626,21 @@ internal fun SettingsScreen(
         ActivityResultContracts.CreateDocument("application/zip"),
     ) { uri: Uri? -> savePreparedExport(uri) }
 
+    /*
+     * 崩溃记录单独一个 launcher：它是 text/plain，不能和 zip 共用（CreateDocument
+     * 的 MIME 决定了文件选择器给什么后缀）。
+     */
+    val crashLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain"),
+    ) { uri: Uri? -> savePreparedExport(uri) }
+
+    fun startCrashExport() = prepareExport("txt", { crashLauncher.launch(it) }) { file ->
+        val report = com.simplechat.app.data.CrashDiagnostics.file(context)
+            ?: error(Res.get(R.string.crash_report_missing))
+        report.inputStream().use { input -> file.outputStream().use { input.copyTo(it) } }
+        archiveProgress.value = 1f
+    }
+
     fun startArchiveExport() = prepareExport("zip", { archiveLauncher.launch(it) }) { file ->
         stageArchive(file) { repository.exportArchive(it) { p -> archiveProgress.value = p } }
     }
@@ -633,6 +664,7 @@ internal fun SettingsScreen(
             title = when (page) {
                 SettingsPage.ROOT -> stringResource(R.string.settings_title)
                 SettingsPage.DATA -> stringResource(R.string.settings_data)
+                SettingsPage.SYNC -> stringResource(R.string.settings_sync)
                 SettingsPage.API_PROFILES -> stringResource(R.string.settings_api)
                 SettingsPage.API_PROFILE -> editingProfile?.name
                     ?: stringResource(R.string.settings_api)
@@ -688,7 +720,7 @@ internal fun SettingsScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .verticalScroll(rememberScrollState())
-                        .padding(horizontal = Space.Screen),
+                        .padding(horizontal = 16.dp),
                 ) {
                     when (target) {
                         SettingsPage.ROOT -> RootPage(
@@ -706,6 +738,7 @@ internal fun SettingsScreen(
                             accentColor = accentColor,
                             onThemeChange = { scope.launch { store.setThemeMode(it.name) } },
                             onAccentChange = { scope.launch { store.setAccentColor(it.name) } },
+                            onPureBlackChange = { scope.launch { store.setPureBlack(it) } },
                             onOpenFont = { page = SettingsPage.FONT },
                             language = AppLanguage.fromId(stored.languageId),
                             onLanguageChange = { scope.launch { store.setLanguage(it.name) } },
@@ -742,6 +775,7 @@ internal fun SettingsScreen(
                         )
 
                         SettingsPage.DATA -> DataPage(
+                            stored = stored,
                             message = dataMessage,
                             progress = importPercent,
                             reading = importReading,
@@ -756,6 +790,30 @@ internal fun SettingsScreen(
                                 importLauncher.launch(arrayOf("*/*"))
                             },
                             onDeleteAll = { dialog = SettingsDialog.DeleteAll },
+                            onOpenSync = { page = SettingsPage.SYNC },
+                            onExportReport = { startReportExport() },
+                            onExportCrash = { startCrashExport() },
+                        )
+
+                        SettingsPage.SYNC -> SyncPage(
+                            stored = stored,
+                            state = syncState,
+                            testing = syncTesting,
+                            testMessage = syncTestMessage,
+                            onEdit = { dialog = it },
+                            onSyncNow = { container.syncManager.startSync() },
+                            onTest = {
+                                if (!syncTesting) {
+                                    syncTesting = true
+                                    syncTestMessage = null
+                                    scope.launch {
+                                        syncTestMessage = runCatching { container.syncManager.testConnection() }
+                                            .getOrElse { it.userMessage() }
+                                        syncTesting = false
+                                    }
+                                }
+                            },
+                            onAutoSync = { enabled -> scope.launch { store.setDavAutoSync(enabled) } },
                         )
 
                         SettingsPage.API_PROFILE -> if (editingProfile != null && editingSettings != null) ApiPage(
@@ -994,8 +1052,56 @@ internal fun SettingsScreen(
             },
         )
 
-        SettingsDialog.Model -> {
-            /*
+        // ── 云端同步（WebDAV）的四个参数 ──────────────────
+        SettingsDialog.SyncServer -> TextInputDialog(
+            title = stringResource(R.string.sync_server),
+            initial = stored.davUrl,
+            placeholder = "https://dav.jianguoyun.com/dav/",
+            onDismiss = { dialog = null },
+            onConfirm = { value ->
+                dialog = null
+                scope.launch { store.setDavUrl(value.trim()) }
+                syncTestMessage = null
+            },
+        )
+
+        SettingsDialog.SyncUser -> TextInputDialog(
+            title = stringResource(R.string.sync_account),
+            initial = stored.davUser,
+            placeholder = "",
+            onDismiss = { dialog = null },
+            onConfirm = { value ->
+                dialog = null
+                scope.launch { store.setDavUser(value.trim()) }
+                syncTestMessage = null
+            },
+        )
+
+        SettingsDialog.SyncPassword -> TextInputDialog(
+            title = stringResource(R.string.sync_password),
+            initial = stored.davPassword,
+            placeholder = "",
+            onDismiss = { dialog = null },
+            onConfirm = { value ->
+                dialog = null
+                scope.launch { store.setDavPassword(value) }
+                syncTestMessage = null
+            },
+        )
+
+        SettingsDialog.SyncPath -> TextInputDialog(
+            title = stringResource(R.string.sync_path),
+            initial = stored.davPath,
+            placeholder = DEFAULT_DAV_PATH,
+            onDismiss = { dialog = null },
+            onConfirm = { value ->
+                dialog = null
+                scope.launch { store.setDavPath(value) }
+                syncTestMessage = null
+            },
+        )
+
+        SettingsDialog.Model -> {            /*
              * 选项 = **这个端点拉到的模型**（落库的那份）在前，内置能力表补在后。
              *
              * 早先只读 `knownModels(provider)`：自定义服务商的内置目录是空的，
@@ -1391,7 +1497,7 @@ private fun themeModeLabel(mode: ThemeMode): String = when (mode) {
 // ══════════════════════════════════════════════════════════
 
 /**
- * 外观：主题模式、主题色、字体大小。
+ * 外观：主题模式、主题色、纯黑、字体大小、语言。
  *
  * 主题模式与主题色原来在一级页各弹一个菜单 —— 这两项本来就要「看着挑」，
  * 藏在菜单里每次都得点开才知道当前是哪个。现在平铺成单选行与一排色块，一眼可见。
@@ -1403,6 +1509,7 @@ private fun AppearancePage(
     accentColor: AccentColor,
     onThemeChange: (ThemeMode) -> Unit,
     onAccentChange: (AccentColor) -> Unit,
+    onPureBlackChange: (Boolean) -> Unit,
     onOpenFont: () -> Unit,
     language: AppLanguage,
     onLanguageChange: (AppLanguage) -> Unit,
@@ -1431,7 +1538,7 @@ private fun AppearancePage(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = Space.Screen, vertical = Space.RowPadY),
+                .padding(horizontal = 18.dp, vertical = 14.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -1443,6 +1550,13 @@ private fun AppearancePage(
                 )
             }
         }
+        RowDivider()
+        SettingsSwitchRow(
+            label = stringResource(R.string.settings_pure_black),
+            hint = stringResource(R.string.settings_pure_black_hint),
+            checked = stored.pureBlack,
+            onCheckedChange = onPureBlackChange,
+        )
     }
 
     SettingsSectionLabel(stringResource(R.string.settings_group_text))
@@ -1522,37 +1636,113 @@ private fun SecurityPage(
     onOpenVault: () -> Unit,
 ) {
     val colors = LocalChatColors.current
+    val context = LocalContext.current
+    /* 设备有没有设锁屏：决定"与屏幕锁定相同"这一项能不能用。 */
+    val deviceSecure = remember(context) { context.hasDeviceLock() }
 
     Text(
         text = stringResource(R.string.settings_security_desc),
-        style = MaterialTheme.typography.bodySmall,
+        style = MaterialTheme.typography.bodyMedium,
         color = colors.placeholder,
-        modifier = Modifier.padding(top = 12.dp),
+        modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
     )
 
-    SettingsSectionLabel(stringResource(R.string.settings_lock_section))
+    SettingsSectionLabel(stringResource(R.string.settings_lock_method))
 
+    /*
+     * 三种方式互斥，所以用**单选圆点**而不是对勾：对勾在这里会被读成"已启用"，
+     * 而实际上只是"选中的那一个"。
+     */
     SettingsCard {
-        SettingsChoiceRow(
+        SettingsRadioRow(
             icon = AppIcons.Close,
             label = stringResource(R.string.settings_lock_none),
             selected = lockType == AppLockType.NONE,
             onClick = { onSetLockType(AppLockType.NONE) },
         )
         RowDivider()
-        SettingsChoiceRow(
+        SettingsRadioRow(
             icon = AppIcons.Key,
             label = stringResource(R.string.settings_lock_pin),
+            hint = if (stored.hasVaultPin) {
+                stringResource(R.string.settings_lock_pin_locked_hint)
+            } else {
+                stringResource(R.string.settings_lock_no_pin)
+            },
             selected = lockType == AppLockType.PIN,
             onClick = { onSetLockType(AppLockType.PIN) },
         )
         RowDivider()
-        SettingsChoiceRow(
+        SettingsRadioRow(
             icon = AppIcons.Lock,
             label = stringResource(R.string.settings_lock_device),
+            hint = if (deviceSecure) {
+                stringResource(R.string.settings_lock_device_hint)
+            } else {
+                stringResource(R.string.lock_device_unavailable)
+            },
             selected = lockType == AppLockType.DEVICE,
             onClick = { onSetLockType(AppLockType.DEVICE) },
         )
+    }
+
+    /*
+     * 选了「自定义密码」之后，真正要做的那一步就在下面这张卡里。
+     *
+     * 上面那行只负责"选"，设置 / 修改密码是另一个动作 —— 混在单选行里会让人
+     * 以为点一下密码就设好了（之前正是这样：选完什么也没发生，只能猜）。
+     */
+    if (lockType == AppLockType.PIN) {
+        Spacer(Modifier.size(12.dp))
+        SettingsCard {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = AppIcons.Key,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(20.dp),
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Text(
+                        text = stringResource(
+                            if (stored.hasVaultPin) {
+                                R.string.settings_lock_pin_locked_hint
+                            } else {
+                                R.string.settings_lock_set_pin_first
+                            },
+                        ),
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                }
+                Text(
+                    text = stringResource(R.string.vault_set_pin_hint),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = colors.placeholder,
+                )
+                FilledTonalButton(
+                    onClick = onChangePin,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = CircleShape,
+                ) {
+                    Text(
+                        stringResource(
+                            if (stored.hasVaultPin) {
+                                R.string.settings_lock_change_pin
+                            } else {
+                                R.string.vault_set_pin
+                            },
+                        ),
+                    )
+                }
+            }
+        }
     }
 
     if (lockType != AppLockType.NONE) {
@@ -1565,29 +1755,13 @@ private fun SecurityPage(
                 300 to R.string.settings_lock_timeout_5m,
             ).forEachIndexed { index, (seconds, label) ->
                 if (index > 0) RowDivider()
-                SettingsChoiceRow(
+                SettingsRadioRow(
                     icon = null,
                     label = stringResource(label),
                     selected = stored.appLockTimeoutSeconds == seconds,
                     onClick = { onSetTimeout(seconds) },
                 )
             }
-        }
-    }
-
-    if (lockType == AppLockType.PIN) {
-        SettingsSectionLabel(stringResource(R.string.settings_lock_section))
-
-        SettingsCard {
-            SettingsActionRow(
-                label = stringResource(R.string.settings_lock_change_pin),
-                hint = if (stored.hasVaultPin) {
-                    stringResource(R.string.settings_lock_pin_locked_hint)
-                } else {
-                    stringResource(R.string.settings_lock_no_pin)
-                },
-                onClick = onChangePin,
-            )
         }
     }
 
@@ -1798,22 +1972,21 @@ internal fun SettingsChoiceRow(
         modifier = Modifier
             .fillMaxWidth()
             .selectable(selected = selected, role = Role.RadioButton, onClick = onClick)
-            .heightIn(min = Space.Row)
-            .padding(horizontal = Space.Screen, vertical = Space.RowPadY),
+            .padding(horizontal = 18.dp, vertical = 16.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(Space.IconGap),
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         if (icon != null) {
             Icon(
                 imageVector = icon,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurface,
-                modifier = Modifier.size(Space.Icon),
+                modifier = Modifier.size(22.dp),
             )
         }
         Text(
             text = label,
-            style = MaterialTheme.typography.titleSmall,
+            style = MaterialTheme.typography.bodyLarge,
             color = MaterialTheme.colorScheme.onSurface,
             modifier = Modifier.weight(1f),
         )
@@ -1822,7 +1995,7 @@ internal fun SettingsChoiceRow(
                 imageVector = AppIcons.Check,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.size(Space.Icon),
+                modifier = Modifier.size(20.dp),
             )
         }
     }
@@ -1979,6 +2152,7 @@ private fun VoiceRow(
 
 @Composable
 private fun DataPage(
+    stored: StoredSettings,
     message: String?,
     /** 确定进度：null = 还没开始或已经结束；0..1 = 已解析的会话占比。 */
     progress: Float? = null,
@@ -1991,7 +2165,30 @@ private fun DataPage(
     onExportDeepSeek: () -> Unit,
     onImport: () -> Unit,
     onDeleteAll: () -> Unit,
+    /** 进入「云端同步」（WebDAV）二级页。 */
+    onOpenSync: () -> Unit = {},
+    /** 导出上一次导入报告。 */
+    onExportReport: () -> Unit = {},
+    /** 导出崩溃记录（不存在时给一句明确提示，而不是静默）。 */
+    onExportCrash: () -> Unit = {},
 ) {
+    SettingsSectionLabel(stringResource(R.string.settings_group_sync))
+
+    SettingsCard {
+        SettingsNavRow(
+            icon = AppIcons.Cloud,
+            label = stringResource(R.string.settings_sync),
+            value = if (stored.davUrl.isBlank()) {
+                stringResource(R.string.sync_status_off)
+            } else if (stored.davAutoSync) {
+                stringResource(R.string.sync_status_on)
+            } else {
+                stored.davUrl
+            },
+            onClick = onOpenSync,
+        )
+    }
+
     SettingsSectionLabel(stringResource(R.string.settings_group_backup))
 
     SettingsCard {
@@ -2082,6 +2279,24 @@ private fun DataPage(
         }
     }
 
+    SettingsSectionLabel(stringResource(R.string.settings_group_diagnostics))
+
+    SettingsCard {
+        SettingsActionRow(
+            label = stringResource(R.string.import_report_export),
+            hint = stringResource(R.string.import_report_hint),
+            onClick = onExportReport,
+            enabled = !reading && progress == null && exportProgress == null,
+        )
+        RowDivider()
+        SettingsActionRow(
+            label = stringResource(R.string.crash_report_export),
+            hint = stringResource(R.string.crash_report_hint),
+            onClick = onExportCrash,
+            enabled = !reading && progress == null && exportProgress == null,
+        )
+    }
+
     SettingsSectionLabel(stringResource(R.string.settings_group_reset))
 
     SettingsCard {
@@ -2101,6 +2316,171 @@ private fun DataPage(
             style = MaterialTheme.typography.labelMedium,
             color = LocalChatColors.current.placeholder,
             modifier = Modifier.padding(horizontal = 4.dp),
+        )
+    }
+}
+
+// ══════════════════════════════════════════════════════════
+//  二级：云端同步（WebDAV）
+// ══════════════════════════════════════════════════════════
+
+/**
+ * 同步设置。
+ *
+ * 四行服务器信息 + 两个动作 + 一个开关，底下是状态与说明。
+ * 刻意**不做**"选网盘服务商"这类向导：WebDAV 的参数就四个，填一次之后
+ * 一年都不会再进来，向导只是把四行拉成四步。
+ */
+@Composable
+private fun SyncPage(
+    stored: StoredSettings,
+    state: SyncState,
+    testing: Boolean,
+    testMessage: String?,
+    onEdit: (SettingsDialog) -> Unit,
+    onSyncNow: () -> Unit,
+    onTest: () -> Unit,
+    onAutoSync: (Boolean) -> Unit,
+) {
+    val colors = LocalChatColors.current
+    val unset = stringResource(R.string.api_key_unset)
+
+    SettingsSectionLabel(stringResource(R.string.sync_group_server))
+
+    SettingsCard {
+        SettingsNavRow(
+            icon = AppIcons.Cloud,
+            label = stringResource(R.string.sync_server),
+            value = stored.davUrl.ifBlank { unset },
+            onClick = { onEdit(SettingsDialog.SyncServer) },
+        )
+        RowDivider()
+        SettingsNavRow(
+            icon = null,
+            label = stringResource(R.string.sync_account),
+            value = stored.davUser.ifBlank { unset },
+            onClick = { onEdit(SettingsDialog.SyncUser) },
+        )
+        RowDivider()
+        SettingsNavRow(
+            icon = null,
+            label = stringResource(R.string.sync_password),
+            // 只显示"设没设"，永不回显明文（与 API Key 一个规矩）
+            value = if (stored.davPassword.isBlank()) {
+                stringResource(R.string.sync_password_unset)
+            } else {
+                maskKey(stored.davPassword)
+            },
+            onClick = { onEdit(SettingsDialog.SyncPassword) },
+        )
+        RowDivider()
+        SettingsNavRow(
+            icon = null,
+            label = stringResource(R.string.sync_path),
+            value = stored.davPath,
+            onClick = { onEdit(SettingsDialog.SyncPath) },
+        )
+    }
+
+    SettingsSectionLabel(stringResource(R.string.settings_group_sync))
+
+    SettingsCard {
+        SettingsActionRow(
+            label = stringResource(R.string.sync_now),
+            hint = stringResource(R.string.sync_now_summary),
+            onClick = onSyncNow,
+            enabled = !state.running,
+        )
+        RowDivider()
+        SettingsActionRow(
+            label = stringResource(R.string.sync_test),
+            hint = null,
+            onClick = onTest,
+            enabled = !state.running && !testing,
+        )
+        RowDivider()
+        SettingsSwitchRow(
+            label = stringResource(R.string.sync_auto),
+            checked = stored.davAutoSync,
+            onCheckedChange = onAutoSync,
+        )
+    }
+
+    Spacer(Modifier.size(12.dp))
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        if (state.running) {
+            /*
+             * 有总数就给**确定进度**（几百个会话要传好几分钟，光转圈让人以为卡死），
+             * 没有总数（下载 meta、列目录那种瞬间动作）才转圈。
+             */
+            if (state.total > 0) {
+                LinearProgressIndicator(
+                    modifier = Modifier.fillMaxWidth(),
+                    progress = { (state.done.toFloat() / state.total).coerceIn(0f, 1f) },
+                )
+            } else {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
+        }
+
+        /*
+         * 一句话的状态：跑起来时是阶段，跑完是结果，试连时是试连结果。
+         * 优先级从上往下：正在发生的事 > 刚做过的事 > 上一次同步的结论。
+         */
+        val status = when {
+            state.running -> when (state.stage) {
+                SyncStage.DOWNLOAD -> stringResource(R.string.sync_stage_download)
+                SyncStage.MERGE -> if (state.total > 0) {
+                    stringResource(R.string.sync_progress_pull, state.done, state.total)
+                } else {
+                    stringResource(R.string.sync_stage_merge)
+                }
+
+                SyncStage.UPLOAD -> if (state.total > 0) {
+                    stringResource(R.string.sync_progress_upload, state.done, state.total)
+                } else {
+                    stringResource(R.string.sync_stage_upload)
+                }
+
+                null -> stringResource(R.string.sync_now)
+            }
+
+            testing -> stringResource(R.string.api_testing)
+            testMessage != null -> testMessage
+            state.message != null -> state.message
+            else -> stringResource(R.string.sync_never)
+        }
+        Text(
+            text = status,
+            style = MaterialTheme.typography.labelMedium,
+            color = if (state.failed && !state.running) colors.danger else colors.placeholder,
+        )
+
+        // 上次成功同步的时间单独一行 —— 它是"数据到底同没同步"的锚点
+        Text(
+            text = if (stored.davLastSyncAt > 0) {
+                stringResource(
+                    R.string.sync_last_at,
+                    SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
+                        .format(Date(stored.davLastSyncAt)),
+                )
+            } else {
+                stringResource(R.string.sync_never)
+            },
+            style = MaterialTheme.typography.labelSmall,
+            color = colors.placeholder,
+        )
+
+        Text(
+            text = stringResource(R.string.sync_hint),
+            style = MaterialTheme.typography.labelSmall,
+            color = colors.placeholder,
         )
     }
 }
@@ -2624,13 +3004,36 @@ private fun AboutPage(
     var checking by remember { mutableStateOf(false) }
     var checkResult by remember { mutableStateOf<UpdateChecker.Result?>(null) }
 
+    /*
+     * 一句话说清这是什么。不写"基于 XX 二次开发"这类像免责声明的话 ——
+     * 它就是一个独立应用，只是把出处标在下面的「参考实现」里。
+     */
+    Text(
+        text = stringResource(R.string.about_intro),
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onBackground,
+        modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
+    )
+
     SettingsSectionLabel(stringResource(R.string.about_version))
 
     SettingsCard {
         InfoRow(label = stringResource(R.string.about_version), value = "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
         RowDivider(inset = 16.dp)
         InfoRow(label = stringResource(R.string.about_package), value = BuildConfig.APPLICATION_ID)
-        RowDivider()
+        RowDivider(inset = 16.dp)
+        InfoRow(label = stringResource(R.string.license_type), value = APP_LICENSE)
+        RowDivider(inset = 16.dp)
+        InfoRow(label = stringResource(R.string.license_copyright), value = APP_COPYRIGHT)
+    }
+
+    /*
+     * 「检查更新」单独一张卡：上面几行是只读信息，这一行是**可点**的 ——
+     * 混排会出现"有的能点有的不能点"。
+     */
+    SettingsSectionLabel(stringResource(R.string.about_update))
+
+    SettingsCard {
         SettingsActionRow(
             label = stringResource(R.string.about_check_update),
             hint = stringResource(R.string.about_current_version, BuildConfig.VERSION_NAME),
@@ -2647,9 +3050,15 @@ private fun AboutPage(
         )
     }
 
+    /*
+     * 项目地址与参考实现单独一组：这两行都是**可点**链接，
+     * 不与只读的版本信息混在一张卡里。
+     */
     SettingsSectionLabel(stringResource(R.string.about_project))
     SettingsCard {
         LinkRow(label = stringResource(R.string.about_project_url), value = ProjectUrl, url = ProjectUrl)
+        RowDivider(inset = 16.dp)
+        LinkRow(label = stringResource(R.string.about_reference), value = ReferenceUrl, url = ReferenceUrl)
         RowDivider(inset = 16.dp)
         SettingsNavRow(icon = null, label = stringResource(R.string.license_type), value = APP_LICENSE,
             onClick = { showProjectLicense = true })
@@ -2973,43 +3382,71 @@ fun SettingsTopBar(
     }
 }
 
-private fun Modifier.settingsSectionGrid(): Modifier =
-    padding(start = 4.dp, top = Space.Section, bottom = Space.Gap)
-
+/**
+ * 分组小标题。
+ *
+ * 用**主色**而不是灰色（`labelMedium` 13sp）：设置页里分组标题是唯一
+ * 需要"被扫到"的层级，灰色小字在一屏十几行里根本读不出来。
+ * 这也正是 M3 设置类界面的常规做法 —— 分组标题承担导航，不承担正文。
+ */
 @Composable
 fun SettingsSectionLabel(text: String) {
-    val colors = LocalChatColors.current
     Text(
         text = text,
         style = MaterialTheme.typography.labelMedium,
-        color = colors.placeholder,
-        modifier = Modifier.settingsSectionGrid(),
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(start = 10.dp, top = 16.dp, bottom = 8.dp),
     )
 }
 
+/**
+ * 设置卡片：**一张 24dp 圆角的整块**，里面的行之间用小间隙隔开。
+ *
+ * 行与行的分隔由 [RowDivider] 画成"一条页面底色的缝"，而不是一条 1dp 细线 ——
+ * 于是这一块看起来是**一组相连的行**（M3 的 connected list），
+ * 而不是一张带表格线的卡。
+ */
 @Composable
 fun SettingsCard(content: @Composable () -> Unit) {
     val colors = LocalChatColors.current
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(MenuShape)
+            .clip(SettingsCardShape)
             .background(colors.card),
     ) {
         content()
     }
 }
 
+/** 卡片圆角：M3 的 large 档（24dp）。 */
+private val SettingsCardShape = RoundedCornerShape(24.dp)
+
+/**
+ * 行之间的分割。两种形态（调用点很多，保持同名）：
+ *
+ * - **不带参数**（卡片里）：一条 **2dp 的页面底色**，把整块读成"几行连在一起"；
+ * - **`inset > 0`**（对话框、非卡片区域）：一条 1dp 细线并缩进。
+ */
 @Composable
-internal fun RowDivider(inset: androidx.compose.ui.unit.Dp = Space.Screen + Space.Icon + Space.IconGap) {
+internal fun RowDivider(inset: androidx.compose.ui.unit.Dp = 0.dp) {
     val colors = LocalChatColors.current
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(start = inset)
-            .height(1.dp)
-            .background(colors.divider),
-    )
+    if (inset > 0.dp) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = inset)
+                .height(1.dp)
+                .background(colors.divider),
+        )
+    } else {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(2.dp)
+                .background(colors.settingsBackground),
+        )
+    }
 }
 
 /**
@@ -3161,6 +3598,14 @@ private fun BalanceRow(
  * 一级入口行：图标 + 标题 +（可选）当前值 + 箭头。
  * 图标传 `null` 即为二级页面里的行 —— 二级不配图标。
  */
+/**
+ * 右侧值分到的宽度权重（标题是 1）。
+ *
+ * 0.5 ≈ 标题 2/3 / 值 1/3：手机宽度下标题能完整显示六到八个汉字，
+ * 「云端同步」「朗读音色」「自动折叠思考内容」都在安全区内。
+ */
+private const val ValueWeight = 0.5f
+
 @Composable
 fun SettingsNavRow(
     icon: ImageVector?,
@@ -3173,24 +3618,26 @@ fun SettingsNavRow(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .heightIn(min = Space.Row)
-            .padding(horizontal = Space.Screen, vertical = Space.RowPadY),
+            /* 行高 18×2 + 内容 ≈ 64dp；带图标 + 右侧值时不挤，触控区也稳过 48dp。 */
+            .padding(horizontal = 18.dp, vertical = 18.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(Space.IconGap),
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         if (icon != null) {
             Icon(
                 imageVector = icon,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurface,
-                modifier = Modifier.size(Space.Icon),
+                modifier = Modifier.size(22.dp),
             )
         }
         Text(
             text = label,
-            style = MaterialTheme.typography.titleSmall,
+            // bodyLarge(16sp) 是 M3 列表项标题的标准字号；titleSmall(14) 偏小
+            style = MaterialTheme.typography.bodyLarge,
             color = MaterialTheme.colorScheme.onSurface,
-            // 标题吃掉全部剩余空间 → 值 + 箭头被顶到最右，形成一条整齐的右边线
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
         if (value != null) {
@@ -3201,19 +3648,19 @@ fun SettingsNavRow(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 textAlign = TextAlign.End,
-                modifier = Modifier.widthIn(max = 190.dp),
+                modifier = Modifier.weight(ValueWeight),
             )
         }
         Icon(
             imageVector = AppIcons.ChevronRight,
             contentDescription = null,
             tint = colors.placeholder,
-            modifier = Modifier.size(16.dp),
+            modifier = Modifier.size(18.dp),
         )
     }
 }
 
-/** 二级页面的动作行：标题 +（可选）说明，无图标。 */
+/** 二级页面的动作行：标题 +（可选）说明，可带图标。 */
 @Composable
 internal fun SettingsActionRow(
     label: String,
@@ -3229,16 +3676,25 @@ internal fun SettingsActionRow(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(enabled = enabled, onClick = onClick)
-            .heightIn(min = Space.Row)
-            .padding(horizontal = Space.Screen, vertical = Space.RowPadY),
+            .padding(horizontal = 18.dp, vertical = 16.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(Space.IconGap),
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        if (icon != null) Icon(icon, contentDescription = null, modifier = Modifier.size(Space.Icon))
-        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        if (icon != null) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = if (destructive) colors.danger else MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.size(22.dp),
+            )
+        }
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
             Text(
                 text = label,
-                style = MaterialTheme.typography.titleSmall,
+                style = MaterialTheme.typography.bodyLarge,
                 color = if (destructive) colors.danger else MaterialTheme.colorScheme.onSurface,
             )
             if (hint != null) {
@@ -3260,30 +3716,39 @@ internal fun SettingsSwitchRow(
     onCheckedChange: (Boolean) -> Unit,
     icon: ImageVector? = null,
     enabled: Boolean = true,
+    /** 第二行灰字说明。M3 的列表项就是"标题 + 支持文本"两行结构。 */
+    hint: String? = null,
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(enabled = enabled) { onCheckedChange(!checked) }
-            .heightIn(min = Space.Row)
-            .padding(horizontal = Space.Screen, vertical = Space.RowPadY),
+            .padding(horizontal = 18.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(Space.IconGap),
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         if (icon != null) {
             Icon(
                 imageVector = icon,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurface,
-                modifier = Modifier.size(Space.Icon),
+                modifier = Modifier.size(21.dp),
             )
         }
-        Text(
-            text = label,
-            style = MaterialTheme.typography.titleSmall,
-            color = if (enabled) MaterialTheme.colorScheme.onSurface else LocalChatColors.current.placeholder,
-            modifier = Modifier.weight(1f),
-        )
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.bodyLarge,
+                color = if (enabled) MaterialTheme.colorScheme.onSurface else LocalChatColors.current.placeholder,
+            )
+            if (hint != null) {
+                Text(
+                    text = hint,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
         AppSwitch(
             checked = checked,
             onCheckedChange = onCheckedChange,
@@ -3297,7 +3762,14 @@ internal fun SettingsSwitchRow(
  * 仓库地址。写成常量而不是资源：它是**代码里的一个事实**，不随界面语言变，
  * 也不该被翻译（翻成别的语言反而点不开）。改仓库时只改这一处。
  */
-private const val ProjectUrl = "https://github.com/Pokanshuu/Simple-Chat"
+private const val ProjectUrl = "https://github.com/ZhuNemo/mydeepseek"
+
+/**
+ * 参考实现（上游）。
+ *
+ * 留一行链接是对原作者的交代，也让想追根溯源的人找得到起点。
+ */
+private const val ReferenceUrl = "https://github.com/Pokanshuu/Simple-Chat"
 
 /**
  * 可点击的信息行 —— 样式与 [InfoRow] 一致，只是值用主色、整行可点。
@@ -3339,6 +3811,55 @@ private fun LinkRow(label: String, value: String, url: String) {
     }
 }
 
+/**
+ * 单选行：图标 + 标题（+ 说明）+ M3 单选圆点。
+ *
+ * 用于"几选一"的互斥设置（解锁方式、自动锁定时间）。与 [SettingsChoiceRow]
+ * 的区别只在末尾控件：对勾表示"已启用"，圆点表示"选中的那一个"。
+ */
+@Composable
+private fun SettingsRadioRow(
+    icon: ImageVector?,
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    hint: String? = null,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .selectable(selected = selected, role = Role.RadioButton, onClick = onClick)
+            .padding(horizontal = 18.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        if (icon != null) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.secondary,
+                modifier = Modifier.size(21.dp),
+            )
+        }
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            if (hint != null) {
+                Text(
+                    text = hint,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        // 整行可点，圆点本身不再单独处理点击（避免同一行两个点击目标）
+        RadioButton(selected = selected, onClick = null)
+    }
+}
+
 /** 只读信息行。 */
 @Composable
 private fun InfoRow(label: String, value: String) {
@@ -3346,8 +3867,7 @@ private fun InfoRow(label: String, value: String) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(min = Space.Row)
-            .padding(horizontal = Space.Screen, vertical = Space.RowPadY),
+            .padding(horizontal = 16.dp, vertical = 16.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
