@@ -1,17 +1,10 @@
 package com.simplechat.app
 
-import android.Manifest
-import android.content.ComponentName
-import android.content.pm.PackageManager
 import android.content.Context
-import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
@@ -20,7 +13,6 @@ import com.simplechat.app.data.AppLanguage
 import com.simplechat.app.data.LocaleHelper
 import com.simplechat.app.ui.RootScreen
 import com.simplechat.app.ui.lock.AppLockGate
-import com.simplechat.app.ui.common.LocalUseSimpleCatIcon
 import com.simplechat.app.ui.theme.AccentColor
 import com.simplechat.app.ui.theme.ApplySystemBarAppearance
 import com.simplechat.app.ui.theme.SimpleChatTheme
@@ -66,10 +58,6 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            LaunchedEffect(current?.useSimpleCatIcon) {
-                current?.let { updateLauncherIcon(it.useSimpleCatIcon) }
-            }
-
             val themeMode = runCatching {
                 ThemeMode.valueOf(current?.themeModeId ?: ThemeMode.SYSTEM.name)
             }.getOrDefault(ThemeMode.SYSTEM)
@@ -94,48 +82,13 @@ class MainActivity : ComponentActivity() {
                 pureBlack = current?.pureBlack ?: false,
             ) {
                 ApplySystemBarAppearance()
-                CompositionLocalProvider(LocalUseSimpleCatIcon provides (current?.useSimpleCatIcon ?: true)) {
-                    /*
-                     * 应用锁包在**最外层**：它要盖住所有页面（对话、设置、保险箱），
-                     * 而不只是某一个入口。冷启动与回前台的重新上锁都由它判断。
-                     */
-                    AppLockGate(settingsStore) { unlocked ->
-                        RootScreen(appLockUnlocked = unlocked)
-                    }
+                /*
+                 * 应用锁包在**最外层**：它要盖住所有页面（对话、设置、保险箱），
+                 * 而不只是某一个入口。冷启动与回前台的重新上锁都由它判断。
+                 */
+                AppLockGate(settingsStore) { unlocked ->
+                    RootScreen(appLockUnlocked = unlocked)
                 }
-            }
-        }
-    }
-
-    internal fun applyLauncherIconAndExit(useSimpleCat: Boolean) {
-        updateLauncherIcon(useSimpleCat)
-        finishAndRemoveTask()
-    }
-
-    private fun updateLauncherIcon(useSimpleCat: Boolean) {
-        val classic = ComponentName(packageName, "com.simplechat.app.ClassicLauncher")
-        val cat = ComponentName(packageName, "com.simplechat.app.SimpleCatLauncher")
-        val manager = packageManager
-        val selected = if (useSimpleCat) cat else classic
-        val unselected = if (useSimpleCat) classic else cat
-        val enabled = PackageManager.COMPONENT_ENABLED_STATE_ENABLED
-        val disabled = PackageManager.COMPONENT_ENABLED_STATE_DISABLED
-        val default = PackageManager.COMPONENT_ENABLED_STATE_DEFAULT
-        val flags = PackageManager.DONT_KILL_APP
-
-        val changes = listOf(selected to enabled, unselected to disabled).filter { (component, target) ->
-            val state = manager.getComponentEnabledSetting(component)
-            state != target && !(state == default && (component == cat) == (target == enabled))
-        }
-        if (changes.isEmpty()) return
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            manager.setComponentEnabledSettings(changes.map { (component, state) ->
-                PackageManager.ComponentEnabledSetting(component, state, flags)
-            })
-        } else {
-            // Keep a launcher entry available while switching on older Android versions.
-            changes.forEach { (component, state) ->
-                manager.setComponentEnabledSetting(component, state, flags)
             }
         }
     }

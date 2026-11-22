@@ -5,7 +5,6 @@ import java.io.File
 import android.net.Uri
 import android.provider.DocumentsContract
 import androidx.activity.compose.BackHandler
-import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
@@ -110,7 +109,6 @@ import com.simplechat.app.ui.lock.PinSetupFlow
 import com.simplechat.app.ui.lock.hasDeviceLock
 import com.simplechat.app.ui.lock.openSecuritySettings
 import com.simplechat.app.ui.common.AppIcons
-import com.simplechat.app.MainActivity
 import com.simplechat.app.ui.common.AppConfirmDialog
 import com.simplechat.app.ui.common.AppMenu
 import com.simplechat.app.ui.common.AppMenuCheck
@@ -708,16 +706,6 @@ internal fun SettingsScreen(
                             accentColor = accentColor,
                             onThemeChange = { scope.launch { store.setThemeMode(it.name) } },
                             onAccentChange = { scope.launch { store.setAccentColor(it.name) } },
-                            onIconChange = { activity, enabled ->
-                                scope.launch {
-                                    try {
-                                        store.setUseSimpleCatIcon(enabled)
-                                        activity.applyLauncherIconAndExit(enabled)
-                                    } catch (_: java.io.IOException) {
-                                        android.widget.Toast.makeText(activity, R.string.diagnostics_save_failed, android.widget.Toast.LENGTH_SHORT).show()
-                                    }
-                                }
-                            },
                             onOpenFont = { page = SettingsPage.FONT },
                             language = AppLanguage.fromId(stored.languageId),
                             onLanguageChange = { scope.launch { store.setLanguage(it.name) } },
@@ -1415,27 +1403,10 @@ private fun AppearancePage(
     accentColor: AccentColor,
     onThemeChange: (ThemeMode) -> Unit,
     onAccentChange: (AccentColor) -> Unit,
-    onIconChange: (MainActivity, Boolean) -> Unit,
     onOpenFont: () -> Unit,
     language: AppLanguage,
     onLanguageChange: (AppLanguage) -> Unit,
 ) {
-    val activity = LocalActivity.current as? MainActivity
-    var pendingIcon by rememberSaveable { mutableStateOf<Boolean?>(null) }
-
-    pendingIcon?.let { enabled ->
-        AppConfirmDialog(
-            title = stringResource(R.string.settings_icon_restart_title),
-            message = stringResource(R.string.settings_icon_restart_message),
-            confirmText = stringResource(R.string.settings_icon_exit),
-            onDismiss = { pendingIcon = null },
-            onConfirm = {
-                pendingIcon = null
-                activity?.let { onIconChange(it, enabled) }
-            },
-        )
-    }
-
     SettingsSectionLabel(stringResource(R.string.settings_theme_mode))
 
     SettingsCard {
@@ -1452,24 +1423,6 @@ private fun AppearancePage(
                 onClick = { onThemeChange(mode) },
             )
         }
-    }
-
-    SettingsSectionLabel(stringResource(R.string.settings_icon))
-
-    SettingsCard {
-        SettingsChoiceRow(
-            icon = AppIcons.ClassicMessageSquare,
-            label = stringResource(R.string.settings_icon_classic),
-            selected = !stored.useSimpleCatIcon,
-            onClick = { if (stored.useSimpleCatIcon) pendingIcon = false },
-        )
-        RowDivider()
-        SettingsChoiceRow(
-            icon = AppIcons.SimpleCat,
-            label = stringResource(R.string.settings_icon_simple_cat),
-            selected = stored.useSimpleCatIcon,
-            onClick = { if (!stored.useSimpleCatIcon) pendingIcon = true },
-        )
     }
 
     SettingsSectionLabel(stringResource(R.string.settings_accent))
