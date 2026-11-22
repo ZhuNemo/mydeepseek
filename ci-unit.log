@@ -7,16 +7,16 @@ Daemon will be stopped at the end of the build
 > Task :app:packageDebugResources
 > Task :app:processDebugNavigationResources
 > Task :app:javaPreCompileDebug FROM-CACHE
-> Task :app:mapDebugSourceSetPaths
-> Task :app:compileDebugNavigationResources FROM-CACHE
 > Task :app:checkDebugAarMetadata
+> Task :app:mapDebugSourceSetPaths
 > Task :app:parseDebugLocalResources
+> Task :app:compileDebugNavigationResources FROM-CACHE
+> Task :app:generateDebugRFile
 > Task :app:createDebugCompatibleScreenManifests
 > Task :app:extractDeepLinksDebug FROM-CACHE
-> Task :app:processDebugMainManifest
-> Task :app:generateDebugRFile
-> Task :app:processDebugManifest
 > Task :app:mergeDebugResources
+> Task :app:processDebugMainManifest
+> Task :app:processDebugManifest
 > Task :app:preDebugUnitTestBuild UP-TO-DATE
 > Task :app:javaPreCompileDebugUnitTest FROM-CACHE
 > Task :app:processDebugManifestForPackage
@@ -26,221 +26,88 @@ Daemon will be stopped at the end of the build
 w: [ksp] /home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/db/Entities.kt:236: presetId column references a foreign key but it is not part of an index. This may trigger full table scans whenever parent table is modified so you are highly advised to create an index that covers this column.
 
 > Task :app:compileDebugKotlin
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:119:23 Unresolved reference 'PackageManager'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:120:24 Unresolved reference 'PackageManager'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:121:23 Unresolved reference 'PackageManager'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:122:21 Unresolved reference 'PackageManager'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:124:23 Cannot infer type for type parameter 'T'. Specify it explicitly.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:124:39 Cannot infer type for type parameter 'B'. Specify it explicitly.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:124:62 Cannot infer type for type parameter 'B'. Specify it explicitly.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:124:75 Cannot infer type for type parameter 'T'. Specify it explicitly.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:124:84 Cannot infer type for type parameter 'T'. Specify it explicitly.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:124:84 Operator call 'component1()' is ambiguous for destructuring of type 'uninferred ??? (Unknown type for type parameter T)'. Applicable candidates:
-fun <T> Array<out T>.component1(): T
-fun ByteArray.component1(): Byte
-fun ShortArray.component1(): Short
-fun IntArray.component1(): Int
-fun LongArray.component1(): Long
-fun FloatArray.component1(): Float
-fun DoubleArray.component1(): Double
-fun BooleanArray.component1(): Boolean
-fun CharArray.component1(): Char
-fun <T> List<T>.component1(): T
-fun <K, V> Map.Entry<K, V>.component1(): K
-fun UIntArray.component1(): UInt
-fun ULongArray.component1(): ULong
-fun UByteArray.component1(): UByte
-fun UShortArray.component1(): UShort
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:124:84 Operator call 'component2()' is ambiguous for destructuring of type 'uninferred ??? (Unknown type for type parameter T)'. Applicable candidates:
-fun <T> Array<out T>.component2(): T
-fun ByteArray.component2(): Byte
-fun ShortArray.component2(): Short
-fun IntArray.component2(): Int
-fun LongArray.component2(): Long
-fun FloatArray.component2(): Float
-fun DoubleArray.component2(): Double
-fun BooleanArray.component2(): Boolean
-fun CharArray.component2(): Char
-fun <T> List<T>.component2(): T
-fun <K, V> Map.Entry<K, V>.component2(): V
-fun UIntArray.component2(): UInt
-fun ULongArray.component2(): ULong
-fun UByteArray.component2(): UByte
-fun UShortArray.component2(): UShort
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:129:13 Unresolved reference 'Build'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:129:38 Unresolved reference 'Build'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:130:57 Cannot infer type for type parameter 'T'. Specify it explicitly.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:130:63 Cannot infer type for type parameter 'T'. Specify it explicitly.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:130:63 Operator call 'component1()' is ambiguous for destructuring of type 'uninferred ??? (Unknown type for type parameter T)'. Applicable candidates:
-fun <T> Array<out T>.component1(): T
-fun ByteArray.component1(): Byte
-fun ShortArray.component1(): Short
-fun IntArray.component1(): Int
-fun LongArray.component1(): Long
-fun FloatArray.component1(): Float
-fun DoubleArray.component1(): Double
-fun BooleanArray.component1(): Boolean
-fun CharArray.component1(): Char
-fun <T> List<T>.component1(): T
-fun <K, V> Map.Entry<K, V>.component1(): K
-fun UIntArray.component1(): UInt
-fun ULongArray.component1(): ULong
-fun UByteArray.component1(): UByte
-fun UShortArray.component1(): UShort
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:130:63 Operator call 'component2()' is ambiguous for destructuring of type 'uninferred ??? (Unknown type for type parameter T)'. Applicable candidates:
-fun <T> Array<out T>.component2(): T
-fun ByteArray.component2(): Byte
-fun ShortArray.component2(): Short
-fun IntArray.component2(): Int
-fun LongArray.component2(): Long
-fun FloatArray.component2(): Float
-fun DoubleArray.component2(): Double
-fun BooleanArray.component2(): Boolean
-fun CharArray.component2(): Char
-fun <T> List<T>.component2(): T
-fun <K, V> Map.Entry<K, V>.component2(): V
-fun UIntArray.component2(): UInt
-fun ULongArray.component2(): ULong
-fun UByteArray.component2(): UByte
-fun UShortArray.component2(): UShort
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:131:17 Unresolved reference 'PackageManager'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:135:21 Cannot infer type for type parameter 'T'. Specify it explicitly.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:135:31 Cannot infer type for type parameter 'T'. Specify it explicitly.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:135:31 Operator call 'component1()' is ambiguous for destructuring of type 'uninferred ??? (Unknown type for type parameter T)'. Applicable candidates:
-fun <T> Array<out T>.component1(): T
-fun ByteArray.component1(): Byte
-fun ShortArray.component1(): Short
-fun IntArray.component1(): Int
-fun LongArray.component1(): Long
-fun FloatArray.component1(): Float
-fun DoubleArray.component1(): Double
-fun BooleanArray.component1(): Boolean
-fun CharArray.component1(): Char
-fun <T> List<T>.component1(): T
-fun <K, V> Map.Entry<K, V>.component1(): K
-fun UIntArray.component1(): UInt
-fun ULongArray.component1(): ULong
-fun UByteArray.component1(): UByte
-fun UShortArray.component1(): UShort
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/MainActivity.kt:135:31 Operator call 'component2()' is ambiguous for destructuring of type 'uninferred ??? (Unknown type for type parameter T)'. Applicable candidates:
-fun <T> Array<out T>.component2(): T
-fun ByteArray.component2(): Byte
-fun ShortArray.component2(): Short
-fun IntArray.component2(): Int
-fun LongArray.component2(): Long
-fun FloatArray.component2(): Float
-fun DoubleArray.component2(): Double
-fun BooleanArray.component2(): Boolean
-fun CharArray.component2(): Char
-fun <T> List<T>.component2(): T
-fun <K, V> Map.Entry<K, V>.component2(): V
-fun UIntArray.component2(): UInt
-fun ULongArray.component2(): ULong
-fun UByteArray.component2(): UByte
-fun UShortArray.component2(): UShort
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/data/sync/SyncManager.kt:229:25 No parameter with name 'conversations' found.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/data/sync/SyncManager.kt:230:25 No value passed for parameter 'conversationsSeq'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ChatScreen.kt:1157:56 No parameter with name 'clearFocus' found.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ChatScreen.kt:1167:49 No parameter with name 'clearFocus' found.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/MessageList.kt:1052:65 Cannot access 'fun escapeHref(url: String): String': it is private in file.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ProcessPanel.kt:239:13 No parameter with name 'onTextLayout' found.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ProcessPanel.kt:276:13 No parameter with name 'textColor' found.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ThinkingHeader.kt:23:37 Conflicting import: imported name 'Offset' is ambiguous.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ThinkingHeader.kt:24:37 Conflicting import: imported name 'Size' is ambiguous.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ThinkingHeader.kt:25:37 Conflicting import: imported name 'StrokeCap' is ambiguous.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ThinkingHeader.kt:26:47 Conflicting import: imported name 'Stroke' is ambiguous.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ThinkingHeader.kt:27:1 Syntax error: Expecting a top level declaration.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ThinkingHeader.kt:27:4 Syntax error: Expecting a top level declaration.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ThinkingHeader.kt:27:7 Syntax error: Expecting a top level declaration.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ThinkingHeader.kt:27:8 Syntax error: imports are only allowed in the beginning of file.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ThinkingHeader.kt:28:37 Conflicting import: imported name 'Offset' is ambiguous.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ThinkingHeader.kt:29:37 Conflicting import: imported name 'Size' is ambiguous.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ThinkingHeader.kt:30:37 Conflicting import: imported name 'StrokeCap' is ambiguous.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ThinkingHeader.kt:31:47 Conflicting import: imported name 'Stroke' is ambiguous.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ThinkingHeader.kt:151:30 Unresolved reference 'colors'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ThinkingHeader.kt:151:30 Argument type mismatch: actual type is 'Map.Entry<uninferred K (of fun <K, V> Map.Entry<K, V>.copy), uninferred V (of fun <K, V> Map.Entry<K, V>.copy)>', but 'Color' was expected.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ThinkingHeader.kt:151:49 Cannot infer type for type parameter 'K'. Specify it explicitly.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ThinkingHeader.kt:151:49 Cannot infer type for type parameter 'V'. Specify it explicitly.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ThinkingHeader.kt:151:49 This declaration needs opt-in. Its usage must be marked with '@kotlin.ExperimentalStdlibApi' or '@OptIn(kotlin.ExperimentalStdlibApi::class)'
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ThinkingHeader.kt:152:21 Unresolved reference 'colors'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/history/HistoryDrawer.kt:225:43 Unresolved reference 'Row'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/history/HistoryDrawer.kt:226:74 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/history/HistoryDrawer.kt:228:68 Unresolved reference 'IconGap'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/history/HistoryDrawer.kt:234:52 Unresolved reference 'Icon'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/history/HistoryDrawer.kt:248:43 Unresolved reference 'Row'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/history/HistoryDrawer.kt:249:74 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/history/HistoryDrawer.kt:251:68 Unresolved reference 'IconGap'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/history/HistoryDrawer.kt:257:52 Unresolved reference 'Icon'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/history/HistoryDrawer.kt:431:35 Unresolved reference 'Row'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/history/HistoryDrawer.kt:434:60 Unresolved reference 'IconGap'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/history/HistoryDrawer.kt:446:44 Unresolved reference 'Icon'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/history/HistoryDrawer.kt:511:39 Unresolved reference 'Row'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/history/HistoryDrawer.kt:520:52 Unresolved reference 'Icon'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/lock/AppLockGate.kt:172:17 Named arguments are prohibited for function types.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/lock/AppLockGate.kt:205:37 Named arguments are prohibited for function types.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/onboarding/OnboardingScreen.kt:829:67 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/onboarding/OnboardingScreen.kt:844:75 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/ServiceApiDialog.kt:249:97 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/ServiceApiDialog.kt:461:85 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/ServiceApiDialog.kt:475:66 Unresolved reference 'Row'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/ServiceApiDialog.kt:489:73 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:1481:70 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:1760:73 Unresolved reference 'Row'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:1767:77 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:1848:35 Unresolved reference 'Row'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:1849:66 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:1851:60 Unresolved reference 'IconGap'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:1858:48 Unresolved reference 'Icon'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:1872:48 Unresolved reference 'Icon'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:1985:35 Unresolved reference 'Row'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:1986:66 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:2296:128 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:2403:61 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:2403:85 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:2867:104 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:2885:35 Unresolved reference 'Row'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:2886:66 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3051:83 Unresolved reference 'Icon'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3051:96 Unresolved reference 'IconGap'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3172:35 Unresolved reference 'Row'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3173:66 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3175:60 Unresolved reference 'IconGap'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3182:44 Unresolved reference 'Icon'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3223:35 Unresolved reference 'Row'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3224:66 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3226:60 Unresolved reference 'IconGap'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3233:48 Unresolved reference 'Icon'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3279:35 Unresolved reference 'Row'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3280:66 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3282:60 Unresolved reference 'IconGap'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3284:96 Unresolved reference 'Icon'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3315:35 Unresolved reference 'Row'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3316:66 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3318:60 Unresolved reference 'IconGap'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3325:48 Unresolved reference 'Icon'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3367:35 Unresolved reference 'Row'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3368:66 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3396:35 Unresolved reference 'Row'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3397:66 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3465:82 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3490:55 Unresolved reference 'Row'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3491:79 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3516:47 Unresolved reference 'Row'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3517:71 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3769:78 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3811:74 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3985:90 Unresolved reference 'RowPadY'.
-e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3996:85 Unresolved reference 'RowPadY'.
+w: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/data/SettingsStore.kt:311:76 'val paletteStyleId: String' is deprecated. 配色推导方式已固定为 Fidelity，不再暴露设置.
+w: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/data/import/ExternalBackup.kt:139:33 Java type mismatch: inferred type is 'String?', but 'String' was expected.
+w: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/data/sync/WebDavClient.kt:99:46 Elvis operator (?:) always returns the left operand of non-nullable type 'ResponseBody'.
+w: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/data/sync/WebDavClient.kt:168:44 Unnecessary safe call on a non-null receiver of type 'ResponseBody'.
+w: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/net/ChatApi.kt:152:45 Unnecessary safe call on a non-null receiver of type 'ResponseBody'.
+w: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/net/DeepSeekTts.kt:200:58 Unnecessary safe call on a non-null receiver of type 'ResponseBody'.
+w: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/net/DeepSeekTts.kt:203:42 Elvis operator (?:) always returns the left operand of non-nullable type 'ResponseBody'.
+w: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/net/ImageToolCall.kt:33:50 Unnecessary safe call on a non-null receiver of type 'JsonObject'.
+w: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/net/UpdateChecker.kt:92:37 Unnecessary safe call on a non-null receiver of type 'ResponseBody'.
+w: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/net/anthropic/AnthropicApi.kt:87:47 Unnecessary safe call on a non-null receiver of type 'ResponseBody'.
+w: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ChatScreen.kt:1545:54 Unnecessary safe call on a non-null receiver of type 'Pair<String, String>'.
+w: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ShareRenderBlocks.kt:92:16 'constructor(flavour: MarkdownFlavourDescriptor): MarkdownParser' is deprecated. Use constructor with CancellationToken.
+w: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/chat/ShareRenderBlocks.kt:92:55 'fun buildMarkdownTreeFromString(text: String): ASTNode' is deprecated. Use the CharSequence overload.
+w: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/lock/AppLockGate.kt:235:40 'fun createConfirmDeviceCredentialIntent(p0: CharSequence!, p1: CharSequence!): Intent!' is deprecated. Deprecated in Java.
+w: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/markdown/MathSplit.kt:153:16 'constructor(flavour: MarkdownFlavourDescriptor): MarkdownParser' is deprecated. Use constructor with CancellationToken.
+w: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/markdown/MathSplit.kt:153:55 'fun buildMarkdownTreeFromString(text: String): ASTNode' is deprecated. Use the CharSequence overload.
+w: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/settings/SettingsScreen.kt:3887:21 'val LocalClipboardManager: ProvidableCompositionLocal<ClipboardManager>' is deprecated. Use LocalClipboard instead which supports suspend functions.
+w: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/theme/SystemBars.kt:97:16 'var isStatusBarContrastEnforced: Boolean' is deprecated. Deprecated in Java.
+w: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/theme/SystemBars.kt:103:16 'var navigationBarDividerColor: Int' is deprecated. Deprecated in Java.
+w: file:///home/runner/work/mydeepseek/mydeepseek/app/src/main/java/com/simplechat/app/ui/vault/VaultScreen.kt:143:31 'fun createConfirmDeviceCredentialIntent(p0: CharSequence!, p1: CharSequence!): Intent!' is deprecated. Deprecated in Java.
 
-> Task :app:compileDebugKotlin FAILED
-gradle/actions: Writing build results to /home/runner/work/_temp/.gradle-actions/build-results/__run_5-1795322553684.json
+> Task :app:compileDebugJavaWithJavac
+> Task :app:processDebugJavaRes
+> Task :app:bundleDebugClassesToRuntimeJar
+> Task :app:bundleDebugClassesToCompileJar
+> Task :app:kspDebugUnitTestKotlin
+
+> Task :app:compileDebugUnitTestKotlin FAILED
+e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/test/java/com/simplechat/app/ui/markdown/SmoothRevealTest.kt:22:26 Unresolved reference 'cooldownAfter'.
+e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/test/java/com/simplechat/app/ui/markdown/SmoothRevealTest.kt:23:26 Unresolved reference 'cooldownAfter'.
+e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/test/java/com/simplechat/app/ui/markdown/SmoothRevealTest.kt:24:26 Unresolved reference 'cooldownAfter'.
+e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/test/java/com/simplechat/app/ui/markdown/SmoothRevealTest.kt:30:27 Unresolved reference 'cooldownAfter'.
+e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/test/java/com/simplechat/app/ui/markdown/SmoothRevealTest.kt:32:27 Unresolved reference 'cooldownAfter'.
+e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/test/java/com/simplechat/app/ui/markdown/SmoothRevealTest.kt:38:27 Unresolved reference 'cooldownAfter'.
+e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/test/java/com/simplechat/app/ui/markdown/SmoothRevealTest.kt:39:27 Unresolved reference 'cooldownAfter'.
+e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/test/java/com/simplechat/app/ui/markdown/SmoothRevealTest.kt:40:27 Unresolved reference 'cooldownAfter'.
+e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/test/java/com/simplechat/app/ui/markdown/SmoothRevealTest.kt:46:33 Cannot infer type for type parameter 'R'. Specify it explicitly.
+e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/test/java/com/simplechat/app/ui/markdown/SmoothRevealTest.kt:46:39 Unresolved reference 'cooldownAfter'.
+e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/test/java/com/simplechat/app/ui/markdown/SmoothRevealTest.kt:47:19 Cannot infer type for type parameter 'T'. Specify it explicitly.
+e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/test/java/com/simplechat/app/ui/markdown/SmoothRevealTest.kt:47:33 Cannot infer type for type parameter 'T'. Specify it explicitly.
+e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/test/java/com/simplechat/app/ui/markdown/SmoothRevealTest.kt:47:43 Cannot infer type for type parameter 'T'. Specify it explicitly.
+e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/test/java/com/simplechat/app/ui/markdown/SmoothRevealTest.kt:47:43 Operator call 'component1()' is ambiguous for destructuring of type 'uninferred ??? (Unknown type for type parameter T)'. Applicable candidates:
+fun <T> Array<out T>.component1(): T
+fun ByteArray.component1(): Byte
+fun ShortArray.component1(): Short
+fun IntArray.component1(): Int
+fun LongArray.component1(): Long
+fun FloatArray.component1(): Float
+fun DoubleArray.component1(): Double
+fun BooleanArray.component1(): Boolean
+fun CharArray.component1(): Char
+fun <T> List<T>.component1(): T
+fun <K, V> Map.Entry<K, V>.component1(): K
+fun UIntArray.component1(): UInt
+fun ULongArray.component1(): ULong
+fun UByteArray.component1(): UByte
+fun UShortArray.component1(): UShort
+e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/test/java/com/simplechat/app/ui/markdown/SmoothRevealTest.kt:47:43 Operator call 'component2()' is ambiguous for destructuring of type 'uninferred ??? (Unknown type for type parameter T)'. Applicable candidates:
+fun <T> Array<out T>.component2(): T
+fun ByteArray.component2(): Byte
+fun ShortArray.component2(): Short
+fun IntArray.component2(): Int
+fun LongArray.component2(): Long
+fun FloatArray.component2(): Float
+fun DoubleArray.component2(): Double
+fun BooleanArray.component2(): Boolean
+fun CharArray.component2(): Char
+fun <T> List<T>.component2(): T
+fun <K, V> Map.Entry<K, V>.component2(): V
+fun UIntArray.component2(): UInt
+fun ULongArray.component2(): ULong
+fun UByteArray.component2(): UByte
+fun UShortArray.component2(): UShort
+e: file:///home/runner/work/mydeepseek/mydeepseek/app/src/test/java/com/simplechat/app/ui/markdown/SmoothRevealTest.kt:48:49 'operator' modifier is required on 'fun String.compareTo(other: String, ignoreCase: Boolean = ...): Int'.
+gradle/actions: Writing build results to /home/runner/work/_temp/.gradle-actions/build-results/__run_5-1795323144319.json
 
 [Incubating] Problems report is available at: file:///home/runner/work/mydeepseek/mydeepseek/build/reports/problems/problems-report.html
 
 FAILURE: Build failed with an exception.
 
 * What went wrong:
-Execution failed for task ':app:compileDebugKotlin' (registered by plugin 'com.android.internal.application').
+Execution failed for task ':app:compileDebugUnitTestKotlin' (registered by plugin 'com.android.internal.application').
 > A failure occurred while executing org.jetbrains.kotlin.compilerRunner.btapi.BuildToolsApiCompilationWork
    > Compilation error. See log for more details
 
@@ -250,7 +117,7 @@ Execution failed for task ':app:compileDebugKotlin' (registered by plugin 'com.a
 > Get more help at https://help.gradle.org.
 
 * Exception is:
-org.gradle.api.tasks.TaskExecutionException: Execution failed for task ':app:compileDebugKotlin' (registered by plugin 'com.android.internal.application').
+org.gradle.api.tasks.TaskExecutionException: Execution failed for task ':app:compileDebugUnitTestKotlin' (registered by plugin 'com.android.internal.application').
 	at org.gradle.api.internal.tasks.execution.ExecuteActionsTaskExecuter.lambda$executeIfValid$1(ExecuteActionsTaskExecuter.java:135)
 	at org.gradle.internal.Try$Failure.ifSuccessfulOrElse(Try.java:288)
 	at org.gradle.api.internal.tasks.execution.ExecuteActionsTaskExecuter.executeIfValid(ExecuteActionsTaskExecuter.java:133)
@@ -282,6 +149,37 @@ org.gradle.api.tasks.TaskExecutionException: Execution failed for task ':app:com
 	at org.gradle.execution.taskgraph.DefaultTaskExecutionGraph$BuildOperationAwareExecutionAction.execute(DefaultTaskExecutionGraph.java:328)
 	at org.gradle.execution.plan.DefaultPlanExecutor$ExecutorWorker.execute(DefaultPlanExecutor.java:459)
 	at org.gradle.execution.plan.DefaultPlanExecutor$ExecutorWorker.run(DefaultPlanExecutor.java:376)
+	at org.gradle.execution.plan.DefaultPlanExecutor.process(DefaultPlanExecutor.java:111)
+	at org.gradle.execution.taskgraph.DefaultTaskExecutionGraph.executeWithServices(DefaultTaskExecutionGraph.java:146)
+	at org.gradle.execution.taskgraph.DefaultTaskExecutionGraph.execute(DefaultTaskExecutionGraph.java:131)
+	at org.gradle.execution.SelectedTaskExecutionAction.execute(SelectedTaskExecutionAction.java:35)
+	at org.gradle.execution.BuildOperationFiringBuildWorkerExecutor$ExecuteTasks.call(BuildOperationFiringBuildWorkerExecutor.java:54)
+	at org.gradle.execution.BuildOperationFiringBuildWorkerExecutor$ExecuteTasks.call(BuildOperationFiringBuildWorkerExecutor.java:43)
+	at org.gradle.internal.operations.DefaultBuildOperationRunner$CallableBuildOperationWorker.execute(DefaultBuildOperationRunner.java:210)
+	at org.gradle.internal.operations.DefaultBuildOperationRunner$CallableBuildOperationWorker.execute(DefaultBuildOperationRunner.java:205)
+	at org.gradle.internal.operations.DefaultBuildOperationRunner$2.execute(DefaultBuildOperationRunner.java:67)
+	at org.gradle.internal.operations.DefaultBuildOperationRunner$2.execute(DefaultBuildOperationRunner.java:60)
+	at org.gradle.internal.operations.DefaultBuildOperationRunner.execute(DefaultBuildOperationRunner.java:167)
+	at org.gradle.internal.operations.DefaultBuildOperationRunner.execute(DefaultBuildOperationRunner.java:60)
+	at org.gradle.internal.operations.DefaultBuildOperationRunner.call(DefaultBuildOperationRunner.java:54)
+	at org.gradle.execution.BuildOperationFiringBuildWorkerExecutor.execute(BuildOperationFiringBuildWorkerExecutor.java:40)
+	at org.gradle.internal.build.DefaultBuildLifecycleController.lambda$executeTasks$0(DefaultBuildLifecycleController.java:323)
+	at org.gradle.internal.model.StateTransitionController.doTransition(StateTransitionController.java:324)
+	at org.gradle.internal.model.StateTransitionController.lambda$tryTransition$0(StateTransitionController.java:235)
+	at org.gradle.internal.work.DefaultSynchronizer.withLock(DefaultSynchronizer.java:45)
+	at org.gradle.internal.model.StateTransitionController.tryTransition(StateTransitionController.java:235)
+	at org.gradle.internal.build.DefaultBuildLifecycleController.executeTasks(DefaultBuildLifecycleController.java:314)
+	at org.gradle.internal.build.DefaultBuildWorkGraphController$DefaultBuildWorkGraph.runWork(DefaultBuildWorkGraphController.java:220)
+	at org.gradle.internal.work.DefaultWorkerLeaseService.lambda$runAndReleaseLocks$0(DefaultWorkerLeaseService.java:302)
+	at org.gradle.internal.work.ResourceLockStatistics$1.measure(ResourceLockStatistics.java:43)
+	at org.gradle.internal.work.DefaultWorkerLeaseService.runAndReleaseLocks(DefaultWorkerLeaseService.java:300)
+	at org.gradle.internal.work.DefaultWorkerLeaseService.withLocksAcquired(DefaultWorkerLeaseService.java:296)
+	at org.gradle.internal.work.DefaultWorkerLeaseService.withLocks(DefaultWorkerLeaseService.java:288)
+	at org.gradle.internal.work.DefaultWorkerLeaseService.runAsWorkerThread(DefaultWorkerLeaseService.java:131)
+	at org.gradle.composite.internal.DefaultBuildController.doRun(DefaultBuildController.java:182)
+	at org.gradle.composite.internal.DefaultBuildController$BuildOpRunnable.lambda$run$0(DefaultBuildController.java:199)
+	at org.gradle.internal.operations.CurrentBuildOperationRef.with(CurrentBuildOperationRef.java:84)
+	at org.gradle.composite.internal.DefaultBuildController$BuildOpRunnable.run(DefaultBuildController.java:199)
 	at org.gradle.internal.concurrent.ExecutorPolicy$CatchAndRecordFailures.onExecute(ExecutorPolicy.java:65)
 	at org.gradle.internal.concurrent.AbstractManagedExecutor$1.run(AbstractManagedExecutor.java:47)
 Caused by: org.gradle.workers.internal.DefaultWorkerExecutor$WorkExecutionException: A failure occurred while executing org.jetbrains.kotlin.compilerRunner.btapi.BuildToolsApiCompilationWork
@@ -402,7 +300,7 @@ Caused by: org.gradle.workers.internal.DefaultWorkerExecutor$WorkExecutionExcept
 	at org.gradle.internal.execution.steps.IdentifyStep.execute(IdentifyStep.java:38)
 	at org.gradle.internal.execution.impl.DefaultExecutionEngine$1.execute(DefaultExecutionEngine.java:68)
 	at org.gradle.api.internal.tasks.execution.ExecuteActionsTaskExecuter.executeIfValid(ExecuteActionsTaskExecuter.java:132)
-	... 30 more
+	... 61 more
 Caused by: org.jetbrains.kotlin.gradle.tasks.CompilationErrorException: Compilation error. See log for more details
 	at org.jetbrains.kotlin.gradle.tasks.TasksUtilsKt.throwExceptionIfCompilationFailed(tasksUtils.kt:21)
 	at org.jetbrains.kotlin.compilerRunner.btapi.BuildToolsApiCompilationWork.execute(BuildToolsApiCompilationWork.kt:320)
@@ -439,5 +337,5 @@ Caused by: org.jetbrains.kotlin.gradle.tasks.CompilationErrorException: Compilat
 	... 2 more
 
 
-BUILD FAILED in 1m 13s
-20 actionable tasks: 16 executed, 4 from cache
+BUILD FAILED in 1m 11s
+26 actionable tasks: 22 executed, 4 from cache
