@@ -424,7 +424,7 @@ internal fun resolveCitationLinks(markdown: String, sources: List<SourceRef>): S
     }
 }
 
-private fun escapeHref(url: String): String = url
+internal fun escapeHref(url: String): String = url
     .replace("(", "%28")
     .replace(")", "%29")
     .replace(" ", "%20")

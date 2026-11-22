@@ -169,7 +169,7 @@ fun AppLockGate(
     }
 
     if (unlocked || effectiveType == AppLockType.NONE) {
-        content(unlocked = effectiveType != AppLockType.NONE)
+        content(effectiveType != AppLockType.NONE)
         return
     }
 
@@ -202,7 +202,7 @@ fun AppLockGate(
             hasPin = settings.hasVaultPin,
         )
 
-        AppLockType.NONE -> content(unlocked = false)
+        AppLockType.NONE -> content(false)
     }
 }
 

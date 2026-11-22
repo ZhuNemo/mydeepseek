@@ -2,7 +2,9 @@ package com.simplechat.app
 
 import android.Manifest
 import android.content.ComponentName
+import android.content.pm.PackageManager
 import android.content.Context
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent

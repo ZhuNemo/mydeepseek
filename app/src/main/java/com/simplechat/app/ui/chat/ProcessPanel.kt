@@ -2,8 +2,6 @@ package com.simplechat.app.ui.chat
 
 import com.simplechat.app.ui.markdown.rememberSearchTextDecoration
 import androidx.compose.animation.animateContentSize
-import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -27,7 +25,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
@@ -43,14 +40,12 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.unit.Density
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.simplechat.app.R
 import com.simplechat.app.data.Res
 import com.simplechat.app.ui.common.AppIcons
 import com.simplechat.app.ui.common.FoldAnimMs
-import com.simplechat.app.ui.markdown.MarkdownWithMath
 import com.simplechat.app.ui.common.MotionEasing
 import com.simplechat.app.ui.common.PillShape
 import com.simplechat.app.ui.theme.LocalChatColors
@@ -99,7 +94,7 @@ fun ProcessPanel(
                 if (reasoningStreaming) {
                     Modifier
                 } else {
-                    Modifier.animateContentSize(spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow))
+                    Modifier.animateContentSize(tween(FoldAnimMs, easing = MotionEasing))
                 },
             ),
     ) {
@@ -179,9 +174,9 @@ internal fun TailContent(reasoning: String, gutter: Boolean = false) {
                 }
                 .padding(start = if (gutter) ThinkingContentInset else 15.dp),
         ) {
-            ReasoningMarkdown(
+            Text(
                 text = tail,
-                streaming = true,
+                style = ProcessTextStyle,
                 color = colors.processText,
             )
         }
@@ -231,55 +226,15 @@ private fun FullContent(reasoning: String) {
                 .background(colors.processBar),
         )
         Spacer(Modifier.width(12.dp))
-        ReasoningMarkdown(
+        Text(
             text = reasoning,
-            streaming = false,
+            style = ProcessTextStyle,
             color = colors.processText,
             modifier = Modifier.weight(1f).then(searchDecoration),
             onTextLayout = onTextLayout,
         )
     }
 }
-
-/**
- * 思考链的 markdown 渲染。
- *
- * ### 字号为什么用 fontScale 缩放，而不是逐个改 typography
- *
- * markdown 里光是文本样式就有十几种（h1–h6、正文、代码、引用、表格……），
- * 逐个乘系数既啰嗦又必然漏掉某一种 —— 而漏掉的那一种会在灰色小字里
- * 突兀地恢复成大号正文。缩放 `LocalDensity` 的 `fontScale` 等价于
- * "这一段内部把系统字号调小"，所有 sp 自动跟随，漏不掉。
- *
- * 颜色走 [MarkdownWithMath] 的 `textColor`（而不是外面套一层 `LocalContentColor`）：
- * 库的 `markdownColor(text = …)` 只认它自己的参数，外层 content color 传不进去，
- * 结果是灰色段落里蹦出几块黑的链接与行内代码。
- */
-@Composable
-private fun ReasoningMarkdown(
-    text: String,
-    streaming: Boolean,
-    color: Color,
-    modifier: Modifier = Modifier,
-) {
-    val density = LocalDensity.current
-    CompositionLocalProvider(
-        LocalDensity provides Density(
-            density = density.density,
-            fontScale = density.fontScale * ReasoningFontScale,
-        ),
-    ) {
-        MarkdownWithMath(
-            content = text,
-            modifier = modifier,
-            streaming = streaming,
-            textColor = color,
-        )
-    }
-}
-
-/** 思考链字号相对正文的比例：正文 16sp → 思考约 13.6sp。 */
-private const val ReasoningFontScale = 0.85f
 
 /** Tail 模式的高度上限：约 4 行正文。 */
 private val TailHeight = 96.dp

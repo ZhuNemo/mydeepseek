@@ -126,6 +126,19 @@ object Space {
 
     /** 主按钮（带文字）的高度。M3 的 filled button 就是 40dp，视觉上配 48 的触控区。 */
     val ButtonHeight = 44.dp
+
+    /*
+     * ── 单行条目的统一栅格 ───────────────────────────
+     *
+     * 抽屉会话行、设置里的每一行、菜单项共用一个行高 —— 同一块屏幕上不该有
+     * 三种节奏。上游这套名字（Row / RowPadY / Icon / IconGap）在合并后已经被
+     * 大量调用（设置页、抽屉、服务配置对话框、首次引导），所以保留同一组命名，
+     * 只把数值调到 M3 的尺度：56dp 行高 + 20dp 图标。
+     */
+    val Row = 56.dp
+    val RowPadY = 12.dp
+    val Icon = 20.dp
+    val IconGap = 12.dp
 }
 
 // ══════════════════════════════════════════════════════════
@@ -746,7 +759,7 @@ private class AppMenuPositionProvider(
  * 否则点输入框反而会把键盘收掉。
  */
 @Composable
-fun Modifier.dismissKeyboardOnTouch(): Modifier {
+fun Modifier.dismissKeyboardOnTouch(clearFocus: () -> Boolean = { true }): Modifier {
     val focusManager = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
 
@@ -755,7 +768,7 @@ fun Modifier.dismissKeyboardOnTouch(): Modifier {
             while (true) {
                 val event = awaitPointerEvent(PointerEventPass.Initial)
                 val change = event.changes.firstOrNull() ?: continue
-                if (change.pressed && !change.previousPressed) {
+                if (change.pressed && !change.previousPressed && clearFocus()) {
                     focusManager.clearFocus()
                     keyboard?.hide()
                 }

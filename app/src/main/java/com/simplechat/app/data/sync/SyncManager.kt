@@ -226,7 +226,7 @@ class SyncManager(
                 if (pulled > 0) {
                     keepDrafts(overwriting)
                     repository.importSyncStream(
-                        conversations = SyncPayload.conversations(incoming),
+                        conversationsSeq = SyncPayload.conversations(incoming),
                         presetsToWrite = newerPresets(repository.syncPresets(), meta?.presets.orEmpty()),
                     )
                 }
