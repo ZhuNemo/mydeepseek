@@ -129,20 +129,6 @@ jobs:
           set -o pipefail
           ./gradlew --no-daemon --stacktrace testDebugUnitTest 2>&1 | tee /tmp/unit.log
 
-      # 临时诊断（定位完删掉）：失败时把完整日志提交到当前分支。
-      # GITHUB_TOKEN 触发的 push 不会再触发 workflow，不会打转。
-      - name: 诊断：失败日志提交到分支
-        if: failure()
-        run: |
-          set -uo pipefail
-          [ -f /tmp/unit.log ] || exit 0
-          cp /tmp/unit.log ci-unit.log
-          git config user.name "ci-bot"
-          git config user.email "ci-bot@users.noreply.github.com"
-          git add -f ci-unit.log
-          git commit -m "ci: 记录单元测试失败日志（定位用，随后删除）" || exit 0
-          git push origin "HEAD:${{ github.ref_name }}" || true
-
       - name: 构建 Release APK
         run: ./gradlew --no-daemon --stacktrace assembleRelease
 
