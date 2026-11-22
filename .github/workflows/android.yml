@@ -142,15 +142,19 @@ jobs:
 
       # Release 的 asset 是**原文件**（点开就能直接下载 apk），而 Actions 的 Artifact
       # 永远是 zip。这里复制一份带版本号的名字，两处都用它 —— 下载下来一眼能看出是哪个版本。
+      # 版本号从 build.gradle.kts 读，不依赖 GITHUB_REF_NAME：分支构建时那个值是分支名，
+      # 拼出来的文件名既难看，也可能因为含 `/` 之类字符导致 cp 失败。
       - name: 给 APK 起个可读的名字
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION=$(grep -oE 'appVersionName = "[^"]+"' app/build.gradle.kts | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "版本: $VERSION (GITHUB_REF_NAME=$GITHUB_REF_NAME)"
           SRC=app/build/outputs/apk/release/app-release.apk
+          ls -lh app/build/outputs/apk/release/
           DST="app/build/outputs/apk/release/myDeepSeek-${VERSION}.apk"
           cp "$SRC" "$DST"
           echo "APK: $DST"
-          ls -lh app/build/outputs/apk/release/
+          ls -lh "$DST"
 
       - name: 上传 APK
         uses: actions/upload-artifact@v4
